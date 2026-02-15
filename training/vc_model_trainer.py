@@ -43,9 +43,20 @@ class TinyVCModel(nn.Module):
 
 
 class VCModelTrainer:
-    def __init__(self, pipeline: FeaturePipeline, db_url: str = DATABASE_URL):
+    def __init__(
+        self,
+        pipeline: FeaturePipeline,
+        db_url: str = DATABASE_URL,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        local_rank: int = 0,
+    ):
         self.pipeline = pipeline
         self.db_url = db_url
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.local_rank = int(local_rank)
         os.makedirs(MODEL_DIR, exist_ok=True)
 
     def _connect(self):
@@ -61,8 +72,21 @@ class VCModelTrainer:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+    def _resolve_device(self) -> torch.device:
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+        if 0 <= self.local_rank < torch.cuda.device_count():
+            return torch.device(f"cuda:{self.local_rank}")
+        return torch.device("cuda")
+
     def train(self) -> Dict:
-        self._set_seed(SEED)
+        if self.rank != 0:
+            return {
+                "status": "skipped_non_primary_rank",
+                "rank": self.rank,
+                "world_size": self.world_size,
+            }
+        self._set_seed(SEED + self.rank)
         dq = self.pipeline.check_data_quality("BTC", timeframe="5m", lookback_hours=48)
         if dq.get("quality_passed", 0.0) < 0.5:
             return {"status": "blocked_by_data_quality", "data_quality": dq}
@@ -85,7 +109,7 @@ class VCModelTrainer:
         train_idx = np.arange(0, n - val_n)
         val_idx = np.arange(n - val_n, n)
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = self._resolve_device()
         model = TinyVCModel(in_dim=X.shape[1]).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
         y_train = y[train_idx]

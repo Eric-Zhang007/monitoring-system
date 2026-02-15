@@ -31,6 +31,22 @@ class FeaturePipeline:
         return psycopg2.connect(self.db_url, cursor_factory=RealDictCursor)
 
     @staticmethod
+    def _table_exists(cur, table_name: str) -> bool:
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = %s
+            ) AS exists_flag
+            """,
+            (str(table_name).lower(),),
+        )
+        row = cur.fetchone() or {}
+        return bool(row.get("exists_flag"))
+
+    @staticmethod
     def _dq_thresholds() -> Dict[str, float]:
         return {
             "missing_rate_max": float(os.getenv("DQ_MAX_MISSING_RATE", "0.02")),
@@ -92,70 +108,77 @@ class FeaturePipeline:
         source_used = "market_bars"
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT
-                      COUNT(*) AS total_rows,
-                      COALESCE(SUM(CASE WHEN close IS NULL OR volume IS NULL THEN 1 ELSE 0 END), 0) AS missing_rows,
-                      COALESCE(SUM(CASE WHEN close <= 0 THEN 1 ELSE 0 END), 0) AS invalid_price_rows,
-                      COALESCE(SUM(
-                        CASE
-                          WHEN prev_ts IS NOT NULL AND ts = prev_ts THEN 1
-                          ELSE 0
-                        END
-                      ), 0) AS duplicate_rows,
-                      COALESCE(SUM(
-                        CASE
-                          WHEN prev_ts IS NOT NULL AND EXTRACT(EPOCH FROM (ts - prev_ts)) > %s THEN 1
-                          ELSE 0
-                        END
-                      ), 0) AS stale_gap_rows
-                    FROM (
-                      SELECT
-                        ts, close, volume,
-                        LAG(ts) OVER (ORDER BY ts ASC) AS prev_ts
-                      FROM market_bars
-                      WHERE symbol = UPPER(%s)
-                        AND timeframe = %s
-                        AND ts > NOW() - make_interval(hours => %s)
-                    ) s
-                    """,
-                    (stale_gap_seconds, symbol, timeframe, lookback_hours),
-                )
-                row = dict(cur.fetchone() or {})
-                if int(row.get("total_rows") or 0) <= 0:
-                    source_used = "prices"
-                    fallback_gap = int(max(stale_gap_seconds, float(os.getenv("DQ_PRICE_STALE_GAP_SECONDS", "10800"))))
+                if self._table_exists(cur, "market_bars"):
                     cur.execute(
                         """
                         SELECT
                           COUNT(*) AS total_rows,
-                          COALESCE(SUM(CASE WHEN price IS NULL OR volume IS NULL THEN 1 ELSE 0 END), 0) AS missing_rows,
-                          COALESCE(SUM(CASE WHEN price <= 0 THEN 1 ELSE 0 END), 0) AS invalid_price_rows,
+                          COALESCE(SUM(CASE WHEN close IS NULL OR volume IS NULL THEN 1 ELSE 0 END), 0) AS missing_rows,
+                          COALESCE(SUM(CASE WHEN close <= 0 THEN 1 ELSE 0 END), 0) AS invalid_price_rows,
                           COALESCE(SUM(
                             CASE
-                              WHEN prev_ts IS NOT NULL AND timestamp = prev_ts THEN 1
+                              WHEN prev_ts IS NOT NULL AND ts = prev_ts THEN 1
                               ELSE 0
                             END
                           ), 0) AS duplicate_rows,
                           COALESCE(SUM(
                             CASE
-                              WHEN prev_ts IS NOT NULL AND EXTRACT(EPOCH FROM (timestamp - prev_ts)) > %s THEN 1
+                              WHEN prev_ts IS NOT NULL AND EXTRACT(EPOCH FROM (ts - prev_ts)) > %s THEN 1
                               ELSE 0
                             END
                           ), 0) AS stale_gap_rows
                         FROM (
                           SELECT
-                            timestamp, price, volume,
-                            LAG(timestamp) OVER (ORDER BY timestamp ASC) AS prev_ts
-                          FROM prices
+                            ts, close, volume,
+                            LAG(ts) OVER (ORDER BY ts ASC) AS prev_ts
+                          FROM market_bars
                           WHERE symbol = UPPER(%s)
-                            AND timestamp > NOW() - make_interval(hours => %s)
+                            AND timeframe = %s
+                            AND ts > NOW() - make_interval(hours => %s)
                         ) s
                         """,
-                        (fallback_gap, symbol, lookback_hours),
+                        (stale_gap_seconds, symbol, timeframe, lookback_hours),
                     )
                     row = dict(cur.fetchone() or {})
+                else:
+                    row = {"total_rows": 0, "missing_rows": 0, "invalid_price_rows": 0, "duplicate_rows": 0, "stale_gap_rows": 0}
+                if int(row.get("total_rows") or 0) <= 0:
+                    if self._table_exists(cur, "prices"):
+                        source_used = "prices"
+                        fallback_gap = int(max(stale_gap_seconds, float(os.getenv("DQ_PRICE_STALE_GAP_SECONDS", "10800"))))
+                        cur.execute(
+                            """
+                            SELECT
+                              COUNT(*) AS total_rows,
+                              COALESCE(SUM(CASE WHEN price IS NULL OR volume IS NULL THEN 1 ELSE 0 END), 0) AS missing_rows,
+                              COALESCE(SUM(CASE WHEN price <= 0 THEN 1 ELSE 0 END), 0) AS invalid_price_rows,
+                              COALESCE(SUM(
+                                CASE
+                                  WHEN prev_ts IS NOT NULL AND timestamp = prev_ts THEN 1
+                                  ELSE 0
+                                END
+                              ), 0) AS duplicate_rows,
+                              COALESCE(SUM(
+                                CASE
+                                  WHEN prev_ts IS NOT NULL AND EXTRACT(EPOCH FROM (timestamp - prev_ts)) > %s THEN 1
+                                  ELSE 0
+                                END
+                              ), 0) AS stale_gap_rows
+                            FROM (
+                              SELECT
+                                timestamp, price, volume,
+                                LAG(timestamp) OVER (ORDER BY timestamp ASC) AS prev_ts
+                              FROM prices
+                              WHERE symbol = UPPER(%s)
+                                AND timestamp > NOW() - make_interval(hours => %s)
+                            ) s
+                            """,
+                            (fallback_gap, symbol, lookback_hours),
+                        )
+                        row = dict(cur.fetchone() or {})
+                    else:
+                        source_used = "none"
+                        row = {"total_rows": 0, "missing_rows": 0, "invalid_price_rows": 0, "duplicate_rows": 0, "stale_gap_rows": 0}
         total = int(row.get("total_rows") or 0)
         missing = int(row.get("missing_rows") or 0)
         invalid = int(row.get("invalid_price_rows") or 0)
@@ -230,7 +253,15 @@ class FeaturePipeline:
         effective_timeframe = str(timeframe)
         with self._connect() as conn:
             with conn.cursor() as cur:
-                try:
+                has_market_bars = self._table_exists(cur, "market_bars")
+                has_orderbook = self._table_exists(cur, "orderbook_l2")
+                has_funding = self._table_exists(cur, "funding_rates")
+                has_onchain = self._table_exists(cur, "onchain_signals")
+                has_events = self._table_exists(cur, "events")
+                has_event_links = self._table_exists(cur, "event_links")
+                has_entities = self._table_exists(cur, "entities")
+                has_prices = self._table_exists(cur, "prices")
+                if has_market_bars:
                     cur.execute(
                         """
                         SELECT symbol, close::float AS price, volume::float AS volume, ts AS timestamp
@@ -243,6 +274,7 @@ class FeaturePipeline:
                         (symbol, timeframe, limit),
                     )
                     rows = [dict(r) for r in cur.fetchall()]
+                if has_orderbook:
                     cur.execute(
                         """
                         SELECT ts AS timestamp, imbalance::float AS imbalance
@@ -254,6 +286,7 @@ class FeaturePipeline:
                         (symbol, limit * 2),
                     )
                     orderbook_rows = [dict(r) for r in cur.fetchall()]
+                if has_funding:
                     cur.execute(
                         """
                         SELECT ts AS timestamp, funding_rate::float AS funding_rate
@@ -265,6 +298,7 @@ class FeaturePipeline:
                         (symbol, max(200, limit // 4)),
                     )
                     funding_rows = [dict(r) for r in cur.fetchall()]
+                if has_onchain:
                     cur.execute(
                         """
                         SELECT ts AS timestamp, metric_value::float AS metric_value
@@ -277,6 +311,7 @@ class FeaturePipeline:
                         (symbol, limit * 2),
                     )
                     onchain_rows = [dict(r) for r in cur.fetchall()]
+                if has_events and has_event_links and has_entities:
                     try:
                         cur.execute(
                             """
@@ -306,6 +341,7 @@ class FeaturePipeline:
                             (symbol, limit * 2),
                         )
                     event_rows = [dict(r) for r in cur.fetchall()]
+                if has_events:
                     try:
                         cur.execute(
                             """
@@ -325,9 +361,7 @@ class FeaturePipeline:
                         global_event_rows = [dict(r) for r in cur.fetchall()]
                     except Exception:
                         global_event_rows = []
-                except Exception:
-                    rows = []
-                if not rows:
+                if not rows and has_prices:
                     effective_timeframe = os.getenv("LIQUID_PRICE_FALLBACK_TIMEFRAME", "1h")
                     cur.execute(
                         """

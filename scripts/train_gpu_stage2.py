@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,16 @@ def _estimate_cost_cny(hours: float, compute_tier: str, a100_hourly_cny: float, 
     return 0.0
 
 
+def _build_train_cmd(nproc_per_node: int, env: Dict[str, str]) -> List[str]:
+    nproc = max(1, int(nproc_per_node))
+    if nproc <= 1:
+        return ["python3", "training/main.py"]
+    torchrun_path = shutil.which("torchrun", path=env.get("PATH"))
+    if torchrun_path:
+        return [torchrun_path, "--standalone", f"--nproc_per_node={nproc}", "training/main.py"]
+    return ["python3", "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={nproc}", "training/main.py"]
+
+
 def _api_ready(api_base: str, timeout_sec: float = 3.0) -> bool:
     url = f"{str(api_base).rstrip('/')}/health"
     try:
@@ -66,8 +77,11 @@ def main() -> int:
     ap.add_argument("--a100-hourly-cny", type=float, default=float(os.getenv("A100_HOURLY_CNY", "11.96")))
     ap.add_argument("--billing-discount", type=float, default=float(os.getenv("AUTODL_BILLING_DISCOUNT", "1.0")))
     ap.add_argument("--estimated-hours", type=float, default=6.0)
+    ap.add_argument("--nproc-per-node", type=int, default=int(os.getenv("TRAIN_NPROC_PER_NODE", "0")))
     ap.add_argument("--out", default="artifacts/gpu_stage2/train_gpu_stage2_latest.json")
     args = ap.parse_args()
+    if int(args.nproc_per_node) <= 0:
+        args.nproc_per_node = 2 if str(args.compute_tier) == "a100x2" else 1
 
     started = datetime.now(timezone.utc)
     out_path = Path(args.out)
@@ -80,6 +94,7 @@ def main() -> int:
     env["TRAIN_RUN_ONCE"] = "1"
     env["TRAIN_ENABLE_VC"] = "1" if bool(args.enable_vc) else "0"
     env["TRAIN_ENABLE_LIQUID"] = "1" if bool(args.enable_liquid) else "0"
+    env["TRAIN_NPROC_PER_NODE"] = str(int(args.nproc_per_node))
     env["BACKTEST_ALIGNMENT_MODE"] = "strict_asof"
     env["BACKTEST_ALIGNMENT_VERSION"] = "strict_asof_v1"
     env["BACKTEST_MAX_FEATURE_STALENESS_HOURS"] = str(24 * 14)
@@ -123,7 +138,8 @@ def main() -> int:
             }
         )
     else:
-        steps.append(_run(["python3", "training/main.py"], env=env))
+        train_cmd = _build_train_cmd(int(args.nproc_per_node), env=env)
+        steps.append(_run(train_cmd, env=env))
 
     ok = all(int(s.get("returncode", 1)) == 0 for s in steps)
     finished = datetime.now(timezone.utc)
@@ -139,6 +155,7 @@ def main() -> int:
         "duration_sec": round((finished - started).total_seconds(), 3),
         "status": "ok" if ok else "failed",
         "compute_tier": str(args.compute_tier),
+        "nproc_per_node": int(args.nproc_per_node),
         "symbols": [s.strip().upper() for s in str(args.symbols).split(",") if s.strip()],
         "estimated_hours": float(args.estimated_hours),
         "cost_estimate_cny": float(total_cost),

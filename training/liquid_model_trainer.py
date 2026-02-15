@@ -92,10 +92,22 @@ class TSMixerLiquidModel(nn.Module):
 
 
 class LiquidModelTrainer:
-    def __init__(self, pipeline: FeaturePipeline, symbols: List[str], db_url: str = DATABASE_URL):
+    def __init__(
+        self,
+        pipeline: FeaturePipeline,
+        symbols: List[str],
+        db_url: str = DATABASE_URL,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        local_rank: int = 0,
+    ):
         self.pipeline = pipeline
         self.symbols = symbols
         self.db_url = db_url
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
+        self.local_rank = int(local_rank)
         os.makedirs(MODEL_DIR, exist_ok=True)
 
     def _connect(self):
@@ -110,6 +122,18 @@ class LiquidModelTrainer:
             torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+    def _resolve_device(self) -> torch.device:
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+        if 0 <= self.local_rank < torch.cuda.device_count():
+            return torch.device(f"cuda:{self.local_rank}")
+        return torch.device("cuda")
+
+    def _symbols_for_rank(self) -> List[str]:
+        if self.world_size <= 1:
+            return list(self.symbols)
+        return [symbol for idx, symbol in enumerate(self.symbols) if idx % self.world_size == self.rank]
 
     @staticmethod
     def _to_sequence(xn: np.ndarray) -> np.ndarray:
@@ -149,7 +173,7 @@ class LiquidModelTrainer:
             return (x_pred @ w).astype(np.float32), "ridge_fallback", {"model": "ridge_fallback", "weights": w.astype(np.float32).tolist()}
 
     def train_symbol(self, symbol: str) -> Dict:
-        self._set_seed(SEED)
+        self._set_seed(SEED + self.rank)
         tf_candidates: List[str] = []
         primary_tf = os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m").strip().lower()
         for tf in [primary_tf, "5m", "15m", "1h"]:
@@ -287,7 +311,7 @@ class LiquidModelTrainer:
         seq = self._to_sequence(Xn)
         n_tokens = int(seq.shape[1])
         n_channels = int(seq.shape[2])
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = self._resolve_device()
         model = TSMixerLiquidModel(n_tokens=n_tokens, n_channels=n_channels, n_blocks=2).to(device)
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
         mse_loss = nn.MSELoss()
@@ -611,5 +635,20 @@ class LiquidModelTrainer:
         }
 
     def train_all(self) -> Dict:
-        results = [self.train_symbol(symbol) for symbol in self.symbols]
-        return {"status": "ok", "results": results}
+        assigned = self._symbols_for_rank()
+        if not assigned:
+            return {
+                "status": "no_symbols_assigned",
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "assigned_symbols": [],
+                "results": [],
+            }
+        results = [self.train_symbol(symbol) for symbol in assigned]
+        return {
+            "status": "ok",
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "assigned_symbols": assigned,
+            "results": results,
+        }

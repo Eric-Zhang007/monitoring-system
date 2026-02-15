@@ -8,7 +8,9 @@
 - supersede 治理已落地，历史 artifact 失败样本可审计排除；
 - 并发回测链路已打通：`backend` 改为多 `uvicorn workers` + 调参脚本并发重试；
 - 执行层规则化风控已扩展：单笔止损/止盈 + 日内回撤熔断；
-- 服务器离线部署脚本链路已补齐（预检/打包/上传/DB恢复/启动验收）。
+- 服务器离线部署脚本链路已补齐（预检/打包/上传/DB恢复/启动验收）；
+- 训练双卡编排已补齐：`training/main.py` 支持 `torchrun` rank/world-size，`liquid` 按 rank 分片 symbol 并行训练，`scripts/train_gpu_stage2.py` 支持 `--nproc-per-node` 自动双卡启动；
+- 受限内核服务器的无 Docker 预检与流程已补齐（`scripts/server_preflight_nodocker.sh` + `SERVER_PREP_PLAN_ZH.md`）。
 
 2. **门禁状态**
 - 严格口径（`prod + model + prod_live + lookback 180d`）：
@@ -25,6 +27,49 @@
 3. **上线判定**
 - 当前不满足“严格 Sharpe≥1.5”硬门禁，暂不进入 AutoDL `2×A100` 生产切换；
 - 仅建议继续 `paper + maintenance/prod_live` 校准与训练迭代。
+
+## ✅ 2026-02-15 双卡训练编排与无 Docker 路线补齐（本轮）
+
+1. **训练脚本双卡改造**
+- `training/main.py`：
+  - 增加分布式初始化与清理（`RANK/WORLD_SIZE/LOCAL_RANK`）；
+  - 支持 `torchrun --nproc_per_node=2` 多进程启动；
+  - `vc` 仅主 rank 执行，`liquid` 训练结果支持跨 rank 汇总日志。
+- `training/liquid_model_trainer.py`：
+  - 增加 `rank/world_size/local_rank`；
+  - `train_all` 按 rank 分片 `LIQUID_SYMBOLS`，避免重复训练与 checkpoint 抢写；
+  - 设备绑定到 `cuda:LOCAL_RANK`。
+- `training/vc_model_trainer.py`：
+  - 增加 rank 感知与设备绑定；
+  - 非主 rank 直接返回 `skipped_non_primary_rank`。
+
+2. **训练入口脚本改造**
+- `scripts/train_gpu_stage2.py`：
+  - 新增 `--nproc-per-node`；
+  - 自动根据 `compute-tier` 选择单进程或双卡分布式；
+  - 优先 `torchrun`，缺失时回退 `python -m torch.distributed.run`；
+  - 训练输出记录新增 `nproc_per_node`。
+
+3. **无 Docker 上线准备补齐**
+- 新增 `scripts/server_preflight_nodocker.sh`：
+  - 检查 `python3/git/screen/nvidia-smi`、磁盘/内存、GPU 数量；
+  - 输出 `torch`/CUDA 可用性探针；
+  - 可选 `DATABASE_URL` 连通探测。
+- `SERVER_PREP_PLAN_ZH.md` 新增“无 Docker 训练/推理流程”：
+  - 依赖安装（保留服务器现有 torch，不降级）；
+  - `screen + train_gpu_stage2.py --compute-tier a100x2 --nproc-per-node 2` 标准命令；
+  - 训练日志与状态查看命令。
+
+4. **本地验证**
+- `python3 -m py_compile training/main.py training/vc_model_trainer.py training/liquid_model_trainer.py scripts/train_gpu_stage2.py`：通过；
+- `python3 scripts/train_gpu_stage2.py --help`：通过；
+- 本机未安装 `torch/torchrun`，无法在本机完成分布式运行时验证；将以服务器环境做最终 smoke。
+
+5. **服务器验证（AutoDL 2xA800）**
+- 无 Docker 路线已验证可执行：`postgresql/redis` 启动 + `alembic upgrade head` 通过；
+- `torchrun --standalone --nproc_per_node=2 training/main.py`（`TRAIN_ENABLE_VC=0 TRAIN_ENABLE_LIQUID=0`）通过；
+- `python3 scripts/train_gpu_stage2.py --compute-tier a100x2 --nproc-per-node 2 --enable-vc --enable-liquid` 返回 `status=ok`；
+- `training/feature_pipeline.py` 已修复 `prices` 表缺失兼容：fallback 不再抛异常，改为安全返回 `source_used='none'` 并触发数据质量阻断。
 
 ## ✅ 2026-02-15 15:10 UTC 执行层风控与服务器部署准备（本轮）
 

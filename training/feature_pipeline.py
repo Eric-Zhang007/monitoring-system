@@ -58,8 +58,38 @@ class FeaturePipeline:
                 out[k] = v
         return out
 
-    def check_data_quality(self, symbol: str, timeframe: str = "5m", lookback_hours: int = 48) -> Dict[str, float]:
+    @staticmethod
+    def _timeframe_to_minutes(timeframe: str) -> int:
+        tf = str(timeframe or "5m").strip().lower()
+        try:
+            if tf.endswith("m"):
+                return max(1, int(tf[:-1] or "5"))
+            if tf.endswith("h"):
+                return max(1, int(tf[:-1] or "1")) * 60
+            if tf.endswith("d"):
+                return max(1, int(tf[:-1] or "1")) * 1440
+            return max(1, int(tf))
+        except Exception:
+            return 5
+
+    def check_data_quality(
+        self,
+        symbol: str,
+        timeframe: str = "5m",
+        lookback_hours: int = 48,
+        min_rows_override: Optional[int] = None,
+    ) -> Dict[str, float]:
         thresholds = self._dq_thresholds()
+        tf_minutes = self._timeframe_to_minutes(timeframe)
+        expected_rows = max(1, int((max(1, lookback_hours) * 60) / max(1, tf_minutes)))
+        required_rows = int(thresholds["min_rows"]) if min_rows_override is None else int(min_rows_override)
+        if min_rows_override is None and tf_minutes > 5:
+            ratio = float(os.getenv("DQ_MIN_COVERAGE_RATIO", "0.7"))
+            adaptive_rows = max(24, int(expected_rows * max(0.1, ratio)))
+            required_rows = min(int(thresholds["min_rows"]), adaptive_rows)
+        stale_mult = float(os.getenv("DQ_STALE_GAP_MULTIPLIER", "3.0"))
+        stale_gap_seconds = int(max(1, tf_minutes * 60 * stale_mult))
+        source_used = "market_bars"
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -76,7 +106,7 @@ class FeaturePipeline:
                       ), 0) AS duplicate_rows,
                       COALESCE(SUM(
                         CASE
-                          WHEN prev_ts IS NOT NULL AND EXTRACT(EPOCH FROM (ts - prev_ts)) > 900 THEN 1
+                          WHEN prev_ts IS NOT NULL AND EXTRACT(EPOCH FROM (ts - prev_ts)) > %s THEN 1
                           ELSE 0
                         END
                       ), 0) AS stale_gap_rows
@@ -90,9 +120,42 @@ class FeaturePipeline:
                         AND ts > NOW() - make_interval(hours => %s)
                     ) s
                     """,
-                    (symbol, timeframe, lookback_hours),
+                    (stale_gap_seconds, symbol, timeframe, lookback_hours),
                 )
                 row = dict(cur.fetchone() or {})
+                if int(row.get("total_rows") or 0) <= 0:
+                    source_used = "prices"
+                    fallback_gap = int(max(stale_gap_seconds, float(os.getenv("DQ_PRICE_STALE_GAP_SECONDS", "10800"))))
+                    cur.execute(
+                        """
+                        SELECT
+                          COUNT(*) AS total_rows,
+                          COALESCE(SUM(CASE WHEN price IS NULL OR volume IS NULL THEN 1 ELSE 0 END), 0) AS missing_rows,
+                          COALESCE(SUM(CASE WHEN price <= 0 THEN 1 ELSE 0 END), 0) AS invalid_price_rows,
+                          COALESCE(SUM(
+                            CASE
+                              WHEN prev_ts IS NOT NULL AND timestamp = prev_ts THEN 1
+                              ELSE 0
+                            END
+                          ), 0) AS duplicate_rows,
+                          COALESCE(SUM(
+                            CASE
+                              WHEN prev_ts IS NOT NULL AND EXTRACT(EPOCH FROM (timestamp - prev_ts)) > %s THEN 1
+                              ELSE 0
+                            END
+                          ), 0) AS stale_gap_rows
+                        FROM (
+                          SELECT
+                            timestamp, price, volume,
+                            LAG(timestamp) OVER (ORDER BY timestamp ASC) AS prev_ts
+                          FROM prices
+                          WHERE symbol = UPPER(%s)
+                            AND timestamp > NOW() - make_interval(hours => %s)
+                        ) s
+                        """,
+                        (fallback_gap, symbol, lookback_hours),
+                    )
+                    row = dict(cur.fetchone() or {})
         total = int(row.get("total_rows") or 0)
         missing = int(row.get("missing_rows") or 0)
         invalid = int(row.get("invalid_price_rows") or 0)
@@ -103,7 +166,7 @@ class FeaturePipeline:
         dup_rate = float(dup / max(1, total))
         stale_ratio = float(stale / max(1, total))
         passed = (
-            total >= int(thresholds["min_rows"])
+            total >= int(required_rows)
             and missing_rate <= thresholds["missing_rate_max"]
             and invalid_rate <= thresholds["invalid_price_rate_max"]
             and dup_rate <= thresholds["duplicate_rate_max"]
@@ -111,6 +174,9 @@ class FeaturePipeline:
         )
         return {
             "total_rows": float(total),
+            "required_rows": float(required_rows),
+            "source_used": source_used,
+            "timeframe_used": str(timeframe),
             "missing_rate": missing_rate,
             "invalid_price_rate": invalid_rate,
             "duplicate_rate": dup_rate,
@@ -154,13 +220,14 @@ class FeaturePipeline:
             meta=rows,
         )
 
-    def load_liquid_training_batch(self, symbol: str, limit: int = 2000) -> SampleBatch:
+    def load_liquid_training_batch(self, symbol: str, limit: int = 2000, timeframe: str = "5m") -> SampleBatch:
         rows: List[Dict] = []
         orderbook_rows: List[Dict] = []
         funding_rows: List[Dict] = []
         onchain_rows: List[Dict] = []
         event_rows: List[Dict] = []
         global_event_rows: List[Dict] = []
+        effective_timeframe = str(timeframe)
         with self._connect() as conn:
             with conn.cursor() as cur:
                 try:
@@ -169,11 +236,11 @@ class FeaturePipeline:
                         SELECT symbol, close::float AS price, volume::float AS volume, ts AS timestamp
                         FROM market_bars
                         WHERE symbol = UPPER(%s)
-                          AND timeframe = '5m'
+                          AND timeframe = %s
                         ORDER BY ts DESC
                         LIMIT %s
                         """,
-                        (symbol, limit),
+                        (symbol, timeframe, limit),
                     )
                     rows = [dict(r) for r in cur.fetchall()]
                     cur.execute(
@@ -261,6 +328,7 @@ class FeaturePipeline:
                 except Exception:
                     rows = []
                 if not rows:
+                    effective_timeframe = os.getenv("LIQUID_PRICE_FALLBACK_TIMEFRAME", "1h")
                     cur.execute(
                         """
                         SELECT symbol, price::float AS price, volume::float AS volume, timestamp
@@ -275,7 +343,11 @@ class FeaturePipeline:
 
         rows = sorted(rows, key=lambda r: r["timestamp"])
 
-        if len(rows) < 10:
+        tf_minutes = self._timeframe_to_minutes(effective_timeframe)
+        step_1h = max(1, int(round(60.0 / max(1, tf_minutes))))
+        step_4h = max(1, step_1h * 4)
+        history_len = 96
+        if len(rows) < (history_len + step_4h + 2):
             return SampleBatch(X=np.zeros((0, 18), dtype=np.float32), y=np.zeros((0,), dtype=np.float32), meta=[], extra_labels={})
 
         ob_ts = [r["timestamp"] for r in orderbook_rows]
@@ -316,7 +388,7 @@ class FeaturePipeline:
         labels_1h = []
         labels_4h = []
         labels_cost = []
-        for i in range(96, len(rows) - 49):
+        for i in range(history_len, len(rows) - step_4h):
             price = float(rows[i].get("price") or 0.0)
             if price <= 0:
                 continue
@@ -387,8 +459,8 @@ class FeaturePipeline:
                 ]
             )
 
-            fwd_1h = (float(rows[i + 12].get("price") or price) - price) / max(price, 1e-12)
-            fwd_4h = (float(rows[i + 48].get("price") or price) - price) / max(price, 1e-12)
+            fwd_1h = (float(rows[i + step_1h].get("price") or price) - price) / max(price, 1e-12)
+            fwd_4h = (float(rows[i + step_4h].get("price") or price) - price) / max(price, 1e-12)
             est_cost = (5.0 + 3.0) / 10000.0 + min(0.002, 0.5 * abs(orderbook_imbalance) / 1000.0)
             labels.append(fwd_1h - est_cost)
             labels_1h.append(fwd_1h - est_cost)

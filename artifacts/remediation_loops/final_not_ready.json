@@ -1,8 +1,0 @@
-{
-  "status": "not_ready",
-  "message": "max iterations reached before readiness gates turned green",
-  "iterations": 1,
-  "consecutive_green": 0,
-  "started_at": "2026-02-15T11:21:50.082450+00:00",
-  "finished_at": "2026-02-15T11:22:23.483413+00:00"
-}

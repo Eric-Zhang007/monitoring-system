@@ -57,6 +57,8 @@ Thumbs.db
 venv/
 env/
 ENV/
+.venv/
+.venv_ssh/
 
 # Testing
 .pytest_cache/
@@ -76,3 +78,13 @@ temp/
 *.tmp
 .cache/
 .ipynb_checkpoints/
+
+# Local planning scratch files
+Codex Plan
+Codex Plan2
+NUL
+
+# Runtime artifacts (keep only placeholders/docs)
+artifacts/**
+!artifacts/.gitkeep
+!artifacts/README.md

@@ -24,7 +24,7 @@ def _json_cmd(cmd: list[str]) -> Dict[str, Any]:
 
 
 def main() -> int:
-    min_sharpe_daily = float(os.getenv("GPU_CUTOVER_MIN_SHARPE_DAILY", os.getenv("BACKTEST_GATE_MIN_SHARPE_DAILY", "0.4")))
+    min_sharpe_daily = float(os.getenv("GPU_CUTOVER_MIN_SHARPE_DAILY", os.getenv("BACKTEST_GATE_MIN_SHARPE_DAILY", "1.5")))
     strict_common = [
         "--score-source",
         "model",

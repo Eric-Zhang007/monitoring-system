@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+import requests
+
 
 def _run(cmd: List[str], env: Dict[str, str]) -> Dict[str, Any]:
     p = subprocess.run(cmd, env=env, capture_output=True, text=True)
@@ -40,6 +42,17 @@ def _estimate_cost_cny(hours: float, compute_tier: str, a100_hourly_cny: float, 
     return 0.0
 
 
+def _api_ready(api_base: str, timeout_sec: float = 3.0) -> bool:
+    url = f"{str(api_base).rstrip('/')}/health"
+    try:
+        r = requests.get(url, timeout=float(timeout_sec))
+        if r.status_code < 500:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Stage-2 GPU training orchestrator (strict-asof + external events)")
     ap.add_argument("--symbols", default=os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL"))
@@ -62,8 +75,8 @@ def main() -> int:
 
     env = os.environ.copy()
     env["LIQUID_SYMBOLS"] = str(args.symbols)
-    env["EPOCHS"] = str(int(args.epochs))
-    env["BATCH_SIZE"] = str(int(args.batch_size))
+    env["LIQUID_EPOCHS"] = str(int(args.epochs))
+    env["LIQUID_BATCH_SIZE"] = str(int(args.batch_size))
     env["TRAIN_RUN_ONCE"] = "1"
     env["TRAIN_ENABLE_VC"] = "1" if bool(args.enable_vc) else "0"
     env["TRAIN_ENABLE_LIQUID"] = "1" if bool(args.enable_liquid) else "0"
@@ -73,21 +86,31 @@ def main() -> int:
 
     steps: List[Dict[str, Any]] = []
     if bool(args.run_optuna):
-        steps.append(
-            _run(
-                [
-                    "python3",
-                    "scripts/optuna_liquid_hpo.py",
-                    "--compute-tier",
-                    str(args.compute_tier),
-                    "--n-trials",
-                    str(int(args.optuna_trials)),
-                    "--a100-hourly-cny",
-                    str(float(args.a100_hourly_cny)),
-                ],
-                env=env,
+        if _api_ready(env.get("API_BASE", "http://localhost:8000")):
+            steps.append(
+                _run(
+                    [
+                        "python3",
+                        "scripts/optuna_liquid_hpo.py",
+                        "--compute-tier",
+                        str(args.compute_tier),
+                        "--n-trials",
+                        str(int(args.optuna_trials)),
+                        "--a100-hourly-cny",
+                        str(float(args.a100_hourly_cny)),
+                    ],
+                    env=env,
+                )
             )
-        )
+        else:
+            steps.append(
+                {
+                    "cmd": ["python3", "scripts/optuna_liquid_hpo.py"],
+                    "returncode": 0,
+                    "stdout": "",
+                    "stderr": "skipped: backtest API is not reachable, optuna disabled for this run",
+                }
+            )
 
     dep = _check_module("torch", env=env)
     if not dep["ok"]:

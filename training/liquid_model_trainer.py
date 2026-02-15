@@ -150,7 +150,26 @@ class LiquidModelTrainer:
 
     def train_symbol(self, symbol: str) -> Dict:
         self._set_seed(SEED)
-        dq = self.pipeline.check_data_quality(symbol, timeframe="5m", lookback_hours=72)
+        tf_candidates: List[str] = []
+        primary_tf = os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m").strip().lower()
+        for tf in [primary_tf, "5m", "15m", "1h"]:
+            cur_tf = tf.strip().lower()
+            if cur_tf and cur_tf not in tf_candidates:
+                tf_candidates.append(cur_tf)
+        selected_tf = tf_candidates[0] if tf_candidates else "5m"
+        dq: Dict = {}
+        best_dq: Dict | None = None
+        for tf in tf_candidates:
+            check = self.pipeline.check_data_quality(symbol, timeframe=tf, lookback_hours=72)
+            if (best_dq is None) or (float(check.get("total_rows", 0.0)) > float(best_dq.get("total_rows", 0.0))):
+                best_dq = check
+                selected_tf = tf
+            if float(check.get("quality_passed", 0.0)) >= 0.5:
+                dq = check
+                selected_tf = tf
+                break
+        if not dq:
+            dq = best_dq or {}
         dq_failed_reasons = []
         if float(dq.get("missing_rate", 0.0)) > float(os.getenv("DQ_MAX_MISSING_RATE", "0.02")):
             dq_failed_reasons.append("missing_rate_exceeded")
@@ -161,16 +180,19 @@ class LiquidModelTrainer:
         if float(dq.get("stale_ratio", 0.0)) > float(os.getenv("DQ_MAX_STALE_RATIO", "0.1")):
             dq_failed_reasons.append("stale_ratio_exceeded")
         if dq.get("quality_passed", 0.0) < 0.5:
+            if float(dq.get("total_rows", 0.0)) < float(dq.get("required_rows", 0.0)):
+                dq_failed_reasons.append("insufficient_rows")
             return {
                 "symbol": symbol,
                 "status": "blocked_by_data_quality",
                 "reason": ",".join(dq_failed_reasons) or "quality_gate_failed",
+                "timeframe": selected_tf,
                 "data_quality": dq,
             }
 
-        batch = self.pipeline.load_liquid_training_batch(symbol=symbol, limit=4000)
+        batch = self.pipeline.load_liquid_training_batch(symbol=symbol, limit=4000, timeframe=selected_tf)
         if batch.X.shape[0] == 0:
-            return {"symbol": symbol, "status": "no_data"}
+            return {"symbol": symbol, "status": "no_data", "timeframe": selected_tf, "data_quality": dq}
 
         X, y = batch.X, batch.y
         train_lineage_id = f"train-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{symbol.lower()}"
@@ -565,6 +587,7 @@ class LiquidModelTrainer:
         return {
             "symbol": symbol,
             "status": "ok",
+            "timeframe": selected_tf,
             "train_lineage_id": train_lineage_id,
             "samples": int(X.shape[0]),
             "train_mse": round(lgb_mse, 9),

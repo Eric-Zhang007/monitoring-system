@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import itertools
 import json
 import os
+import time
 from typing import Any, Dict, List, Tuple
 
 import requests
@@ -89,6 +91,7 @@ def main() -> int:
     ap.add_argument("--run-source", default="prod", choices=["prod", "maintenance"])
     ap.add_argument("--data-regime", default="", help="prod_live|maintenance_replay|mixed; empty means infer from run-source")
     ap.add_argument("--score-source", default="model", choices=["model", "heuristic"])
+    ap.add_argument("--require-model-artifact", action="store_true")
     ap.add_argument("--signal-polarity-mode", default="auto_train_ic", choices=["normal", "auto_train_ic", "auto_train_pnl"])
     ap.add_argument("--alignment-mode", default="strict_asof", choices=["strict_asof", "legacy_index"])
     ap.add_argument("--alignment-version", default="strict_asof_v1")
@@ -101,6 +104,9 @@ def main() -> int:
     ap.add_argument("--test-days", type=int, default=7)
     ap.add_argument("--max-trials", type=int, default=512)
     ap.add_argument("--request-timeout-sec", type=float, default=45.0)
+    ap.add_argument("--parallelism", type=int, default=max(1, min(8, (os.cpu_count() or 4))))
+    ap.add_argument("--max-retries", type=int, default=2)
+    ap.add_argument("--retry-backoff-sec", type=float, default=1.5)
     ap.add_argument("--entry-grid", default="0.08,0.06,0.05,0.04,0.03,0.02,0.015")
     ap.add_argument("--exit-grid", default="0.005,0.008,0.01,0.012,0.015,0.02")
     ap.add_argument("--base-weight-grid", default="0.08,0.1,0.12,0.15,0.18")
@@ -127,9 +133,9 @@ def main() -> int:
     }
 
     keys = list(grid.keys())
-    trials = []
+    payloads: List[Tuple[Dict[str, str], Dict[str, Any]]] = []
     for values in itertools.product(*(grid[k] for k in keys)):
-        if len(trials) >= args.max_trials:
+        if len(payloads) >= args.max_trials:
             break
         cfg = dict(zip(keys, values))
         payload = {
@@ -141,7 +147,7 @@ def main() -> int:
             "alignment_mode": args.alignment_mode,
             "alignment_version": args.alignment_version,
             "max_feature_staleness_hours": int(args.max_feature_staleness_hours),
-            "require_model_artifact": True,
+            "require_model_artifact": bool(args.require_model_artifact),
             "targets": targets,
             "horizon": "1d",
             "data_version": args.data_version,
@@ -156,36 +162,60 @@ def main() -> int:
             "position_max_weight_high_vol_mult": float(cfg["POSITION_MAX_WEIGHT_HIGH_VOL_MULT"]),
             "cost_penalty_lambda": float(cfg["COST_PENALTY_LAMBDA"]),
         }
-        try:
-            metric = _run_backtest(args.api_base, payload, timeout_sec=float(args.request_timeout_sec))
-        except Exception as exc:
-            trials.append({"config": cfg, "status": "error", "error": type(exc).__name__})
-            continue
-        if str(metric.get("status")) != "completed":
-            trials.append(
-                {
-                    "config": cfg,
-                    "status": str(metric.get("status") or "failed"),
-                    "reason": str(metric.get("reason") or ""),
-                    "run_id": metric.get("run_id"),
-                }
-            )
-            continue
-        trials.append(
-            {
+        payloads.append((cfg, payload))
+
+    def _eval_one(cfg: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
+        retries = max(0, int(args.max_retries))
+        backoff = max(0.0, float(args.retry_backoff_sec))
+        metric: Dict[str, Any] | None = None
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                metric = _run_backtest(args.api_base, payload, timeout_sec=float(args.request_timeout_sec))
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries and backoff > 0:
+                    time.sleep(backoff * (attempt + 1))
+        if metric is None:
+            return {
                 "config": cfg,
-                "payload": {
-                    "fee_bps": float(args.fee_bps),
-                    "slippage_bps": float(args.slippage_bps),
-                    "signal_polarity_mode": args.signal_polarity_mode,
-                    "alignment_mode": args.alignment_mode,
-                    "alignment_version": args.alignment_version,
-                    "max_feature_staleness_hours": int(args.max_feature_staleness_hours),
-                },
-                "metric": metric,
-                "status": "ok",
+                "status": "error",
+                "error": type(last_exc).__name__ if last_exc else "UnknownError",
+                "error_message": str(last_exc)[:240] if last_exc else "",
             }
-        )
+        if str(metric.get("status")) != "completed":
+            return {
+                "config": cfg,
+                "status": str(metric.get("status") or "failed"),
+                "reason": str(metric.get("reason") or ""),
+                "run_id": metric.get("run_id"),
+            }
+        return {
+            "config": cfg,
+            "payload": {
+                "fee_bps": float(args.fee_bps),
+                "slippage_bps": float(args.slippage_bps),
+                "signal_polarity_mode": args.signal_polarity_mode,
+                "alignment_mode": args.alignment_mode,
+                "alignment_version": args.alignment_version,
+                "max_feature_staleness_hours": int(args.max_feature_staleness_hours),
+            },
+            "metric": metric,
+            "status": "ok",
+        }
+
+    trials: List[Dict[str, Any]] = []
+    workers = max(1, int(args.parallelism))
+    if workers <= 1:
+        for cfg, payload in payloads:
+            trials.append(_eval_one(cfg, payload))
+    else:
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_eval_one, cfg, payload) for cfg, payload in payloads]
+            for fut in cf.as_completed(futures):
+                trials.append(fut.result())
 
     def _score(item: Dict[str, Any]) -> tuple[float, float, float]:
         m = item.get("metric") or {}

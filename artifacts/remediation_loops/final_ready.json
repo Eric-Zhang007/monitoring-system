@@ -1,8 +1,0 @@
-{
-  "status": "ready",
-  "message": "ready_for_gpu_cutover maintained across required windows",
-  "iterations": 1,
-  "consecutive_green": 1,
-  "started_at": "2026-02-15T11:25:40.005224+00:00",
-  "finished_at": "2026-02-15T11:26:12.982051+00:00"
-}

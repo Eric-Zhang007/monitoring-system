@@ -195,9 +195,6 @@ async def consume_redis_messages():
             # 消费价格消息
             await asyncio.to_thread(consumer.consume, 'price_stream', count=10, block_ms=100)
 
-            # 消费新闻消息
-            await asyncio.to_thread(consumer.consume, 'news_stream', count=10, block_ms=100)
-
             await asyncio.sleep(0.1)
 
         except Exception as e:

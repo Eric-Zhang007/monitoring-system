@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import hashlib
 from datetime import datetime
 from typing import Dict, List
 
@@ -37,6 +38,8 @@ WF_PURGE_WINDOW = int(os.getenv("LIQUID_WF_PURGE_WINDOW", "12"))
 WF_MIN_FOLDS = int(os.getenv("LIQUID_WF_MIN_FOLDS", "3"))
 PKF_SPLITS = int(os.getenv("LIQUID_PURGED_KFOLD_SPLITS", "5"))
 PKF_PURGE_WINDOW = int(os.getenv("LIQUID_PURGED_KFOLD_PURGE", "12"))
+FEATURE_VERSION = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
+DATA_VERSION = os.getenv("DATA_VERSION", "v1")
 
 
 class MixerBlock(nn.Module):
@@ -188,6 +191,10 @@ class LiquidModelTrainer:
                 "funding_rate": float(r[12]),
                 "onchain_norm": float(r[13]),
                 "event_decay": float(r[14]),
+                "orderbook_missing_flag": float(r[15]) if len(r) > 15 else 1.0,
+                "funding_missing_flag": float(r[16]) if len(r) > 16 else 1.0,
+                "onchain_missing_flag": float(r[17]) if len(r) > 17 else 1.0,
+                "feature_payload_schema_version": "v2.1",
             }
             for r in X
         ]
@@ -195,9 +202,9 @@ class LiquidModelTrainer:
             target=symbol.upper(),
             track="liquid",
             feature_rows=feature_rows,
-            version="feature-store-v2.0",
+            version=FEATURE_VERSION,
             lineage_id=train_lineage_id,
-            data_version=os.getenv("DATA_VERSION", "v1"),
+            data_version=DATA_VERSION,
         )
         label_1h = batch.extra_labels.get("fwd_ret_1h", y) if batch.extra_labels else y
         label_4h = batch.extra_labels.get("fwd_ret_4h", y) if batch.extra_labels else y
@@ -374,27 +381,42 @@ class LiquidModelTrainer:
             )
 
         model_path = os.path.join(MODEL_DIR, f"liquid_{symbol.lower()}_lgbm_baseline_v2.json")
+        model_name = f"liquid_baseline_{symbol.lower()}"
+        model_version = "v2.0"
+        created_at = datetime.utcnow().isoformat() + "Z"
         with open(model_path, "w", encoding="utf-8") as f:
             base_payload = {
+                "model_name": model_name,
+                "model_version": model_version,
+                "track": "liquid",
+                "type": "tabular_lightgbm" if lgb_model_name == "lightgbm" else "tabular_linear",
+                "created_at": created_at,
+                "feature_version": FEATURE_VERSION,
+                "data_version": DATA_VERSION,
                 "x_mean": x_mean.flatten().tolist(),
                 "x_std": x_std.flatten().tolist(),
-                "trained_at": datetime.utcnow().isoformat(),
+                "trained_at": created_at,
                 "seed": SEED,
                 "feature_dim": int(X.shape[1]),
             }
             base_payload.update(lgb_model_payload)
             json.dump(base_payload, f)
         nn_model_path = os.path.join(MODEL_DIR, f"liquid_{symbol.lower()}_tsmixer_v2.pt")
+        model_version_nn = "v2.1"
         torch.save(
             {
                 "state_dict": model.state_dict(),
                 "n_tokens": n_tokens,
                 "n_channels": n_channels,
-                "trained_at": datetime.utcnow().isoformat(),
+                "trained_at": created_at,
                 "type": "tsmixer_liquid",
                 "seed": SEED,
                 "normalization": {"x_mean": x_mean.flatten().tolist(), "x_std": x_std.flatten().tolist()},
                 "ensemble_alpha": float(ensemble_alpha),
+                "feature_payload_schema_version": "v2.1",
+                "feature_version": FEATURE_VERSION,
+                "data_version": DATA_VERSION,
+                "train_report_hash": "",
             },
             nn_model_path,
         )
@@ -416,11 +438,57 @@ class LiquidModelTrainer:
             "purged_kfold": pkf_metrics,
             "feature_dim": int(X.shape[1]),
             "samples": int(X.shape[0]),
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": created_at,
+            "feature_version": FEATURE_VERSION,
+            "data_version": DATA_VERSION,
+            "feature_payload_schema_version": "v2.1",
         }
+        train_report_hash = hashlib.sha256(
+            json.dumps(train_manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        train_manifest["train_report_hash"] = train_report_hash
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "n_tokens": n_tokens,
+                "n_channels": n_channels,
+                "trained_at": created_at,
+                "type": "tsmixer_liquid",
+                "seed": SEED,
+                "normalization": {"x_mean": x_mean.flatten().tolist(), "x_std": x_std.flatten().tolist()},
+                "ensemble_alpha": float(ensemble_alpha),
+                "feature_payload_schema_version": "v2.1",
+                "feature_version": FEATURE_VERSION,
+                "data_version": DATA_VERSION,
+                "train_report_hash": train_report_hash,
+            },
+            nn_model_path,
+        )
         manifest_path = os.path.join(MODEL_DIR, f"liquid_{symbol.lower()}_train_manifest_v2.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(train_manifest, f)
+        nn_manifest_path = os.path.join(MODEL_DIR, f"liquid_{symbol.lower()}_tsmixer_v2.manifest.json")
+        with open(nn_manifest_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "model_name": f"liquid_ttm_{symbol.lower()}",
+                    "model_version": model_version_nn,
+                    "track": "liquid",
+                    "type": "tsmixer_liquid",
+                    "created_at": created_at,
+                    "feature_version": FEATURE_VERSION,
+                    "data_version": DATA_VERSION,
+                    "feature_payload_schema_version": "v2.1",
+                    "n_tokens": n_tokens,
+                    "n_channels": n_channels,
+                    "ensemble_alpha": float(ensemble_alpha),
+                    "normalization": {"x_mean": x_mean.flatten().tolist(), "x_std": x_std.flatten().tolist()},
+                    "train_report_hash": train_report_hash,
+                    "train_manifest_path": manifest_path,
+                    "checkpoint_path": nn_model_path,
+                },
+                f,
+            )
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -436,9 +504,9 @@ class LiquidModelTrainer:
                         created_at = NOW()
                     """,
                     (
-                        f"liquid_baseline_{symbol.lower()}",
+                        model_name,
                         "liquid",
-                        "v2.0",
+                        model_version,
                         model_path,
                         json.dumps(
                             {
@@ -467,7 +535,7 @@ class LiquidModelTrainer:
                     (
                         f"liquid_ttm_{symbol.lower()}",
                         "liquid",
-                        "v2.1",
+                        model_version_nn,
                         nn_model_path,
                         json.dumps(
                             {
@@ -486,6 +554,8 @@ class LiquidModelTrainer:
                                 "walk_forward": wf_metrics,
                                 "purged_kfold": pkf_metrics,
                                 "train_manifest_path": manifest_path,
+                                "train_report_hash": train_report_hash,
+                                "checkpoint_manifest_path": nn_manifest_path,
                                 "data_quality": dq,
                             }
                         ),
@@ -512,6 +582,8 @@ class LiquidModelTrainer:
                 "fwd_ret_4h_mean": round(float(np.mean(label_4h)), 9),
             },
             "train_manifest_path": manifest_path,
+            "train_report_hash": train_report_hash,
+            "checkpoint_manifest_path": nn_manifest_path,
             "data_quality": dq,
         }
 

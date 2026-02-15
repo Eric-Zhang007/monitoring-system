@@ -60,6 +60,8 @@ ENV/
 
 # Testing
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
@@ -72,3 +74,5 @@ htmlcov/
 tmp/
 temp/
 *.tmp
+.cache/
+.ipynb_checkpoints/

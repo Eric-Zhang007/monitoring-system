@@ -21,6 +21,16 @@ groups:
           summary: "Execution reject rate high"
           description: "Recent execution reject rate exceeded 15% for at least 5 minutes."
 
+      - alert: ExecutionRejectRateCritical
+        expr: max(ms_execution_reject_rate{track="liquid"}) > 0.01
+        for: 5m
+        labels:
+          severity: P1
+          route: trading_execution
+        annotations:
+          summary: "Execution reject rate above 1%"
+          description: "Liquid track reject rate exceeded 1% for at least 5 minutes."
+
       - alert: ApiAvailabilityLow
         expr: (sum(rate(ms_http_requests_total[5m])) - sum(rate(ms_http_requests_total{status=~"5.."}[5m]))) / sum(rate(ms_http_requests_total[5m])) < 0.999
         for: 5m
@@ -62,3 +72,53 @@ groups:
         annotations:
           summary: "Signal latency p99 degraded"
           description: "Signal generation p99 latency is above 250ms for at least 10 minutes."
+
+      - alert: ExecutionRejectReasonSkew
+        expr: max by (adapter, reason) (increase(ms_execution_rejects_total[15m])) > 10
+        for: 5m
+        labels:
+          severity: P2
+          route: model_data
+        annotations:
+          summary: "Execution reject reason skew"
+          description: "Single reject reason spiked in the last 15 minutes."
+
+      - alert: CollectorConnectorFailureSpike
+        expr: increase(ms_collector_connector_fetch_total{status="failure"}[15m]) > 10
+        for: 5m
+        labels:
+          severity: P2
+          route: model_data
+        annotations:
+          summary: "Collector connector failure spike"
+          description: "Connector fetch failures spiked in the last 15 minutes."
+
+      - alert: CollectorConnectorRateLimited
+        expr: increase(ms_collector_connector_rate_limit_total[15m]) > 10
+        for: 5m
+        labels:
+          severity: P2
+          route: model_data
+        annotations:
+          summary: "Collector connector rate limited"
+          description: "Data source connectors are being rate-limited repeatedly."
+
+      - alert: CollectorConnectorSuccessRateLow
+        expr: (sum(increase(ms_collector_connector_fetch_total{status=~"success|empty"}[15m])) / clamp_min(sum(increase(ms_collector_connector_fetch_total{status=~"success|empty|failure"}[15m])), 1)) < 0.95
+        for: 10m
+        labels:
+          severity: P2
+          route: model_data
+        annotations:
+          summary: "Collector connector success rate low"
+          description: "Connector fetch success rate dropped below 95% in the last 15 minutes."
+
+      - alert: CollectorSourcePublishToIngestP95Degraded
+        expr: histogram_quantile(0.95, sum(rate(ms_collector_source_publish_to_ingest_seconds_bucket[15m])) by (le)) > 120
+        for: 10m
+        labels:
+          severity: P2
+          route: model_data
+        annotations:
+          summary: "Collector source-to-ingest latency p95 degraded"
+          description: "source_publish_to_ingest p95 is above 120 seconds for at least 10 minutes."

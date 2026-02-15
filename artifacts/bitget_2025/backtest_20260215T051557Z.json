@@ -1,0 +1,89 @@
+{
+  "test_name": "bitget_2025_real_history_backtest",
+  "executed_at": "2026-02-15T05:15:57.729367+00:00",
+  "window_start": "2025-01-01T00:00:00+00:00",
+  "window_end": "2025-12-31T23:59:59+00:00",
+  "source": {
+    "exchange": "bitget",
+    "market": "USDT-FUTURES",
+    "granularity": "1H",
+    "symbols": {
+      "BTCUSDT": "BTC_BG2025",
+      "ETHUSDT": "ETH_BG2025",
+      "SOLUSDT": "SOL_BG2025"
+    }
+  },
+  "ingest_stats": {
+    "BTC_BG2025": {
+      "prices": 8759,
+      "features": 8662
+    },
+    "ETH_BG2025": {
+      "prices": 8759,
+      "features": 8662
+    },
+    "SOL_BG2025": {
+      "prices": 8759,
+      "features": 8662
+    }
+  },
+  "backtest_request": {
+    "track": "liquid",
+    "run_source": "maintenance",
+    "targets": [
+      "BTC_BG2025",
+      "ETH_BG2025",
+      "SOL_BG2025"
+    ],
+    "horizon": "1d",
+    "lookback_days": 500,
+    "train_days": 35,
+    "test_days": 7,
+    "fee_bps": 5.0,
+    "slippage_bps": 3.0
+  },
+  "backtest_response": {
+    "run_id": 172,
+    "status": "failed",
+    "metrics": {
+      "status": "failed",
+      "reason": "insufficient_features",
+      "run_source": "maintenance",
+      "targets": [
+        "BTC_BG2025",
+        "ETH_BG2025",
+        "SOL_BG2025"
+      ],
+      "samples": 0,
+      "ic": 0.0,
+      "hit_rate": 0.0,
+      "turnover": 0.0,
+      "pnl_after_cost": 0.0,
+      "max_drawdown": 0.0,
+      "model_name": "liquid_ttm_ensemble",
+      "model_version": "v2.1",
+      "lineage_coverage": 0.0,
+      "cost_breakdown": {
+        "fee": 0.0,
+        "slippage": 0.0,
+        "impact": 0.0
+      },
+      "gate_passed": false
+    }
+  },
+  "key_metrics": {
+    "samples": 0,
+    "ic": 0.0,
+    "hit_rate": 0.0,
+    "turnover": 0.0,
+    "pnl_after_cost": 0.0,
+    "max_drawdown": 0.0,
+    "lineage_coverage": 0.0,
+    "cost_breakdown": {
+      "fee": 0.0,
+      "slippage": 0.0,
+      "impact": 0.0
+    },
+    "regime_breakdown": null
+  }
+}

@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import numpy as np
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from v2_router import _run_model_replay_backtest  # noqa: E402
@@ -57,3 +59,43 @@ def test_model_replay_backtest_reports_lineage_and_cost_breakdown():
     assert "lineage_coverage" in out
     assert "cost_breakdown" in out
     assert set(out["cost_breakdown"].keys()) == {"fee", "slippage", "impact"}
+
+
+def test_model_replay_backtest_disables_posthoc_polarity_selection():
+    features = _build_feature_rows(100)
+    prices = _build_price_rows(101)
+    out = _run_model_replay_backtest(features, prices, fee_bps=5.0, slippage_bps=3.0)
+    assert out["signal_polarity"] == "normal"
+    assert out["polarity_selection"] == "disabled"
+
+
+def test_model_replay_backtest_outputs_regime_breakdown():
+    features = _build_feature_rows(140)
+    prices = _build_price_rows(141)
+    out = _run_model_replay_backtest(features, prices, fee_bps=5.0, slippage_bps=3.0)
+    assert "regime_breakdown" in out
+    assert isinstance(out["regime_breakdown"], dict)
+
+
+def test_model_replay_backtest_auto_train_ic_can_invert_polarity():
+    n = 120
+    rets = np.array([0.002 if i % 2 == 0 else -0.0018 for i in range(n)], dtype=np.float64)
+    raw = -rets.copy()
+    features = _build_feature_rows(n)
+    price = 100.0
+    prices = [dict(price=price, volume=1000.0)]
+    for r in rets:
+        price *= (1.0 + float(r))
+        prices.append({"price": price, "volume": 1000.0})
+    out = _run_model_replay_backtest(
+        features,
+        prices,
+        fee_bps=5.0,
+        slippage_bps=3.0,
+        raw_series_override=raw,
+        signal_polarity_mode="auto_train_ic",
+        calibration_ratio=0.6,
+    )
+    assert out["status"] == "completed"
+    assert out["signal_polarity"] == "inverted"
+    assert out["polarity_selection"] == "auto_train_ic"

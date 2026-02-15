@@ -39,6 +39,7 @@ class RSSConnector(BaseConnector):
 
         return {
             "event_type": event_type,
+            "market_scope": "crypto",
             "title": title,
             "occurred_at": occurred_at.astimezone(dt.timezone.utc).isoformat(),
             "source_url": entry.get("link"),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 from numbers import Number
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
@@ -358,16 +359,16 @@ class V2Repository:
                     }
                 return out
 
-    def create_backtest_run(self, run_name: str, track: str, config: Dict[str, Any]) -> int:
+    def create_backtest_run(self, run_name: str, track: str, config: Dict[str, Any], run_source: str = "prod") -> int:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO backtest_runs (run_name, track, started_at, metrics, config, created_at)
-                    VALUES (%s, %s, NOW(), %s, %s, NOW())
+                    INSERT INTO backtest_runs (run_name, track, run_source, started_at, metrics, config, created_at)
+                    VALUES (%s, %s, %s, NOW(), %s, %s, NOW())
                     RETURNING id
                     """,
-                    (run_name, track, json.dumps({"status": "running"}), json.dumps(config)),
+                    (run_name, track, run_source, json.dumps({"status": "running"}), json.dumps(config)),
                 )
                 return cur.fetchone()["id"]
 
@@ -383,6 +384,20 @@ class V2Repository:
                     (json.dumps(metrics), run_id),
                 )
 
+    def mark_backtest_run_superseded(self, run_id: int, superseded_by_run_id: int, reason: str) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE backtest_runs
+                    SET superseded_by_run_id = %s,
+                        supersede_reason = %s,
+                        superseded_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (superseded_by_run_id, reason, run_id),
+                )
+
     def get_backtest_run(self, run_id: int) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -390,21 +405,106 @@ class V2Repository:
                 row = cur.fetchone()
                 return dict(row) if row else None
 
-    def list_recent_backtest_runs(self, track: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def list_recent_backtest_runs(
+        self,
+        track: str,
+        limit: int = 10,
+        include_sources: Optional[List[str]] = None,
+        exclude_sources: Optional[List[str]] = None,
+        data_regimes: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             with conn.cursor() as cur:
+                cond = ["track = %s"]
+                params: List[Any] = [track]
+                if include_sources:
+                    cond.append("COALESCE(run_source, 'prod') = ANY(%s)")
+                    params.append([s.strip() for s in include_sources if s and s.strip()])
+                if exclude_sources:
+                    cond.append("COALESCE(run_source, 'prod') <> ALL(%s)")
+                    params.append([s.strip() for s in exclude_sources if s and s.strip()])
+                if data_regimes:
+                    cond.append("COALESCE(NULLIF(config->>'data_regime',''),'missing') = ANY(%s)")
+                    params.append([s.strip() for s in data_regimes if s and s.strip()])
+                params.append(limit)
                 cur.execute(
-                    """
+                    f"""
                     SELECT * FROM backtest_runs
-                    WHERE track = %s
+                    WHERE {' AND '.join(cond)}
                     ORDER BY created_at DESC
                     LIMIT %s
                     """,
-                    (track, limit),
+                    tuple(params),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def list_failed_backtest_runs(
+        self,
+        track: str,
+        reason: Optional[str] = None,
+        unsuperseded_only: bool = False,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cond = ["track = %s", "COALESCE(metrics->>'status','') = 'failed'"]
+                params: List[Any] = [track]
+                if reason:
+                    cond.append("COALESCE(metrics->>'reason','') = %s")
+                    params.append(reason)
+                if unsuperseded_only:
+                    cond.append("superseded_by_run_id IS NULL")
+                params.append(limit)
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM backtest_runs
+                    WHERE {' AND '.join(cond)}
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    tuple(params),
                 )
                 return [dict(r) for r in cur.fetchall()]
 
     def model_artifact_exists(self, model_name: str, track: str, model_version: str) -> bool:
+        def _has_required_fields(payload: Dict[str, Any], required: List[str]) -> bool:
+            for k in required:
+                v = payload.get(k)
+                if v is None:
+                    return False
+                if isinstance(v, str) and not v.strip():
+                    return False
+            return True
+
+        def _load_json_file(path: Path) -> Optional[Dict[str, Any]]:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+            return data if isinstance(data, dict) else None
+
+        def _find_checkpoint_manifest(path: Path) -> Optional[Path]:
+            candidates = [
+                path.with_suffix(".manifest.json"),
+                path.with_suffix(path.suffix + ".manifest.json"),
+                path.with_suffix(path.suffix + ".json"),
+            ]
+            for cand in candidates:
+                if cand.exists() and cand.is_file():
+                    return cand
+            return None
+
+        base_required = [
+            "model_name",
+            "model_version",
+            "track",
+            "type",
+            "created_at",
+            "feature_version",
+            "data_version",
+        ]
+
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -421,7 +521,51 @@ class V2Repository:
                 if not row:
                     return False
                 p = str(row.get("artifact_path") or "")
-                return bool(p)
+                if not p:
+                    return False
+                path = Path(p)
+                if not path.exists() or not path.is_file():
+                    return False
+                if path.suffix.lower() == ".json":
+                    payload = _load_json_file(path)
+                    if payload is None:
+                        return False
+                    if str(payload.get("type") or "").strip().lower() == "bootstrap_placeholder":
+                        return False
+                    if not _has_required_fields(payload, base_required):
+                        return False
+                    if str(payload.get("track") or "").strip().lower() != str(track).strip().lower():
+                        return False
+                    if str(payload.get("model_name") or "").strip() != str(model_name).strip():
+                        return False
+                    if str(payload.get("model_version") or "").strip() != str(model_version).strip():
+                        return False
+                    return True
+                if path.suffix.lower() in {".pt", ".pth"}:
+                    try:
+                        if path.stat().st_size <= 1024:
+                            return False
+                    except Exception:
+                        return False
+                    manifest_path = _find_checkpoint_manifest(path)
+                    if manifest_path is None:
+                        return False
+                    manifest = _load_json_file(manifest_path)
+                    if manifest is None:
+                        return False
+                    if not _has_required_fields(manifest, base_required):
+                        return False
+                    if str(manifest.get("track") or "").strip().lower() != str(track).strip().lower():
+                        return False
+                    if str(manifest.get("model_name") or "").strip() != str(model_name).strip():
+                        return False
+                    if str(manifest.get("model_version") or "").strip() != str(model_version).strip():
+                        return False
+                    # NN checkpoint must carry deterministic replay metadata via sidecar manifest.
+                    if not _has_required_fields(manifest, ["normalization", "train_report_hash", "feature_payload_schema_version"]):
+                        return False
+                    return True
+                return True
 
     def load_price_history(self, symbol: str, lookback_days: int = 90) -> List[Dict[str, Any]]:
         with self._connect() as conn:
@@ -1328,6 +1472,112 @@ class V2Repository:
                     (metric_key, track, lookback_hours, metric_key),
                 )
                 return [float(r["metric"]) for r in cur.fetchall() if r.get("metric") is not None]
+
+    def get_backtest_target_pnl_window(
+        self,
+        track: str,
+        window_hours: int,
+        include_sources: Optional[List[str]] = None,
+        exclude_sources: Optional[List[str]] = None,
+        score_source: Optional[str] = None,
+        data_regimes: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cond = [
+                    "track = %s",
+                    "created_at > NOW() - make_interval(hours => %s)",
+                    "COALESCE(metrics->>'status','') = 'completed'",
+                    "superseded_by_run_id IS NULL",
+                ]
+                params: List[Any] = [track, window_hours]
+                if include_sources:
+                    cond.append("COALESCE(run_source, 'prod') = ANY(%s)")
+                    params.append([s.strip() for s in include_sources if s and s.strip()])
+                if exclude_sources:
+                    cond.append("COALESCE(run_source, 'prod') <> ALL(%s)")
+                    params.append([s.strip() for s in exclude_sources if s and s.strip()])
+                if score_source:
+                    cond.append("COALESCE(config->>'score_source','heuristic') = %s")
+                    params.append(str(score_source).strip().lower())
+                if data_regimes:
+                    cond.append("COALESCE(NULLIF(config->>'data_regime',''),'missing') = ANY(%s)")
+                    params.append([s.strip() for s in data_regimes if s and s.strip()])
+                cur.execute(
+                    f"""
+                    SELECT config, metrics
+                    FROM backtest_runs
+                    WHERE {' AND '.join(cond)}
+                    ORDER BY created_at DESC
+                    """,
+                    tuple(params),
+                )
+                out: Dict[str, Dict[str, float]] = {}
+                for r in cur.fetchall():
+                    cfg = r.get("config") if isinstance(r.get("config"), dict) else {}
+                    metrics = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
+                    targets = cfg.get("targets") if isinstance(cfg.get("targets"), list) else []
+                    if not targets:
+                        continue
+                    per_target = metrics.get("per_target") if isinstance(metrics.get("per_target"), dict) else {}
+                    for t in targets:
+                        target = str(t).upper()
+                        if target not in out:
+                            out[target] = {"sum": 0.0, "count": 0.0}
+                        pnl = 0.0
+                        if isinstance(per_target.get(target), dict):
+                            pnl = float((per_target.get(target) or {}).get("pnl_after_cost", 0.0) or 0.0)
+                        elif target in per_target:
+                            pnl = float(per_target.get(target) or 0.0)
+                        else:
+                            pnl = float(metrics.get("pnl_after_cost", 0.0) or 0.0) / max(1.0, float(len(targets)))
+                        out[target]["sum"] += pnl
+                        out[target]["count"] += 1.0
+                return out
+
+    def get_execution_target_realized_window(
+        self, track: str, window_hours: int
+    ) -> Dict[str, Dict[str, float]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        UPPER(target) AS target,
+                        side,
+                        quantity::double precision AS quantity,
+                        est_price::double precision AS est_price,
+                        COALESCE((metadata->'execution'->>'filled_qty')::double precision, quantity::double precision, 0.0) AS filled_qty,
+                        COALESCE((metadata->'execution'->>'avg_fill_price')::double precision, est_price::double precision, 0.0) AS avg_fill_price
+                    FROM orders_sim
+                    WHERE track = %s
+                      AND created_at > NOW() - make_interval(hours => %s)
+                      AND status IN ('filled', 'partially_filled')
+                    """,
+                    (track, window_hours),
+                )
+                out: Dict[str, Dict[str, float]] = {}
+                for r in cur.fetchall():
+                    target = str(r.get("target") or "").upper()
+                    if not target:
+                        continue
+                    side = str(r.get("side") or "buy").lower()
+                    filled_qty = float(r.get("filled_qty") or 0.0)
+                    if filled_qty <= 0:
+                        continue
+                    est_price = float(r.get("est_price") or 0.0)
+                    avg_fill_price = float(r.get("avg_fill_price") or 0.0)
+                    if est_price <= 0:
+                        continue
+                    signed = 1.0 if side == "buy" else -1.0
+                    realized = signed * (avg_fill_price - est_price) / max(abs(est_price), 1e-12)
+                    notional = abs(filled_qty * est_price)
+                    if target not in out:
+                        out[target] = {"sum_weighted": 0.0, "sum_notional": 0.0, "orders": 0.0}
+                    out[target]["sum_weighted"] += realized * notional
+                    out[target]["sum_notional"] += notional
+                    out[target]["orders"] += 1.0
+                return out
 
     def get_execution_slippage_samples(self, track: str, lookback_hours: int) -> List[float]:
         with self._connect() as conn:

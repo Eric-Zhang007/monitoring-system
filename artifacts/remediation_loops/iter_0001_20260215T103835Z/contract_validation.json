@@ -1,0 +1,50 @@
+{
+  "cmd": [
+    "python3",
+    "scripts/validate_backtest_contracts.py",
+    "--track",
+    "liquid",
+    "--lookback-days",
+    "180",
+    "--min-valid",
+    "20",
+    "--limit",
+    "500",
+    "--score-source",
+    "model",
+    "--include-sources",
+    "prod",
+    "--exclude-sources",
+    "smoke,async_test,maintenance",
+    "--data-regimes",
+    "prod_live"
+  ],
+  "exit_code": 0,
+  "json": {
+    "evaluated_at": "2026-02-15T10:38:41.864464+00:00",
+    "window_start": "2025-08-19T10:38:41.864496+00:00",
+    "window_end": "2026-02-15T10:38:41.864505+00:00",
+    "track": "liquid",
+    "score_source": "model",
+    "include_sources": [
+      "prod"
+    ],
+    "exclude_sources": [
+      "smoke",
+      "async_test",
+      "maintenance"
+    ],
+    "data_regimes": [
+      "prod_live"
+    ],
+    "rows_total": 0,
+    "valid_contract_rows": 0,
+    "invalid_contract_rows": 0,
+    "min_valid_required": 20,
+    "regime_distribution": {},
+    "passed": false,
+    "issues": []
+  },
+  "stdout": "{\"evaluated_at\": \"2026-02-15T10:38:41.864464+00:00\", \"window_start\": \"2025-08-19T10:38:41.864496+00:00\", \"window_end\": \"2026-02-15T10:38:41.864505+00:00\", \"track\": \"liquid\", \"score_source\": \"model\", \"include_sources\": [\"prod\"], \"exclude_sources\": [\"smoke\", \"async_test\", \"maintenance\"], \"data_regimes\": [\"prod_live\"], \"rows_total\": 0, \"valid_contract_rows\": 0, \"invalid_contract_rows\": 0, \"min_valid_required\": 20, \"regime_distribution\": {}, \"passed\": false, \"issues\": []}",
+  "stderr": ""
+}

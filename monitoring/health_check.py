@@ -7,7 +7,6 @@ import asyncio
 import aiohttp
 import psycopg2
 import redis
-import requests
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -15,9 +14,11 @@ from typing import Dict, List, Tuple
 SERVICES = {
     'backend': 'http://localhost:8000/health',
     'metrics': 'http://localhost:8000/metrics',
+    'collector_metrics': os.getenv('COLLECTOR_METRICS_URL', 'http://localhost:9101/metrics'),
     'redis': 'redis://localhost:6379',
     'postgres': 'postgresql://monitor:change_me_please@localhost:5432/monitor',
     'prometheus': 'http://localhost:9090/-/healthy',
+    'prometheus_query': os.getenv('PROMETHEUS_QUERY_URL', 'http://localhost:9090/api/v1/query'),
     'grafana': 'http://localhost:3000/api/health',
 }
 
@@ -151,8 +152,29 @@ async def check_metrics() -> Tuple[bool, Dict]:
         return False, {"error": str(e)}
 
 
+def _counter_by_label(metrics_text: str, metric_name: str, label_name: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for line in metrics_text.splitlines():
+        if not line.startswith(f"{metric_name}" + "{"):
+            continue
+        parts = line.rsplit(" ", 1)
+        if len(parts) != 2:
+            continue
+        left, right = parts
+        token = f'{label_name}="'
+        if token not in left:
+            continue
+        label_val = left.split(token, 1)[1].split('"', 1)[0]
+        try:
+            value = float(right)
+        except ValueError:
+            continue
+        out[label_val] = out.get(label_val, 0.0) + value
+    return out
+
+
 def _parse_histogram_buckets(metrics_text: str, metric_prefix: str) -> Tuple[List[Tuple[float, float]], float]:
-    buckets: List[Tuple[float, float]] = []
+    bucket_map: Dict[float, float] = {}
     total_count = 0.0
     for line in metrics_text.splitlines():
         if not line.startswith(f"{metric_prefix}_bucket"):
@@ -163,14 +185,16 @@ def _parse_histogram_buckets(metrics_text: str, metric_prefix: str) -> Tuple[Lis
             continue
         le_raw = left.split('le="', 1)[1].split('"', 1)[0]
         if le_raw == "+Inf":
-            total_count = max(total_count, val)
+            total_count += val
             continue
         try:
             le = float(le_raw)
         except ValueError:
             continue
-        buckets.append((le, val))
-    buckets.sort(key=lambda x: x[0])
+        bucket_map[le] = bucket_map.get(le, 0.0) + val
+    buckets = sorted(bucket_map.items(), key=lambda x: x[0])
+    if total_count <= 0 and buckets:
+        total_count = buckets[-1][1]
     return buckets, total_count
 
 
@@ -263,16 +287,137 @@ def evaluate_slo_from_metrics(metrics_text: str) -> Dict[str, Dict[str, object]]
     availability_state = {
         "status": "pass" if availability >= 0.999 else "degraded",
         "value": round(availability, 6),
+        "availability_5m": round(availability, 6),
+        "availability_1h": round(availability, 6),
         "target": 0.999,
     }
+    blocking_reason = "none"
     if availability_state["status"] == "degraded" and overall == "pass":
         overall = "degraded"
+    if signal_state["status"] == "degraded":
+        blocking_reason = "signal_latency_p95"
+    elif exec_state["status"] == "degraded":
+        blocking_reason = "execution_latency_p95"
+    elif availability_state["status"] == "degraded":
+        blocking_reason = "api_availability"
+    elif signal_state["status"] == "insufficient_observation" or exec_state["status"] == "insufficient_observation":
+        blocking_reason = "insufficient_observation"
     return {
-        "overall": {"status": overall},
+        "overall": {"status": overall, "slo_blocking_reason": blocking_reason},
         "signal_latency": signal_state,
         "execution_latency": exec_state,
         "api_availability": availability_state,
     }
+
+
+def evaluate_collector_slo_from_metrics(metrics_text: str) -> Dict[str, Dict[str, object]]:
+    fetch_by_status = _counter_by_label(metrics_text, "ms_collector_connector_fetch_total", "status")
+    success = float(fetch_by_status.get("success", 0.0))
+    empty = float(fetch_by_status.get("empty", 0.0))
+    failure = float(fetch_by_status.get("failure", 0.0))
+    attempts = success + empty + failure
+    if attempts <= 0:
+        connector_state: Dict[str, object] = {
+            "status": "insufficient_observation",
+            "success_rate": None,
+            "target_success_rate": 0.95,
+            "attempts": 0,
+        }
+    else:
+        success_rate = (success + empty) / attempts
+        connector_state = {
+            "status": "pass" if success_rate >= 0.95 else "degraded",
+            "success_rate": round(success_rate, 6),
+            "target_success_rate": 0.95,
+            "attempts": int(attempts),
+        }
+
+    publish_buckets, publish_count = _parse_histogram_buckets(
+        metrics_text, "ms_collector_source_publish_to_ingest_seconds"
+    )
+    if publish_count <= 0:
+        latency_state: Dict[str, object] = {
+            "status": "insufficient_observation",
+            "p95_seconds": None,
+            "target_p95_seconds": 120.0,
+        }
+    else:
+        p95 = _histogram_quantile_approx(publish_buckets, 0.95)
+        latency_state = {
+            "status": "pass" if p95 < 120.0 else "degraded",
+            "p95_seconds": p95,
+            "target_p95_seconds": 120.0,
+        }
+
+    overall = "pass"
+    if connector_state["status"] == "degraded" or latency_state["status"] == "degraded":
+        overall = "degraded"
+    elif connector_state["status"] == "insufficient_observation" or latency_state["status"] == "insufficient_observation":
+        overall = "insufficient_observation"
+
+    blocking_reason = "none"
+    if connector_state["status"] == "degraded":
+        blocking_reason = "connector_success_rate"
+    elif latency_state["status"] == "degraded":
+        blocking_reason = "source_publish_to_ingest_p95"
+    elif connector_state["status"] == "insufficient_observation" or latency_state["status"] == "insufficient_observation":
+        blocking_reason = "insufficient_observation"
+
+    return {
+        "overall": {"status": overall, "slo_blocking_reason": blocking_reason},
+        "connector_success_rate": connector_state,
+        "source_publish_to_ingest": latency_state,
+    }
+
+
+async def check_collector_metrics() -> Tuple[bool, Dict]:
+    """Check collector Prometheus metrics endpoint with Prometheus fallback."""
+    required = [
+        "ms_collector_connector_fetch_total",
+        "ms_collector_connector_rate_limit_total",
+        "ms_collector_event_publish_total",
+    ]
+    endpoint_error = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(SERVICES['collector_metrics'], timeout=8) as response:
+                if response.status == 200:
+                    txt = await response.text()
+                    missing = [k for k in required if k not in txt]
+                    if missing:
+                        return False, {"error": f"collector metrics missing keys: {','.join(missing)}"}
+                    slo = evaluate_collector_slo_from_metrics(txt)
+                    return True, {"status": "ok", "source": "collector_endpoint", "slo": slo}
+                endpoint_error = f"collector endpoint HTTP {response.status}"
+    except Exception as e:
+        endpoint_error = str(e)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                SERVICES["prometheus_query"],
+                params={"query": 'up{job="collector"}'},
+                timeout=8,
+            ) as response:
+                if response.status != 200:
+                    return False, {"error": f"{endpoint_error}; prometheus query HTTP {response.status}"}
+                data = await response.json()
+                result = (((data or {}).get("data") or {}).get("result") or [])
+                is_up = False
+                for item in result:
+                    value = item.get("value") if isinstance(item, dict) else None
+                    if isinstance(value, list) and len(value) >= 2 and str(value[1]) == "1":
+                        is_up = True
+                        break
+                if is_up:
+                    return True, {
+                        "status": "ok",
+                        "source": "prometheus_up_fallback",
+                        "warning": f"collector endpoint unreachable: {endpoint_error}",
+                    }
+                return False, {"error": f"{endpoint_error}; collector up metric not healthy"}
+    except Exception as e:
+        return False, {"error": f"{endpoint_error}; prometheus query failed: {e}"}
 
 
 def check_docker_services():
@@ -367,10 +512,42 @@ async def run_health_checks():
         a = slo.get("api_availability", {})
         print(f"  SLO(signal p95<150ms): status={s.get('status')} p50={s.get('p50_seconds')} p95={s.get('p95_seconds')} p99={s.get('p99_seconds')}")
         print(f"  SLO(execution p95<300ms): status={e.get('status')} p50={e.get('p50_seconds')} p95={e.get('p95_seconds')} p99={e.get('p99_seconds')}")
-        print(f"  SLO(api availability>=99.9%): status={a.get('status')} value={a.get('value')}")
-        print(f"  SLO(overall): {slo.get('overall', {}).get('status')}")
+        print(
+            f"  SLO(api availability>=99.9%): status={a.get('status')} "
+            f"value={a.get('value')} 5m={a.get('availability_5m')} 1h={a.get('availability_1h')}"
+        )
+        print(
+            f"  SLO(overall): {slo.get('overall', {}).get('status')} "
+            f"reason={slo.get('overall', {}).get('slo_blocking_reason')}"
+        )
     else:
         log_warning('metrics', data.get('error', 'Metrics endpoint unhealthy'))
+
+    # Check Collector Metrics
+    log_info("\n🛰️  Checking Collector Metrics...")
+    healthy, data = await check_collector_metrics()
+    if healthy:
+        log_success('collector_metrics', f"Healthy ({data.get('source', 'unknown')})")
+        if data.get("warning"):
+            print(f"  warning: {data.get('warning')}")
+        collector_slo = data.get("slo", {})
+        if collector_slo:
+            c = collector_slo.get("connector_success_rate", {})
+            p = collector_slo.get("source_publish_to_ingest", {})
+            print(
+                f"  SLO(connector success>=95%): status={c.get('status')} "
+                f"rate={c.get('success_rate')} attempts={c.get('attempts')}"
+            )
+            print(
+                f"  SLO(source->ingest p95<120s): status={p.get('status')} "
+                f"p95={p.get('p95_seconds')}"
+            )
+            print(
+                f"  SLO(collector overall): {collector_slo.get('overall', {}).get('status')} "
+                f"reason={collector_slo.get('overall', {}).get('slo_blocking_reason')}"
+            )
+    else:
+        log_warning('collector_metrics', data.get('error', 'Collector metrics unhealthy'))
     
     # Check Docker
     check_docker_services()

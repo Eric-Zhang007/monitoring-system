@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -45,6 +47,7 @@ from schemas_v2 import (
     PortfolioScoreRequest,
     PortfolioScoreResponse,
     PnLAttributionRequest,
+    ParityCheckRequest,
     RebalancePosition,
     RiskCheckRequest,
     RiskCheckResponse,
@@ -61,18 +64,23 @@ from schemas_v2 import (
 )
 from execution_engine import ExecutionEngine
 from metrics import (
+    BACKTEST_FAILED_RUNS_TOTAL,
     DATA_FRESHNESS_SECONDS,
     EXECUTION_LATENCY_SECONDS,
     EXECUTION_ORDERS_TOTAL,
+    EXECUTION_REJECTS_TOTAL,
     EXECUTION_REJECT_RATE,
+    METRIC_GATE_STATUS,
     MODEL_DRIFT_EVENTS_TOTAL,
     RISK_HARD_BLOCKS_TOTAL,
     SIGNAL_LATENCY_SECONDS,
+    INGEST_EVENTS_TOTAL,
 )
 from v2_repository import V2Repository
 from task_queue import enqueue_task, get_task
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
+FEATURE_VERSION = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 repo = V2Repository(DATABASE_URL)
@@ -96,6 +104,17 @@ def _risk_limits() -> Dict[str, float]:
         "max_sector_exposure": float(os.getenv("RISK_MAX_SECTOR_EXPOSURE", "0.45")),
         "max_style_exposure": float(os.getenv("RISK_MAX_STYLE_EXPOSURE", "0.55")),
     }
+
+
+def _drawdown_thresholds(dd_limit: float) -> Tuple[float, float]:
+    warn = float(os.getenv("RISK_DRAWDOWN_WARN_THRESHOLD", "0.08"))
+    near = float(os.getenv("RISK_DRAWDOWN_NEAR_LIMIT", "0.10"))
+    if dd_limit > 1e-9:
+        warn = min(warn, max(0.0, dd_limit * 0.9))
+        near = min(near, max(0.0, dd_limit * 0.98))
+    if near <= warn:
+        near = min(max(warn + 0.005, near), dd_limit if dd_limit > 0 else warn + 0.005)
+    return max(0.0, warn), max(0.0, near)
 
 
 def _risk_runtime_limits() -> Dict[str, float]:
@@ -202,7 +221,81 @@ def _normalize_execution_payload(execution: Dict[str, Any]) -> Dict[str, Any]:
                 }
             )
     out["lifecycle"] = lifecycle_out
+    reason = str(out.get("reject_reason") or "")
+    out["reject_reason_category"] = _normalize_reject_reason(reason)
     return out
+
+
+def _normalize_reject_reason(reason: str) -> str:
+    r = (reason or "").strip().lower()
+    if not r:
+        return "none"
+    if "invalid_quantity" in r:
+        return "invalid_quantity"
+    if "slippage_too_wide" in r:
+        return "slippage_too_wide"
+    if "risk_blocked" in r or "kill_switch" in r:
+        return "risk_blocked"
+    if "venue_http_" in r or "venue_error" in r:
+        return "venue_error"
+    if "bitget_credentials_not_configured" in r:
+        return "bitget_credentials_not_configured"
+    if "bitget_signature_error" in r:
+        return "bitget_signature_error"
+    if "bitget_rate_limited" in r:
+        return "bitget_rate_limited"
+    if "bitget_symbol_not_supported" in r:
+        return "bitget_symbol_not_supported"
+    if "bitget_precision_invalid" in r:
+        return "bitget_precision_invalid"
+    if "bitget_position_rule_violation" in r:
+        return "bitget_position_rule_violation"
+    if "timeout" in r or "no_fill_after_retries" in r:
+        return "timeout_or_no_fill"
+    if "paper_reject_simulated" in r:
+        return "simulated_reject"
+    return "other"
+
+
+def _position_sizing_settings() -> Dict[str, float]:
+    return {
+        "entry_z": float(os.getenv("SIGNAL_ENTRY_Z_MIN", "0.02")),
+        "exit_z": float(os.getenv("SIGNAL_EXIT_Z_MIN", "0.008")),
+        "max_weight_base": float(os.getenv("POSITION_MAX_WEIGHT_BASE", "0.05")),
+        "high_vol_mult": float(os.getenv("POSITION_MAX_WEIGHT_HIGH_VOL_MULT", "0.65")),
+        "cost_lambda": float(os.getenv("COST_PENALTY_LAMBDA", "1.2")),
+    }
+
+
+def _cost_model_settings() -> Dict[str, float]:
+    return {
+        "fee_bps": float(os.getenv("COST_FEE_BPS", "5.0")),
+        "slippage_bps": float(os.getenv("COST_SLIPPAGE_BPS", "3.0")),
+        "impact_coeff": float(os.getenv("COST_IMPACT_COEFF", "120.0")),
+    }
+
+
+def _score_to_size(score: float, confidence: float, est_cost_bps: float, vol_bucket: str, sizing_cfg: Dict[str, float]) -> float:
+    cfg = dict(sizing_cfg or {})
+    s = abs(float(score))
+    c = max(0.0, min(1.0, float(confidence)))
+    if s < cfg["entry_z"]:
+        return 0.0
+    core = np.tanh((s - cfg["entry_z"]) / max(1e-9, cfg["entry_z"] * 4.0))
+    conf_boost = 0.4 + 0.6 * c
+    cost_penalty = max(0.1, 1.0 - cfg["cost_lambda"] * max(0.0, est_cost_bps) / 10000.0)
+    vol_penalty = cfg["high_vol_mult"] if vol_bucket == "high" else 1.0
+    return float(max(0.0, cfg["max_weight_base"] * core * conf_boost * cost_penalty * vol_penalty))
+
+
+def _target_vol_bucket(target: str) -> str:
+    rows = repo.load_price_history(target.upper(), lookback_days=2)
+    prices = np.array([float(r.get("price") or 0.0) for r in rows if float(r.get("price") or 0.0) > 0], dtype=np.float64)
+    if prices.size < 24:
+        return "normal"
+    rets = np.diff(prices) / np.clip(prices[:-1], 1e-12, None)
+    sigma = float(np.std(rets[-96:] if rets.size > 96 else rets))
+    return "high" if sigma > 0.02 else "normal"
 
 
 def _bucket_limits() -> Dict[str, float]:
@@ -211,6 +304,27 @@ def _bucket_limits() -> Dict[str, float]:
         "event": float(os.getenv("RISK_BUCKET_EVENT", "0.4")),
         "mean_reversion": float(os.getenv("RISK_BUCKET_MEAN_REVERSION", "0.35")),
     }
+
+
+def _run_source_filters() -> Tuple[List[str], List[str]]:
+    include_raw = os.getenv("BACKTEST_GATE_INCLUDE_SOURCES", "prod")
+    exclude_raw = os.getenv("BACKTEST_GATE_EXCLUDE_SOURCES", "smoke,async_test,maintenance")
+    include = [s.strip().lower() for s in include_raw.split(",") if s.strip()]
+    exclude = [s.strip().lower() for s in exclude_raw.split(",") if s.strip()]
+    return include, exclude
+
+
+def _data_regime_filters() -> List[str]:
+    allowed = {"prod_live", "maintenance_replay", "mixed"}
+    raw = os.getenv("BACKTEST_GATE_DATA_REGIMES", "prod_live")
+    out = [s.strip().lower() for s in raw.split(",") if s.strip()]
+    out = [s for s in out if s in allowed]
+    return out or ["prod_live"]
+
+
+def _score_source_filter(value: Optional[str]) -> str:
+    v = str(value or "").strip().lower()
+    return "heuristic" if v == "heuristic" else "model"
 
 
 def _position_map(positions: List[RebalancePosition]) -> Dict[Tuple[str, str], float]:
@@ -277,6 +391,14 @@ def _evaluate_risk(
     max_style_exposure_override: Optional[float] = None,
 ) -> Tuple[List[RebalancePosition], List[str], float, float]:
     limits = _risk_limits()
+    dd_limit = float(limits["max_realized_drawdown"])
+    dd = max(0.0, float(realized_drawdown))
+    warn_threshold, near_limit_threshold = _drawdown_thresholds(dd_limit)
+    if dd_limit > 1e-9 and dd >= warn_threshold > 0:
+        span = max(1e-9, dd_limit - warn_threshold)
+        ratio = min(1.0, max(0.0, (dd - warn_threshold) / span))
+        shrink = max(0.25, 1.0 - ratio * 0.75)
+        limits["max_single_weight"] = max(0.01, limits["max_single_weight"] * shrink)
     if max_sector_exposure_override is not None:
         limits["max_sector_exposure"] = max_sector_exposure_override
     if max_style_exposure_override is not None:
@@ -356,6 +478,30 @@ def _evaluate_risk(
                 for p in capped
             ]
 
+    if dd >= near_limit_threshold > 0:
+        current_map = _position_map(current)
+        reduced: List[RebalancePosition] = []
+        blocked_additions = 0
+        for p in capped:
+            key = (p.target.upper(), p.track)
+            curr_w = float(current_map.get(key, 0.0))
+            next_w = float(p.weight)
+            if abs(next_w) > abs(curr_w) + 1e-9:
+                blocked_additions += 1
+                next_w = curr_w
+            reduced.append(
+                RebalancePosition(
+                    target=p.target,
+                    track=p.track,
+                    weight=next_w,
+                    sector=p.sector,
+                    style_bucket=p.style_bucket,
+                )
+            )
+        if blocked_additions > 0:
+            violations.append("drawdown_near_limit_reduce_only")
+        capped = reduced
+
     gross = sum(abs(p.weight) for p in capped)
 
     current_map = _position_map(current)
@@ -405,7 +551,7 @@ def _build_vc_prediction(company_name: str, horizon_months: int) -> Dict[str, ob
         ],
         "evidence_links": [e["source_url"] for e in context if e.get("source_url")][:5],
         "model_version": "vc-survival-baseline-v2",
-        "feature_version": "feature-store-v2.0",
+        "feature_version": FEATURE_VERSION,
     }
 
     outputs = {
@@ -473,7 +619,7 @@ def _build_liquid_prediction(symbol: str, horizon: str) -> Dict[str, object]:
         ],
         "evidence_links": [e["source_url"] for e in context if e.get("source_url")][:5],
         "model_version": "liquid-tsfm-adapter-baseline-v2",
-        "feature_version": "feature-store-v2.0",
+        "feature_version": FEATURE_VERSION,
     }
 
     return {
@@ -590,19 +736,25 @@ def _feature_signal_score(payload: Dict[str, Any]) -> float:
     funding = float(payload.get("funding_rate", 0.0) or 0.0)
     onchain = float(payload.get("onchain_norm", 0.0) or 0.0)
     event_decay = float(payload.get("event_decay", 0.0) or 0.0)
+    source_tier_weight = float(payload.get("source_tier_weight", 0.0) or 0.0)
+    source_confidence = float(payload.get("source_confidence", 0.0) or 0.0)
     vol_penalty = abs(vol_12) + abs(vol_48) + abs(vol_96)
+    trend_bias = 0.6 * ret_12 + 0.4 * ret_48
     score = (
-        0.20 * ret_1
-        + 0.25 * ret_3
-        + 0.35 * ret_12
-        + 0.15 * ret_48
+        0.10 * ret_1
+        + 0.20 * ret_3
+        + 0.50 * ret_12
+        + 0.30 * ret_48
+        + 0.35 * trend_bias
         + 0.10 * ob
         + 0.08 * funding
         + 0.07 * onchain
         + 0.05 * event_decay
-        - 0.15 * vol_penalty
+        + 0.04 * source_tier_weight
+        + 0.03 * source_confidence
+        - 0.01 * vol_penalty
     )
-    return float(score)
+    return float(-score)
 
 
 def _run_model_replay_backtest(
@@ -610,7 +762,20 @@ def _run_model_replay_backtest(
     price_rows: List[Dict[str, Any]],
     fee_bps: float,
     slippage_bps: float,
+    sizing_override: Optional[Dict[str, float]] = None,
+    raw_series_override: Optional[np.ndarray] = None,
+    signal_polarity_mode: str = "normal",
+    calibration_ratio: float = 0.5,
 ) -> Dict[str, Any]:
+    cfg = _cost_model_settings()
+    sizing = _position_sizing_settings()
+    if sizing_override:
+        for k in ("entry_z", "exit_z", "max_weight_base", "high_vol_mult", "cost_lambda"):
+            if k in sizing_override and sizing_override[k] is not None:
+                sizing[k] = float(sizing_override[k])
+    fee_bps = float(fee_bps if fee_bps >= 0 else cfg["fee_bps"])
+    slippage_bps = float(slippage_bps if slippage_bps >= 0 else cfg["slippage_bps"])
+    impact_coeff = float(cfg["impact_coeff"])
     if not feature_rows:
         return {
             "status": "failed",
@@ -655,8 +820,14 @@ def _run_model_replay_backtest(
             "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
         }
 
+    polarity = 1.0
+    max_abs_position = float(os.getenv("BACKTEST_MAX_ABS_POSITION", str(sizing["max_weight_base"])))
+    max_step_turnover = float(os.getenv("BACKTEST_MAX_STEP_TURNOVER", "0.12"))
+    cost_edge_mult = float(os.getenv("BACKTEST_COST_EDGE_MULT", "3.0"))
+
     scores: List[float] = []
     future_rets: List[float] = []
+    step_pnls: List[float] = []
     prev_signal = 0.0
     eq = 1.0
     eq_curve = [eq]
@@ -666,18 +837,111 @@ def _run_model_replay_backtest(
     wins = 0
     turnover = 0.0
     unique_lineages = set()
+    regime_steps: Dict[str, Dict[str, float]] = {
+        "bull": {"samples": 0.0, "wins": 0.0, "turnover": 0.0, "ret_sum": 0.0},
+        "bear": {"samples": 0.0, "wins": 0.0, "turnover": 0.0, "ret_sum": 0.0},
+        "sideways": {"samples": 0.0, "wins": 0.0, "turnover": 0.0, "ret_sum": 0.0},
+    }
+    if raw_series_override is not None:
+        raw_series = np.array(raw_series_override, dtype=np.float64).reshape(-1)
+        if raw_series.shape[0] < n:
+            raw_series = np.pad(raw_series, (0, n - raw_series.shape[0]), mode="constant")
+        elif raw_series.shape[0] > n:
+            raw_series = raw_series[:n]
+    else:
+        raw_series = np.array(
+            [polarity * _feature_signal_score((feature_rows[i].get("feature_payload") or {})) for i in range(n)],
+            dtype=np.float64,
+        )
+    polarity_mode = str(signal_polarity_mode or "normal").strip().lower()
+    polarity_mode = polarity_mode if polarity_mode in {"normal", "auto_train_ic", "auto_train_pnl"} else "normal"
+    polarity_selection = "disabled"
+    polarity_train_ic = 0.0
+    polarity_train_edge = 0.0
+    if polarity_mode != "normal" and n >= 16:
+        ratio = float(min(0.9, max(0.2, calibration_ratio)))
+        cal_n = int(min(n - 1, max(16, round(n * ratio))))
+        raw_cal = raw_series[:cal_n]
+        ret_cal = rets[:cal_n]
+        if raw_cal.size >= 8 and ret_cal.size >= 8 and float(np.std(raw_cal)) > 1e-12 and float(np.std(ret_cal)) > 1e-12:
+            polarity_train_ic = float(np.corrcoef(raw_cal, ret_cal)[0, 1])
+            polarity_train_edge = float(np.mean(raw_cal * ret_cal))
+            ic_threshold = float(os.getenv("BACKTEST_POLARITY_IC_THRESHOLD", "0.005"))
+            use_auto = abs(polarity_train_ic) >= max(0.0, ic_threshold)
+            if use_auto:
+                if polarity_mode == "auto_train_pnl":
+                    polarity = 1.0 if polarity_train_edge >= 0.0 else -1.0
+                    polarity_selection = "auto_train_pnl"
+                else:
+                    polarity = 1.0 if polarity_train_ic >= 0.0 else -1.0
+                    polarity_selection = "auto_train_ic"
+            else:
+                polarity_selection = "auto_threshold_hold"
+    if polarity < 0:
+        raw_series = -raw_series
+    raw_abs_p75 = float(np.percentile(np.abs(raw_series), 75)) if raw_series.size else 0.0
+    dynamic_scale = 1.0
+    if raw_abs_p75 > 1e-9:
+        target_scale = max(float(sizing["entry_z"]), 0.012)
+        dynamic_scale = min(40.0, max(1.0, target_scale / raw_abs_p75))
+    scaled_p75 = raw_abs_p75 * dynamic_scale
+    base_entry = float(os.getenv("BACKTEST_ENTRY_Z_MIN", "0.004"))
+    base_exit = float(os.getenv("BACKTEST_EXIT_Z_MIN", "0.0015"))
+    adaptive_entry = scaled_p75 * 0.6 if scaled_p75 > 0 else base_entry
+    backtest_entry_z = max(base_entry, min(float(sizing["entry_z"]), adaptive_entry))
+    backtest_exit_z = max(base_exit, min(float(sizing["exit_z"]), backtest_entry_z * 0.5))
+
+    def _regime_label(idx: int) -> str:
+        st = max(0, idx - 96)
+        window = rets[st:idx] if idx > st else np.array([], dtype=np.float64)
+        if window.size < 12:
+            return "sideways"
+        mu = float(np.mean(window))
+        sigma = float(np.std(window))
+        thr = max(0.0008, sigma * 0.35)
+        if mu > thr:
+            return "bull"
+        if mu < -thr:
+            return "bear"
+        return "sideways"
+
     for i in range(n):
         f = feature_rows[i].get("feature_payload") or {}
         unique_lineages.add(str(feature_rows[i].get("lineage_id") or ""))
-        raw = _feature_signal_score(f)
-        signal = 1.0 if raw > 0.0005 else -1.0 if raw < -0.0005 else 0.0
-        nxt = float(rets[i])
+        raw = float(dynamic_scale * raw_series[i])
+        vol_proxy = abs(float(f.get("vol_12", 0.0) or 0.0)) + abs(float(f.get("vol_48", 0.0) or 0.0))
+        vol_bucket = "high" if vol_proxy > 0.015 else "normal"
         vol = float(max(1.0, vols[i + 1] if i + 1 < len(vols) else vols[-1]))
-        impact_bps = min(30.0, 1200.0 / np.sqrt(vol))
+        impact_bps = min(30.0, impact_coeff / np.sqrt(vol))
+        est_cost_bps = float(fee_bps + slippage_bps + impact_bps)
+        edge_floor = max(backtest_entry_z, cost_edge_mult * est_cost_bps / 10000.0)
+        if abs(raw) < edge_floor:
+            raw = 0.0
+        score_for_size = raw * (float(sizing["entry_z"]) / max(backtest_entry_z, 1e-9))
+        desired_abs = _score_to_size(score_for_size, 1.0, est_cost_bps, vol_bucket, sizing_cfg=sizing)
+        desired = desired_abs if raw >= 0 else -desired_abs
+        desired = float(max(-max_abs_position, min(max_abs_position, desired)))
+        if abs(raw) < backtest_exit_z:
+            desired = 0.0
+        elif abs(raw) < backtest_entry_z and abs(prev_signal) > 1e-6:
+            desired = 0.5 * prev_signal
+        step = desired - prev_signal
+        if step > max_step_turnover:
+            desired = prev_signal + max_step_turnover
+        elif step < -max_step_turnover:
+            desired = prev_signal - max_step_turnover
+        nxt = float(rets[i])
+        trade_amt = abs(desired - prev_signal)
+        est_cost = (fee_bps + slippage_bps + impact_bps) / 10000.0 * trade_amt
+        penalty = min(0.7, float(sizing["cost_lambda"]) * est_cost * 80.0)
+        signal = desired * max(0.0, 1.0 - penalty)
+        if abs(signal) < backtest_exit_z:
+            signal = 0.0
         c_fee = fee_bps / 10000.0 * abs(signal - prev_signal)
         c_slip = slippage_bps / 10000.0 * abs(signal - prev_signal)
         c_imp = impact_bps / 10000.0 * abs(signal - prev_signal)
         pnl = signal * nxt - (c_fee + c_slip + c_imp)
+        step_pnls.append(float(pnl))
         eq *= (1.0 + pnl)
         eq_curve.append(eq)
         fee_cost += c_fee
@@ -685,30 +949,90 @@ def _run_model_replay_backtest(
         impact_cost += c_imp
         scores.append(signal)
         future_rets.append(nxt)
-        if signal * nxt > 0:
+        if abs(signal) > 1e-6 and signal * nxt > 0:
             wins += 1
-        turnover += abs(signal - prev_signal)
+        trade_turnover = abs(signal - prev_signal)
+        turnover += trade_turnover
+        regime = _regime_label(i)
+        bucket = regime_steps.get(regime, regime_steps["sideways"])
+        bucket["samples"] += 1.0
+        if abs(signal) > 1e-6 and signal * nxt > 0:
+            bucket["wins"] += 1.0
+        bucket["turnover"] += trade_turnover
+        bucket["ret_sum"] += pnl
         prev_signal = signal
 
     s = np.array(scores, dtype=np.float64)
     y = np.array(future_rets, dtype=np.float64)
     ic = float(np.corrcoef(s, y)[0, 1]) if np.std(s) > 0 and np.std(y) > 0 else 0.0
     hit_rate = float(wins / max(1, len(scores)))
-    peak = eq_curve[0]
+    sharpe_step_raw = 0.0
+    if len(step_pnls) > 1:
+        p = np.array(step_pnls, dtype=np.float64)
+        p_std = float(np.std(p))
+        if p_std > 1e-12:
+            sharpe_step_raw = float((float(np.mean(p)) / p_std) * np.sqrt(24.0 * 365.0))
+    daily_map: Dict[str, float] = {}
+    for i, pnl in enumerate(step_pnls):
+        ts = None
+        if i + 1 < len(price_rows):
+            ts = price_rows[i + 1].get("timestamp")
+        if isinstance(ts, datetime):
+            ts_utc = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            day_key = ts_utc.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        else:
+            day_key = f"idx_{i // 288}"  # 5m bars fallback bucket
+        daily_map[day_key] = daily_map.get(day_key, 0.0) + float(pnl)
+    daily_vals = np.array(list(daily_map.values()), dtype=np.float64) if daily_map else np.array([], dtype=np.float64)
+    observation_days = int(daily_vals.shape[0])
+    vol_floor_applied = False
+    sharpe_daily = 0.0
+    if observation_days > 1:
+        mu_d = float(np.mean(daily_vals))
+        sd_d = float(np.std(daily_vals))
+        if sd_d < 1e-9:
+            sd_d = 1e-9
+            vol_floor_applied = True
+        sharpe_daily = float((mu_d / sd_d) * np.sqrt(365.0))
+    active_curve = eq_curve
+    peak = active_curve[0]
     max_dd = 0.0
-    for v in eq_curve:
+    for v in active_curve:
         peak = max(peak, v)
         max_dd = max(max_dd, (peak - v) / max(peak, 1e-12))
+    regime_breakdown: Dict[str, Dict[str, float]] = {}
+    for name, vals in regime_steps.items():
+        cnt = int(vals["samples"])
+        if cnt <= 0:
+            continue
+        regime_breakdown[name] = {
+            "samples": cnt,
+            "hit_rate": round(float(vals["wins"] / max(1.0, vals["samples"])), 6),
+            "turnover": round(float(vals["turnover"]), 6),
+            "pnl_after_cost": round(float(vals["ret_sum"]), 6),
+        }
     return {
         "status": "completed",
         "reason": "ok",
         "samples": int(len(scores)),
         "ic": round(ic, 6),
+        "sharpe": round(sharpe_daily, 6),
+        "sharpe_step_raw": round(sharpe_step_raw, 6),
+        "sharpe_daily": round(sharpe_daily, 6),
+        "sharpe_method": "daily_agg_v1",
+        "observation_days": observation_days,
+        "vol_floor_applied": bool(vol_floor_applied),
         "hit_rate": round(hit_rate, 6),
         "turnover": round(float(turnover), 6),
-        "pnl_after_cost": round(float(eq_curve[-1] - 1.0), 6),
+        "pnl_after_cost": round(float(active_curve[-1] - 1.0), 6),
         "max_drawdown": round(float(max_dd), 6),
         "lineage_coverage": round(float(len(unique_lineages) / max(1, len(scores))), 6),
+        "signal_polarity": "inverted" if polarity < 0 else "normal",
+        "polarity_selection": polarity_selection,
+        "polarity_mode_requested": polarity_mode,
+        "polarity_train_ic": round(float(polarity_train_ic), 6),
+        "polarity_train_edge": round(float(polarity_train_edge), 8),
+        "regime_breakdown": regime_breakdown,
         "cost_breakdown": {
             "fee": round(float(fee_cost), 8),
             "slippage": round(float(slippage_cost), 8),
@@ -717,10 +1041,288 @@ def _run_model_replay_backtest(
     }
 
 
+def _feature_vector_from_payload(payload: Dict[str, Any]) -> np.ndarray:
+    keys = [
+        "ret_1",
+        "ret_3",
+        "ret_12",
+        "ret_48",
+        "vol_3",
+        "vol_12",
+        "vol_48",
+        "vol_96",
+        "log_volume",
+        "vol_z",
+        "volume_impact",
+        "orderbook_imbalance",
+        "funding_rate",
+        "onchain_norm",
+        "event_decay",
+        "orderbook_missing_flag",
+        "funding_missing_flag",
+        "onchain_missing_flag",
+    ]
+    return np.array([float(payload.get(k, 0.0) or 0.0) for k in keys], dtype=np.float64)
+
+
+def _load_tabular_model_weights(target: str) -> Optional[Dict[str, np.ndarray]]:
+    target = str(target or "").strip().upper()
+    if not target:
+        return None
+    sym = target.split("_")[0].lower()
+    path = Path(f"/app/models/liquid_{sym}_lgbm_baseline_v2.json")
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    weights = data.get("weights")
+    if not isinstance(weights, list) or not weights:
+        return None
+    w = np.array(weights, dtype=np.float64).reshape(-1)
+    x_mean = np.array(data.get("x_mean", []), dtype=np.float64).reshape(-1)
+    x_std = np.array(data.get("x_std", []), dtype=np.float64).reshape(-1)
+    return {"weights": w, "x_mean": x_mean, "x_std": x_std}
+
+
+def _predict_expected_return_tabular(target: str, payload: Dict[str, Any]) -> Optional[float]:
+    model = _load_tabular_model_weights(target)
+    if model is None:
+        return None
+    x = _feature_vector_from_payload(payload)
+    w = model["weights"]
+    dim = int(w.shape[0])
+    if x.shape[0] < dim:
+        x = np.concatenate([x, np.zeros((dim - x.shape[0],), dtype=np.float64)], axis=0)
+    elif x.shape[0] > dim:
+        x = x[:dim]
+    x_mean = model["x_mean"]
+    x_std = model["x_std"]
+    if x_mean.size > 0 and x_std.size > 0:
+        if x_mean.shape[0] != dim:
+            if x_mean.shape[0] < dim:
+                x_mean = np.concatenate([x_mean, np.zeros((dim - x_mean.shape[0],), dtype=np.float64)], axis=0)
+            else:
+                x_mean = x_mean[:dim]
+        if x_std.shape[0] != dim:
+            if x_std.shape[0] < dim:
+                x_std = np.concatenate([x_std, np.ones((dim - x_std.shape[0],), dtype=np.float64)], axis=0)
+            else:
+                x_std = x_std[:dim]
+        x = (x - x_mean) / np.clip(x_std, 1e-6, None)
+    return float(x @ w)
+
+
+def _run_model_inference_backtest(
+    target: str,
+    feature_rows: List[Dict[str, Any]],
+    price_rows: List[Dict[str, Any]],
+    fee_bps: float,
+    slippage_bps: float,
+    sizing_override: Optional[Dict[str, float]] = None,
+    signal_polarity_mode: str = "normal",
+    calibration_ratio: float = 0.5,
+) -> Dict[str, Any]:
+    n = min(len(feature_rows), max(0, len(price_rows) - 1))
+    if n <= 1:
+        replay = _run_model_replay_backtest(
+            feature_rows=feature_rows,
+            price_rows=price_rows,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            sizing_override=sizing_override,
+            signal_polarity_mode=signal_polarity_mode,
+            calibration_ratio=calibration_ratio,
+        )
+        replay["model_inference_coverage"] = 0.0
+        replay["fallback_used"] = False
+        replay["score_source"] = "model"
+        return replay
+
+    model_raw: List[float] = []
+    predicted = 0
+    for i in range(n):
+        payload = feature_rows[i].get("feature_payload") or {}
+        exp = _predict_expected_return_tabular(target, payload)
+        if exp is not None and np.isfinite(exp):
+            predicted += 1
+            model_raw.append(float(exp))
+        else:
+            model_raw.append(float(_feature_signal_score(payload)))
+
+    replay = _run_model_replay_backtest(
+        feature_rows=feature_rows,
+        price_rows=price_rows,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        sizing_override=sizing_override,
+        raw_series_override=np.array(model_raw, dtype=np.float64),
+        signal_polarity_mode=signal_polarity_mode,
+        calibration_ratio=calibration_ratio,
+    )
+    replay["model_inference_coverage"] = round(float(predicted / max(1, n)), 6)
+    replay["fallback_used"] = bool(predicted < n)
+    replay["score_source"] = "model"
+    return replay
+
+
 def _default_model_by_track(track: str) -> Tuple[str, str]:
     if track == "liquid":
         return "liquid_ttm_ensemble", "v2.1"
     return "vc_survival_model", "v2.1"
+
+
+def _parity_check(
+    track: str,
+    max_deviation: float = 0.10,
+    min_completed_runs: int = 5,
+    score_source: str = "model",
+) -> Dict[str, Any]:
+    score_source = _score_source_filter(score_source)
+    include_sources, exclude_sources = _run_source_filters()
+    data_regimes = _data_regime_filters()
+    runs = repo.list_recent_backtest_runs(
+        track=track,
+        limit=500,
+        include_sources=include_sources,
+        exclude_sources=exclude_sources,
+        data_regimes=data_regimes,
+    )
+    total_completed = sum(
+        1
+        for r in runs
+        if isinstance(r.get("metrics"), dict)
+        and str((r.get("metrics") or {}).get("status") or "").lower() == "completed"
+        and r.get("superseded_by_run_id") is None
+        and _score_source_filter((r.get("config") or {}).get("score_source")) == score_source
+    )
+
+    bt_target_7 = repo.get_backtest_target_pnl_window(
+        track=track,
+        window_hours=24 * 7,
+        include_sources=include_sources,
+        exclude_sources=exclude_sources,
+        score_source=score_source,
+        data_regimes=data_regimes,
+    )
+    bt_target_30 = repo.get_backtest_target_pnl_window(
+        track=track,
+        window_hours=24 * 30,
+        include_sources=include_sources,
+        exclude_sources=exclude_sources,
+        score_source=score_source,
+        data_regimes=data_regimes,
+    )
+    px_target_7 = repo.get_execution_target_realized_window(track=track, window_hours=24 * 7)
+    px_target_30 = repo.get_execution_target_realized_window(track=track, window_hours=24 * 30)
+
+    if total_completed < min_completed_runs:
+        METRIC_GATE_STATUS.labels(track=track, metric="parity_30d").set(0.0)
+        return {
+            "status": "insufficient_observation",
+            "passed": False,
+            "completed_runs": total_completed,
+            "min_completed_runs": min_completed_runs,
+            "score_source": score_source,
+            "data_regimes": data_regimes,
+            "reason": "insufficient_completed_backtests",
+        }
+
+    matched_7 = sorted(set(bt_target_7.keys()) & set(px_target_7.keys()))
+    matched_30 = sorted(set(bt_target_30.keys()) & set(px_target_30.keys()))
+    orders_7 = int(sum((px_target_7.get(t) or {}).get("orders", 0.0) for t in matched_7))
+    orders_30 = int(sum((px_target_30.get(t) or {}).get("orders", 0.0) for t in matched_30))
+    if len(matched_30) < 2:
+        METRIC_GATE_STATUS.labels(track=track, metric="parity_30d").set(0.0)
+        return {
+            "status": "insufficient_observation",
+            "passed": False,
+            "completed_runs": total_completed,
+            "min_completed_runs": min_completed_runs,
+            "score_source": score_source,
+            "data_regimes": data_regimes,
+            "reason": "insufficient_matched_targets",
+            "matched_targets_count": len(matched_30),
+            "paper_filled_orders_count": orders_30,
+            "comparison_basis": "matched_filled_orders",
+        }
+    if orders_30 < 50:
+        METRIC_GATE_STATUS.labels(track=track, metric="parity_30d").set(0.0)
+        return {
+            "status": "insufficient_observation",
+            "passed": False,
+            "completed_runs": total_completed,
+            "min_completed_runs": min_completed_runs,
+            "score_source": score_source,
+            "data_regimes": data_regimes,
+            "reason": "insufficient_paper_orders",
+            "matched_targets_count": len(matched_30),
+            "paper_filled_orders_count": orders_30,
+            "comparison_basis": "matched_filled_orders",
+        }
+
+    def _window_pair(
+        bt_map: Dict[str, Dict[str, float]], px_map: Dict[str, Dict[str, float]], matched: List[str]
+    ) -> Tuple[float, float]:
+        bt_sum = 0.0
+        px_sum = 0.0
+        total_w = 0.0
+        for t in matched:
+            bt_avg = float((bt_map.get(t) or {}).get("sum", 0.0)) / max(1.0, float((bt_map.get(t) or {}).get("count", 0.0)))
+            px_w = float((px_map.get(t) or {}).get("sum_notional", 0.0))
+            px_avg = float((px_map.get(t) or {}).get("sum_weighted", 0.0)) / max(1e-12, px_w)
+            w = max(1.0, px_w)
+            bt_sum += bt_avg * w
+            px_sum += px_avg * w
+            total_w += w
+        if total_w <= 0:
+            return 0.0, 0.0
+        return bt_sum / total_w, px_sum / total_w
+
+    bt_avg_7, px_avg_7 = _window_pair(bt_target_7, px_target_7, matched_7)
+    bt_avg_30, px_avg_30 = _window_pair(bt_target_30, px_target_30, matched_30)
+    d7 = abs(bt_avg_7 - px_avg_7)
+    d30 = abs(bt_avg_30 - px_avg_30)
+    parity_floor = float(os.getenv("PARITY_RETURN_FLOOR", "0.02"))
+    rel7 = d7 / max(1e-6, parity_floor, abs(bt_avg_7), abs(px_avg_7))
+    rel30 = d30 / max(1e-6, parity_floor, abs(bt_avg_30), abs(px_avg_30))
+    passed = rel30 <= max_deviation
+    METRIC_GATE_STATUS.labels(track=track, metric="parity_30d").set(1.0 if passed else 0.0)
+    return {
+        "status": "passed" if passed else "failed",
+        "passed": passed,
+        "track": track,
+        "score_source": score_source,
+        "data_regimes": data_regimes,
+        "max_deviation": max_deviation,
+        "completed_runs": total_completed,
+        "matched_targets_count": len(matched_30),
+        "paper_filled_orders_count": orders_30,
+        "comparison_basis": "matched_filled_orders",
+        "gate_window": "30d",
+        "alert_window": "7d",
+        "window_details": {
+            "7d": {
+                "backtest_avg_pnl_after_cost": round(bt_avg_7, 9),
+                "paper_realized_return": round(px_avg_7, 9),
+                "matched_targets": len(matched_7),
+                "paper_filled_orders": orders_7,
+                "abs_delta": round(d7, 9),
+                "relative_deviation": round(rel7, 9),
+            },
+            "30d": {
+                "backtest_avg_pnl_after_cost": round(bt_avg_30, 9),
+                "paper_realized_return": round(px_avg_30, 9),
+                "matched_targets": len(matched_30),
+                "paper_filled_orders": orders_30,
+                "abs_delta": round(d30, 9),
+                "relative_deviation": round(rel30, 9),
+            },
+        },
+    }
 
 
 def _evaluate_gate(
@@ -729,9 +1331,25 @@ def _evaluate_gate(
     min_pnl_after_cost: float,
     max_drawdown: float,
     windows: int,
+    score_source: str = "model",
 ) -> Tuple[bool, str, Dict[str, float], int]:
-    runs = repo.list_recent_backtest_runs(track=track, limit=windows)
-    usable = [r for r in runs if isinstance(r.get("metrics"), dict) and r["metrics"].get("status") == "completed"]
+    score_source = _score_source_filter(score_source)
+    include_sources, exclude_sources = _run_source_filters()
+    data_regimes = _data_regime_filters()
+    runs = repo.list_recent_backtest_runs(
+        track=track,
+        limit=windows,
+        include_sources=include_sources,
+        exclude_sources=exclude_sources,
+        data_regimes=data_regimes,
+    )
+    usable = [
+        r
+        for r in runs
+        if isinstance(r.get("metrics"), dict)
+        and r["metrics"].get("status") == "completed"
+        and _score_source_filter((r.get("config") or {}).get("score_source")) == score_source
+    ]
     if len(usable) < windows:
         return False, "insufficient_windows", {"ic": 0.0, "pnl_after_cost": 0.0, "max_drawdown": 1.0}, len(usable)
 
@@ -826,7 +1444,13 @@ def _feature_drift_score(reference_payloads: List[Dict[str, float]], current_pay
 
 @router.post("/ingest/events", response_model=IngestEventsResponse)
 async def ingest_events(payload: IngestEventsRequest) -> IngestEventsResponse:
+    for ev in payload.events:
+        if "market_scope" not in ev.payload:
+            ev.payload["market_scope"] = ev.market_scope
     accepted, inserted, deduplicated, event_ids = repo.ingest_events(payload.events)
+    INGEST_EVENTS_TOTAL.labels(status="accepted").inc(accepted)
+    INGEST_EVENTS_TOTAL.labels(status="inserted").inc(inserted)
+    INGEST_EVENTS_TOTAL.labels(status="deduplicated").inc(deduplicated)
     return IngestEventsResponse(
         accepted=accepted,
         inserted=inserted,
@@ -854,7 +1478,7 @@ async def predict_vc(payload: VCPredictRequest):
         outputs=result["outputs"],
         explanation=result["explanation"],
         horizon=f"{payload.horizon_months}m",
-        feature_set_id="feature-store-v2.0",
+        feature_set_id=FEATURE_VERSION,
     )
 
     return {
@@ -877,7 +1501,7 @@ async def predict_liquid(payload: LiquidPredictRequest):
         outputs=result["outputs"],
         explanation=result["explanation"],
         horizon=payload.horizon,
-        feature_set_id="feature-store-v2.0",
+        feature_set_id=FEATURE_VERSION,
     )
 
     return {
@@ -935,15 +1559,53 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             targets = ["OpenAI", "Anthropic", "Scale AI"]
 
     run_name = f"{payload.track}-wf-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    cost_cfg = _cost_model_settings()
+    effective_fee_bps = float(payload.fee_bps if payload.fee_bps >= 0 else cost_cfg["fee_bps"])
+    effective_slippage_bps = float(payload.slippage_bps if payload.slippage_bps >= 0 else cost_cfg["slippage_bps"])
     config = payload.model_dump()
+    score_source = _score_source_filter(payload.score_source)
+    data_regime = str(payload.data_regime).strip().lower()
+    if "data_regime" not in payload.model_fields_set:
+        if payload.run_source == "prod":
+            data_regime = "prod_live"
+        elif payload.run_source == "maintenance":
+            data_regime = "maintenance_replay"
+        else:
+            data_regime = "mixed"
+    if data_regime not in {"prod_live", "maintenance_replay", "mixed"}:
+        data_regime = "mixed"
+    if data_regime == "prod_live" and payload.run_source != "prod":
+        data_regime = "mixed"
+    config["score_source"] = score_source
+    config["data_regime"] = data_regime
     config["targets"] = targets
-    run_id = repo.create_backtest_run(run_name=run_name, track=payload.track, config=config)
+    config["fee_bps"] = effective_fee_bps
+    config["slippage_bps"] = effective_slippage_bps
+    run_id = repo.create_backtest_run(run_name=run_name, track=payload.track, config=config, run_source=payload.run_source)
     model_name = payload.model_name or _default_model_by_track(payload.track)[0]
     model_version = payload.model_version or _default_model_by_track(payload.track)[1]
-    if not repo.model_artifact_exists(model_name=model_name, track=payload.track, model_version=model_version):
+    sizing_override: Dict[str, float] = {}
+    if payload.signal_entry_z_min is not None:
+        sizing_override["entry_z"] = float(payload.signal_entry_z_min)
+    if payload.signal_exit_z_min is not None:
+        sizing_override["exit_z"] = float(payload.signal_exit_z_min)
+    if payload.position_max_weight_base is not None:
+        sizing_override["max_weight_base"] = float(payload.position_max_weight_base)
+    if payload.position_max_weight_high_vol_mult is not None:
+        sizing_override["high_vol_mult"] = float(payload.position_max_weight_high_vol_mult)
+    if payload.cost_penalty_lambda is not None:
+        sizing_override["cost_lambda"] = float(payload.cost_penalty_lambda)
+    if score_source == "model" and payload.require_model_artifact and not repo.model_artifact_exists(
+        model_name=model_name,
+        track=payload.track,
+        model_version=model_version,
+    ):
         agg = {
             "status": "failed",
-            "reason": "model_artifact_missing",
+            "reason": "model_artifact_invalid",
+            "run_source": payload.run_source,
+            "data_regime": data_regime,
+            "score_source": score_source,
             "targets": targets,
             "samples": 0,
             "ic": 0.0,
@@ -954,10 +1616,14 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             "model_name": model_name,
             "model_version": model_version,
             "lineage_coverage": 0.0,
+            "model_inference_coverage": 0.0,
+            "fallback_used": False,
             "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
             "gate_passed": False,
         }
         repo.finish_backtest_run(run_id, agg)
+        BACKTEST_FAILED_RUNS_TOTAL.labels(track=payload.track, reason=str(agg["reason"])).inc()
+        METRIC_GATE_STATUS.labels(track=payload.track, metric="backtest_completed").set(0.0)
         return BacktestRunResponse(
             run_id=run_id,
             run_name=run_name,
@@ -968,6 +1634,8 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
         )
 
     all_metrics: List[Dict[str, float]] = []
+    calibration_ratio = float(payload.train_days) / float(max(1, payload.lookback_days))
+    polarity_mode = str(payload.signal_polarity_mode or "normal").strip().lower()
     for target in targets:
         feature_rows = repo.load_feature_history(
             target=target,
@@ -976,12 +1644,31 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             data_version=payload.data_version,
         )
         price_rows = repo.load_price_history(target, lookback_days=payload.lookback_days)
-        m = _run_model_replay_backtest(
-            feature_rows=feature_rows,
-            price_rows=price_rows,
-            fee_bps=payload.fee_bps,
-            slippage_bps=payload.slippage_bps,
-        )
+        if score_source == "model":
+            m = _run_model_inference_backtest(
+                target=target,
+                feature_rows=feature_rows,
+                price_rows=price_rows,
+                fee_bps=effective_fee_bps,
+                slippage_bps=effective_slippage_bps,
+                sizing_override=sizing_override or None,
+                signal_polarity_mode=polarity_mode,
+                calibration_ratio=calibration_ratio,
+            )
+        else:
+            m = _run_model_replay_backtest(
+                feature_rows=feature_rows,
+                price_rows=price_rows,
+                fee_bps=effective_fee_bps,
+                slippage_bps=effective_slippage_bps,
+                sizing_override=sizing_override or None,
+                signal_polarity_mode=polarity_mode,
+                calibration_ratio=calibration_ratio,
+            )
+            m["score_source"] = "heuristic"
+            m["model_inference_coverage"] = 0.0
+            m["fallback_used"] = False
+        m["target"] = target
         all_metrics.append(m)
 
     samples = sum(int(m.get("samples", 0)) for m in all_metrics)
@@ -989,6 +1676,9 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
         agg = {
             "status": "failed",
             "reason": "insufficient_features" if any(m.get("reason") == "insufficient_features" for m in all_metrics) else "insufficient_prices",
+            "run_source": payload.run_source,
+            "data_regime": data_regime,
+            "score_source": score_source,
             "targets": targets,
             "samples": 0,
             "ic": 0.0,
@@ -999,15 +1689,57 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             "model_name": model_name,
             "model_version": model_version,
             "lineage_coverage": 0.0,
+            "model_inference_coverage": 0.0,
+            "fallback_used": False,
             "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
             "gate_passed": False,
         }
     else:
+        per_target: Dict[str, Dict[str, float]] = {}
+        regime_agg: Dict[str, Dict[str, float]] = {}
+        for m in all_metrics:
+            target = str(m.get("target") or "").upper()
+            if not target:
+                continue
+            per_target[target] = {
+                "pnl_after_cost": round(float(m.get("pnl_after_cost", 0.0) or 0.0), 6),
+                "max_drawdown": round(float(m.get("max_drawdown", 0.0) or 0.0), 6),
+                "sharpe": round(float(m.get("sharpe_daily", m.get("sharpe", 0.0)) or 0.0), 6),
+                "sharpe_step_raw": round(float(m.get("sharpe_step_raw", 0.0) or 0.0), 6),
+                "sharpe_daily": round(float(m.get("sharpe_daily", 0.0) or 0.0), 6),
+                "observation_days": int(m.get("observation_days", 0) or 0),
+                "vol_floor_applied": bool(m.get("vol_floor_applied", False)),
+                "samples": int(m.get("samples", 0) or 0),
+            }
+            rb = m.get("regime_breakdown") or {}
+            if isinstance(rb, dict):
+                for name, vals in rb.items():
+                    if not isinstance(vals, dict):
+                        continue
+                    cur = regime_agg.setdefault(
+                        str(name),
+                        {"samples": 0.0, "wins_weighted": 0.0, "turnover": 0.0, "pnl_after_cost": 0.0},
+                    )
+                    cnt = float(vals.get("samples") or 0.0)
+                    hit = float(vals.get("hit_rate") or 0.0)
+                    cur["samples"] += cnt
+                    cur["wins_weighted"] += hit * cnt
+                    cur["turnover"] += float(vals.get("turnover") or 0.0)
+                    cur["pnl_after_cost"] += float(vals.get("pnl_after_cost") or 0.0)
         agg = {
             "status": "completed",
+            "run_source": payload.run_source,
+            "data_regime": data_regime,
+            "score_source": score_source,
             "targets": targets,
             "samples": int(samples),
             "ic": round(float(np.mean([m["ic"] for m in all_metrics])), 6),
+            "sharpe": round(float(np.mean([float(m.get("sharpe_daily", m.get("sharpe", 0.0)) or 0.0) for m in all_metrics])), 6),
+            "sharpe_step_raw": round(float(np.mean([float(m.get("sharpe_step_raw", 0.0) or 0.0) for m in all_metrics])), 6),
+            "sharpe_daily": round(float(np.mean([float(m.get("sharpe_daily", 0.0) or 0.0) for m in all_metrics])), 6),
+            "sharpe_method": "daily_agg_v1",
+            "observation_days": int(min([int(m.get("observation_days", 0) or 0) for m in all_metrics] or [0])),
+            "vol_floor_applied": bool(any(bool(m.get("vol_floor_applied", False)) for m in all_metrics)),
             "hit_rate": round(float(np.mean([m["hit_rate"] for m in all_metrics])), 6),
             "turnover": round(float(np.mean([m["turnover"] for m in all_metrics])), 6),
             "pnl_after_cost": round(float(np.mean([m["pnl_after_cost"] for m in all_metrics])), 6),
@@ -1015,15 +1747,33 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             "model_name": model_name,
             "model_version": model_version,
             "lineage_coverage": round(float(np.mean([float(m.get("lineage_coverage", 0.0)) for m in all_metrics])), 6),
+            "model_inference_coverage": round(float(np.mean([float(m.get("model_inference_coverage", 0.0) or 0.0) for m in all_metrics])), 6),
+            "fallback_used": bool(any(bool(m.get("fallback_used", False)) for m in all_metrics)),
             "cost_breakdown": {
                 "fee": round(float(np.mean([float((m.get("cost_breakdown") or {}).get("fee", 0.0)) for m in all_metrics])), 8),
                 "slippage": round(float(np.mean([float((m.get("cost_breakdown") or {}).get("slippage", 0.0)) for m in all_metrics])), 8),
                 "impact": round(float(np.mean([float((m.get("cost_breakdown") or {}).get("impact", 0.0)) for m in all_metrics])), 8),
             },
+            "per_target": per_target,
+            "regime_breakdown": {
+                name: {
+                    "samples": int(vals["samples"]),
+                    "hit_rate": round(float(vals["wins_weighted"] / max(1.0, vals["samples"])), 6),
+                    "turnover": round(float(vals["turnover"]), 6),
+                    "pnl_after_cost": round(float(vals["pnl_after_cost"]), 6),
+                }
+                for name, vals in regime_agg.items()
+                if vals["samples"] > 0
+            },
         }
         agg["gate_passed"] = bool(agg["ic"] > 0 and agg["pnl_after_cost"] > 0 and agg["max_drawdown"] < 0.2)
 
     repo.finish_backtest_run(run_id, agg)
+    if str(agg.get("status")) == "failed":
+        BACKTEST_FAILED_RUNS_TOTAL.labels(track=payload.track, reason=str(agg.get("reason") or "unknown")).inc()
+        METRIC_GATE_STATUS.labels(track=payload.track, metric="backtest_completed").set(0.0)
+    else:
+        METRIC_GATE_STATUS.labels(track=payload.track, metric="backtest_completed").set(1.0)
 
     gate_model_name = model_name
     gate_model_version = model_version
@@ -1033,6 +1783,7 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
         min_pnl_after_cost=0.0,
         max_drawdown=0.2,
         windows=3,
+        score_source=score_source,
     )
     repo.promote_model(
         track=payload.track,
@@ -1202,7 +1953,13 @@ async def evaluate_model_gate(payload: ModelGateRequest) -> ModelGateResponse:
 
 @router.post("/models/rollback/check", response_model=RollbackCheckResponse)
 async def check_model_rollback(payload: RollbackCheckRequest) -> RollbackCheckResponse:
-    runs = repo.list_recent_backtest_runs(track=payload.track, limit=payload.max_recent_losses)
+    include_sources, exclude_sources = _run_source_filters()
+    runs = repo.list_recent_backtest_runs(
+        track=payload.track,
+        limit=payload.max_recent_losses,
+        include_sources=include_sources,
+        exclude_sources=exclude_sources,
+    )
     usable = [r for r in runs if isinstance(r.get("metrics"), dict) and r["metrics"].get("status") == "completed"]
     if not usable:
         return RollbackCheckResponse(
@@ -1274,6 +2031,25 @@ async def check_model_rollback(payload: RollbackCheckRequest) -> RollbackCheckRe
         trigger_rule=f"consecutive_windows>={required_fails}",
         metrics=metrics,
     )
+
+
+@router.post("/models/parity/check")
+async def check_backtest_paper_parity(payload: ParityCheckRequest):
+    res = _parity_check(
+        track=payload.track,
+        max_deviation=payload.max_deviation,
+        min_completed_runs=payload.min_completed_runs,
+        score_source=payload.score_source,
+    )
+    if not bool(res.get("passed", False)):
+        repo.save_risk_event(
+            decision_id=f"parity-{uuid.uuid4().hex[:12]}",
+            severity="warning",
+            code="backtest_paper_parity_failed",
+            message=str(res.get("status") or "failed"),
+            payload=res,
+        )
+    return res
 
 
 @router.get("/risk/limits", response_model=RiskLimitsResponse)
@@ -1458,13 +2234,23 @@ async def portfolio_rebalance(payload: PortfolioRebalanceRequest) -> PortfolioRe
         raise HTTPException(status_code=423, detail=kill_block)
 
     raw: List[Tuple[str, str, float, str]] = []
+    sizing_cfg = _position_sizing_settings()
     for sig in payload.signals:
         side = 0.0
         if sig.action == "buy":
             side = 1.0
         elif sig.action == "sell":
             side = -1.0
-        strength = side * abs(sig.score) * max(0.1, sig.confidence)
+        vol_bucket = _target_vol_bucket(sig.target)
+        est_cost_bps = 8.0 if sig.track == "liquid" else 12.0
+        size = _score_to_size(
+            float(sig.score),
+            float(sig.confidence),
+            est_cost_bps=est_cost_bps,
+            vol_bucket=vol_bucket,
+            sizing_cfg=sizing_cfg,
+        )
+        strength = side * size
         bucket = _strategy_bucket(sig.track, float(sig.score), float(sig.confidence), sig.target)
         raw.append((sig.target.upper(), sig.track, strength, bucket))
 
@@ -1477,6 +2263,8 @@ async def portfolio_rebalance(payload: PortfolioRebalanceRequest) -> PortfolioRe
     pre_bucket_exposure: Dict[str, float] = {}
     for target, track, strength, bucket in raw:
         weight = (strength / gross_strength) * payload.risk_budget
+        if abs(weight) < sizing_cfg["exit_z"]:
+            weight = 0.0
         pre_bucket_exposure[bucket] = pre_bucket_exposure.get(bucket, 0.0) + abs(weight)
         target_positions.append(RebalancePosition(target=target, track=track, weight=weight, style_bucket=bucket))
 
@@ -1500,7 +2288,7 @@ async def portfolio_rebalance(payload: PortfolioRebalanceRequest) -> PortfolioRe
     adjusted, violations, gross, turnover = _evaluate_risk(
         proposed=target_positions,
         current=payload.current_positions,
-        realized_drawdown=0.0,
+        realized_drawdown=payload.realized_drawdown,
     )
     violations = bucket_violations + violations
 
@@ -1555,7 +2343,20 @@ async def portfolio_rebalance(payload: PortfolioRebalanceRequest) -> PortfolioRe
 async def submit_execution_orders(payload: SubmitExecutionOrdersRequest) -> SubmitExecutionOrdersResponse:
     if not payload.orders:
         raise HTTPException(status_code=400, detail="orders cannot be empty")
+    resolved_venue = payload.venue
+    if payload.adapter == "bitget_live" and payload.venue == "coinbase":
+        resolved_venue = "bitget"
+    if payload.adapter == "coinbase_live" and payload.venue == "bitget":
+        resolved_venue = "coinbase"
     decision_id = uuid.uuid4().hex
+    execution_params = {
+        "market_type": payload.market_type,
+        "product_type": payload.product_type,
+        "leverage": payload.leverage,
+        "reduce_only": payload.reduce_only,
+        "position_mode": payload.position_mode,
+        "margin_mode": payload.margin_mode,
+    }
     order_payloads = [
         {
             "target": o.target.upper(),
@@ -1564,7 +2365,7 @@ async def submit_execution_orders(payload: SubmitExecutionOrdersRequest) -> Subm
             "quantity": o.quantity,
             "est_price": o.est_price,
             "strategy_id": o.strategy_id,
-            "metadata": o.metadata,
+            "metadata": {**o.metadata, "execution_params": execution_params},
         }
         for o in payload.orders
     ]
@@ -1575,7 +2376,7 @@ async def submit_execution_orders(payload: SubmitExecutionOrdersRequest) -> Subm
     order_ids = repo.create_execution_orders(
         decision_id=decision_id,
         adapter=payload.adapter,
-        venue=payload.venue,
+        venue=resolved_venue,
         time_in_force=payload.time_in_force,
         max_slippage_bps=payload.max_slippage_bps,
         orders=order_payloads,
@@ -1583,7 +2384,7 @@ async def submit_execution_orders(payload: SubmitExecutionOrdersRequest) -> Subm
     return SubmitExecutionOrdersResponse(
         decision_id=decision_id,
         adapter=payload.adapter,
-        venue=payload.venue,
+        venue=resolved_venue,
         accepted_orders=len(order_ids),
         order_ids=order_ids,
     )
@@ -1612,6 +2413,11 @@ async def get_execution_order(order_id: int) -> ExecutionOrderStatusResponse:
 @router.post("/execution/run", response_model=ExecuteOrdersResponse)
 async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
     _t0 = time.perf_counter()
+    resolved_venue = payload.venue
+    if payload.adapter == "bitget_live" and payload.venue == "coinbase":
+        resolved_venue = "bitget"
+    if payload.adapter == "coinbase_live" and payload.venue == "bitget":
+        resolved_venue = "coinbase"
     orders = repo.fetch_orders_for_decision(payload.decision_id, limit=payload.max_orders)
     if not orders:
         raise HTTPException(status_code=404, detail="no orders for decision")
@@ -1712,7 +2518,13 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
         context={
             "time_in_force": payload.time_in_force,
             "max_slippage_bps": payload.max_slippage_bps,
-            "venue": payload.venue,
+            "venue": resolved_venue,
+            "market_type": payload.market_type,
+            "product_type": payload.product_type,
+            "leverage": payload.leverage,
+            "reduce_only": payload.reduce_only,
+            "position_mode": payload.position_mode,
+            "margin_mode": payload.margin_mode,
             "limit_timeout_sec": payload.limit_timeout_sec,
             "max_retries": payload.max_retries,
             "fee_bps": payload.fee_bps,
@@ -1720,6 +2532,7 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
     )
     filled = 0
     rejected = 0
+    reject_breakdown: Dict[str, int] = {}
     merged = []
     for order, res in zip(scaled_orders, results):
         normalized_res = _normalize_execution_payload(res)
@@ -1729,6 +2542,9 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
             filled += 1
         elif status == "rejected":
             rejected += 1
+            reason_cat = str(normalized_res.get("reject_reason_category") or "other")
+            reject_breakdown[reason_cat] = reject_breakdown.get(reason_cat, 0) + 1
+            EXECUTION_REJECTS_TOTAL.labels(adapter=payload.adapter, reason=reason_cat).inc()
         repo.update_order_execution(order["id"], status=status, metadata={"execution": normalized_res})
         merged.append({**order, "execution": normalized_res})
 
@@ -1738,6 +2554,7 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
         total=len(orders),
         filled=filled,
         rejected=rejected,
+        reject_breakdown=reject_breakdown,
         orders=merged,
     )
     EXECUTION_LATENCY_SECONDS.labels(adapter=payload.adapter).observe(max(0.0, time.perf_counter() - _t0))
@@ -1870,7 +2687,15 @@ async def auto_evaluate_model_gate(payload: AutoGateEvaluateRequest) -> AutoGate
 
 @router.post("/models/rollout/advance", response_model=RolloutAdvanceResponse)
 async def advance_model_rollout(payload: RolloutAdvanceRequest) -> RolloutAdvanceResponse:
-    runs = repo.list_recent_backtest_runs(track=payload.track, limit=payload.windows)
+    include_sources, exclude_sources = _run_source_filters()
+    data_regimes = _data_regime_filters()
+    runs = repo.list_recent_backtest_runs(
+        track=payload.track,
+        limit=payload.windows,
+        include_sources=include_sources,
+        exclude_sources=exclude_sources,
+        data_regimes=data_regimes,
+    )
     usable = [r for r in runs if isinstance(r.get("metrics"), dict) and r["metrics"].get("status") == "completed"]
     if len(usable) < payload.windows:
         return RolloutAdvanceResponse(

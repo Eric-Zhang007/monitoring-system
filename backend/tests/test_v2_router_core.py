@@ -9,7 +9,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import v2_router as router_mod  # noqa: E402
 from v2_router import _evaluate_risk, _execution_volatility_violations, _infer_daily_loss_ratio, _ks_statistic, _normalize_execution_payload, _psi, _walk_forward_metrics  # noqa: E402
-from schemas_v2 import ExecuteOrdersRequest, RebalancePosition, RiskCheckRequest, SignalGenerateRequest  # noqa: E402
+from schemas_v2 import BacktestRunRequest, ExecuteOrdersRequest, RebalancePosition, RiskCheckRequest, SignalGenerateRequest  # noqa: E402
 from execution_engine import ExecutionEngine  # noqa: E402
 
 
@@ -99,6 +99,20 @@ def test_extended_request_models():
         venue="coinbase",
     )
     assert run.venue == "coinbase"
+    run_bitget = ExecuteOrdersRequest(
+        decision_id="d2",
+        adapter="bitget_live",
+        venue="bitget",
+        market_type="perp_usdt",
+        product_type="USDT-FUTURES",
+        leverage=3.0,
+        reduce_only=False,
+        position_mode="one_way",
+        margin_mode="cross",
+    )
+    assert run_bitget.adapter == "bitget_live"
+    bt = BacktestRunRequest(track="liquid", targets=["BTC"])
+    assert bt.run_source == "prod"
 
 
 def test_risk_check_kill_switch_violation_code_is_consistent(monkeypatch):
@@ -159,6 +173,32 @@ def test_risk_check_runtime_limits_trigger_violation(monkeypatch):
     assert "consecutive_loss_exceeded" in resp.violations
     assert fake.last_upsert.get("reason") == "daily_loss_exceeded"
     assert int(fake.last_upsert.get("duration_minutes") or 0) >= 1
+
+
+def test_risk_check_drawdown_near_limit_enforces_reduce_only(monkeypatch):
+    class _FakeRepo:
+        def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
+            return False
+
+        def upsert_kill_switch_state(self, *args, **kwargs):
+            return {}
+
+        def save_risk_event(self, **kwargs):
+            return None
+
+    monkeypatch.setenv("RISK_MAX_DRAWDOWN", "0.12")
+    monkeypatch.setenv("RISK_DRAWDOWN_WARN_THRESHOLD", "0.08")
+    monkeypatch.setenv("RISK_DRAWDOWN_NEAR_LIMIT", "0.10")
+    monkeypatch.setattr(router_mod, "repo", _FakeRepo())
+    payload = RiskCheckRequest(
+        proposed_positions=[RebalancePosition(target="BTC", track="liquid", weight=0.08)],
+        current_positions=[RebalancePosition(target="BTC", track="liquid", weight=0.02)],
+        realized_drawdown=0.101,
+    )
+    resp = asyncio.run(router_mod.risk_check(payload))
+    assert resp.approved is False
+    assert "drawdown_near_limit_reduce_only" in resp.violations
+    assert abs(resp.adjusted_positions[0].weight - 0.02) < 1e-9
 
 
 def test_infer_daily_loss_ratio_uses_notional_denominator(monkeypatch):

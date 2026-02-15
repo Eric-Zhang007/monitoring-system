@@ -1,0 +1,1 @@
+{"passed": true, "file": "monitoring/alerts.yml", "checks": {"ExecutionRejectRateCritical": {"ok": true, "missing": []}, "ApiAvailabilityLow": {"ok": true, "missing": []}, "ExecutionRejectReasonSkew": {"ok": true, "missing": []}, "SignalLatencyP99Degraded": {"ok": true, "missing": []}}}

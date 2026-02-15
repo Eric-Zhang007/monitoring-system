@@ -5,7 +5,7 @@ from typing import Dict, List
 
 import requests
 
-from connectors.base import BaseConnector
+from connectors.base import BaseConnector, RateLimitError
 
 
 class OnChainCoinGeckoConnector(BaseConnector):
@@ -27,6 +27,8 @@ class OnChainCoinGeckoConnector(BaseConnector):
             "price_change_percentage": "24h,7d",
         }
         resp = requests.get(url, params=params, timeout=20)
+        if resp.status_code == 429:
+            raise RateLimitError("coingecko_rate_limited")
         resp.raise_for_status()
         data = resp.json()
         return data if isinstance(data, list) else []
@@ -37,6 +39,7 @@ class OnChainCoinGeckoConnector(BaseConnector):
         occurred_at = dt.datetime.utcnow().isoformat() + "Z"
         return {
             "event_type": "market",
+            "market_scope": "crypto",
             "title": f"On-chain/market snapshot: {name}",
             "occurred_at": occurred_at,
             "source_url": f"https://www.coingecko.com/en/coins/{raw.get('id', '')}",

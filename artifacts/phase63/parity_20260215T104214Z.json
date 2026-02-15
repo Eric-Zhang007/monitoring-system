@@ -1,0 +1,1 @@
+{"status": "insufficient_observation", "passed": false, "evaluated_at": "2026-02-15T10:42:24.042967+00:00", "window_start": "2026-01-16T10:42:24.042967+00:00", "window_end": "2026-02-15T10:42:24.042967+00:00", "completed_runs": 2, "score_source": "model", "min_completed_runs": 5, "reason": "insufficient_completed_backtests"}

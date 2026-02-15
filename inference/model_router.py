@@ -88,6 +88,8 @@ class ModelRouter:
         self.torch_cache: Dict[str, Dict[str, Any]] = {}
         self.tabular_cache: Dict[str, Dict[str, Any]] = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.expected_feature_schema = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.1")
+        self.expected_data_version = os.getenv("DATA_VERSION", "v1")
 
     @staticmethod
     def _align_features(features: np.ndarray, in_dim: int) -> np.ndarray:
@@ -159,6 +161,16 @@ class ModelRouter:
                 "normalization": ckpt.get("normalization"),
             }
         elif model_name == "tsmixer_liquid":
+            ckpt_schema = str(ckpt.get("feature_payload_schema_version") or "").strip()
+            ckpt_data_version = str(ckpt.get("data_version") or "").strip()
+            if ckpt_schema and ckpt_schema != self.expected_feature_schema:
+                return None
+            if ckpt_data_version and ckpt_data_version != self.expected_data_version:
+                return None
+            if not str(ckpt.get("train_report_hash") or "").strip():
+                return None
+            if not isinstance(ckpt.get("normalization"), dict):
+                return None
             n_tokens = int(ckpt.get("n_tokens", 5))
             n_channels = int(ckpt.get("n_channels", 3))
             model = TSMixerLiquidModel(n_tokens=n_tokens, n_channels=n_channels, n_blocks=2)
@@ -169,6 +181,9 @@ class ModelRouter:
                 "ensemble_alpha": float(ckpt.get("ensemble_alpha", 0.7) or 0.7),
                 "n_tokens": n_tokens,
                 "n_channels": n_channels,
+                "feature_payload_schema_version": ckpt_schema,
+                "data_version": ckpt_data_version,
+                "train_report_hash": str(ckpt.get("train_report_hash")),
             }
         else:
             return None
@@ -185,6 +200,15 @@ class ModelRouter:
 
         model = self._load_json_model(f"liquid_{symbol.lower()}_lgbm_baseline_v2.json")
         if not model:
+            return None
+        required = ("model_name", "model_version", "track", "type", "feature_version", "data_version")
+        if any(not str(model.get(k) or "").strip() for k in required):
+            return None
+        if str(model.get("track") or "").strip().lower() != "liquid":
+            return None
+        if str(model.get("feature_version") or "").strip() != os.getenv("FEATURE_VERSION", "feature-store-v2.1"):
+            return None
+        if str(model.get("data_version") or "").strip() != self.expected_data_version:
             return None
         loaded: Dict[str, Any] = {
             "name": str(model.get("model") or "unknown"),

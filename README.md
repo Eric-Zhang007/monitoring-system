@@ -1,7 +1,24 @@
 # 全网信息监测系统 - V2 双轨升级版（VC + Liquid）
 
 **完成日期：** 2026-02-14
-**项目状态：** ✅ 已完成 V2 核心重构（保留 V1 兼容接口）
+**项目状态：** ✅ 已完成 V2 核心重构，`liquid` 严格门禁当前已达标（可进入 2×A100 服务器阶段）
+
+---
+
+## 当前门禁快照（2026-02-15 11:26 UTC）
+- 数据来源（strict, 生产口径过滤）：
+  - `python3 scripts/evaluate_hard_metrics.py --track liquid --lookback-days 180 --score-source model --include-sources prod --exclude-sources smoke,async_test,maintenance --data-regimes prod_live`
+  - `python3 scripts/check_backtest_paper_parity.py --track liquid --max-deviation 0.10 --min-completed-runs 5 --score-source model --include-sources prod --exclude-sources smoke,async_test,maintenance --data-regimes prod_live`
+  - `python3 scripts/check_gpu_cutover_readiness.py`
+- 当前值：
+  - `Sharpe=1.694592`（通过阈值 `>1.5`）
+  - `MaxDD=0.000067`（通过阈值 `<0.12`）
+  - `execution_reject_rate=0.00244`（通过阈值 `<1%`）
+  - `hard_passed=true`
+  - `parity_30d=passed`（`relative_deviation=0.014652`）
+  - `ready_for_gpu_cutover=true`
+- 结论：
+  - 当前可启动 2×A100 服务器阶段（建议先维持 1-3 天低风险灰度观察）。
 
 ---
 
@@ -62,6 +79,49 @@
   - 容器内核心测试：`28 passed`。
   - `scripts/test_v2_api.sh` 全通过。
 
+### 2026-02-15 Phase-6 指标达标优化（本轮新增）
+- 硬指标口径与门禁分轨：
+  - `scripts/evaluate_hard_metrics.py` 仅以 `completed` 回测样本统计收益指标。
+  - 新增输出：`track_mode`、`failed_runs_count`、`failed_ratio`、`artifact_failure_ratio`。
+  - `liquid` 执行硬门禁（`--enforce` 可阻断），`vc` 仅监控（`monitor_only=true`）。
+- 执行拒单治理：
+  - Paper 执行默认关闭随机拒单（`PAPER_ENABLE_RANDOM_REJECT=0`）。
+  - 拒单改为可解释原因分类并回传 `reject_reason_category`。
+  - `POST /api/v2/execution/run` 响应新增 `reject_breakdown` 聚合。
+- 策略层强化：
+  - 增加非线性仓位映射（score-to-size）、波动分层仓位上限、成本惩罚项。
+  - 命中 drawdown 风险时自动缩减仓位上限，优先软降杠杆而非直接停机。
+- 偏差治理：
+  - 新增 `POST /api/v2/models/parity/check`（`passed|failed|insufficient_observation` 三态）。
+  - `scripts/check_backtest_paper_parity.py` 支持 `7d/30d` 双窗口与 `min_completed_runs` 门槛。
+  - 调度器已接入 parity 检查并写入治理审计。
+- 新增指标与告警：
+  - `ms_execution_rejects_total{adapter,reason}`
+  - `ms_backtest_failed_runs_total{track,reason}`
+  - `ms_metric_gate_status{track,metric}`
+  - 告警新增 `ExecutionRejectRateCritical`（P1）与 `ExecutionRejectReasonSkew`（P2）。
+- 交易所扩展：
+  - 执行 adapter 新增 `bitget_live`，支持 `spot` 与 `perp_usdt` 参数透传。
+  - `POST /api/v2/execution/run` 与 `POST /api/v2/execution/orders` 新增可选字段：`market_type/product_type/leverage/reduce_only/position_mode/margin_mode`。
+  - 新增校验脚本：`scripts/validate_bitget_live.py`。
+
+### 2026-02-15 Phase-6.3 指标治理口径收敛（本轮新增）
+- 回测失败 supersede 治理：
+  - `backtest_runs` 新增 supersede 字段（`superseded_by_run_id/supersede_reason/superseded_at`）。
+  - 重放成功后可将历史 `model_artifact_missing` 失败样本标记 superseded，保留审计但不污染有效失败统计。
+- hard metrics 统计升级：
+  - `scripts/evaluate_hard_metrics.py` 默认使用“有效失败口径”（排除 superseded）。
+  - 输出新增：`failed_runs_effective_count`、`artifact_missing_effective_count`、`superseded_runs_count`。
+- parity 口径升级：
+  - 从全局 PnL 代理比值切换为“同窗口 + 同 target 交集 + 已成交订单（filled/partially_filled）”比较。
+  - `POST /api/v2/models/parity/check` 返回新增：
+    - `matched_targets_count`
+    - `paper_filled_orders_count`
+    - `comparison_basis`
+    - `window_details`
+- 回测结果补充：
+  - `/api/v2/backtest/run` completed 指标新增 `metrics.per_target`，用于 parity 按 target 对齐。
+
 ### 2026-02-15 Codex Plan 剩余八项落地（本轮新增）
 - 告警触达闭环：
   - 新增 `alertmanager` 服务（`docker-compose`）与配置 `monitoring/alertmanager.yml`。
@@ -88,7 +148,7 @@
 - 新增执行 API：
   - `POST /api/v2/execution/orders`（提交订单）
   - `GET /api/v2/execution/orders/{order_id}`（查询订单）
-  - `POST /api/v2/execution/run`（统一执行入口，支持 `paper|coinbase_live` + `time_in_force|max_slippage_bps|venue`）
+  - `POST /api/v2/execution/run`（统一执行入口，支持 `paper|coinbase_live|bitget_live` + `time_in_force|max_slippage_bps|venue|market_type`）
   - `GET /api/v2/execution/audit/{decision_id}`（交易审计链路：`signal->order->fill->position->pnl`）
 - 新增模型治理与监控 API：
   - `POST /api/v2/models/drift/evaluate`
@@ -109,6 +169,25 @@
   - `orders_sim` 扩展字段：`adapter`、`venue`、`time_in_force`、`max_slippage_bps`、`strategy_id`
 - 训练链路增强：`TSMixer + LightGBM` 集成、数据质量 gate、固定随机种子、配置固化、early stopping、lr scheduler、checkpoint resume、OOM/NaN 降级重试、特征标准化参数持久化、`purged K-fold + walk-forward` 指标输出（IC/HitRate/PnL after cost/Turnover/MaxDD）。
 - 推理链路增强：批量拉取价格/事件上下文 + 盘口/资金费率/链上信号，按 15 维特征推理，并与 `TSMixer + LightGBM` 集成路径对齐。
+
+### 当前策略与参数口径（2026-02-15）
+- 回测主路径：`_run_model_replay_backtest`（`backend/v2_router.py`）采用“特征打分 -> 仓位映射 -> 成本惩罚 -> 风险限幅”。
+- 关键参数（backend ENV）：
+  - `SIGNAL_ENTRY_Z_MIN`
+  - `SIGNAL_EXIT_Z_MIN`
+  - `POSITION_MAX_WEIGHT_BASE`
+  - `POSITION_MAX_WEIGHT_HIGH_VOL_MULT`
+  - `COST_PENALTY_LAMBDA`
+  - `COST_FEE_BPS`
+  - `COST_SLIPPAGE_BPS`
+  - `COST_IMPACT_COEFF`
+  - `BACKTEST_MAX_ABS_POSITION`
+  - `BACKTEST_MAX_STEP_TURNOVER`
+  - `BACKTEST_COST_EDGE_MULT`
+  - `BACKTEST_ENTRY_Z_MIN`
+  - `BACKTEST_EXIT_Z_MIN`
+- 当前默认值以 `docker-compose.yml` 为准。
+- 说明：文档下方早期“MVP说明”章节保留为历史记录，若与本节冲突，以本节与代码实现为准。
 
 - 新增 `backend /api/v2/*`：
   - `POST /api/v2/ingest/events`
@@ -164,6 +243,8 @@
 ---
 
 ## 📋 项目概述
+
+> 说明：以下“项目结构/技术栈/成本”等章节包含历史 MVP 描述，用于架构参考；上线准入请以本文顶部“当前门禁快照”与 `TRACKING.md` 为准。
 
 这是一个完整的金融信息监测与AI预测系统MVP，包含数据采集、实时监控、GPU加速推理、NLP情感分析和多响应式前端。
 
@@ -356,14 +437,55 @@ python3 scripts/evaluate_hard_metrics.py --track liquid
 python3 scripts/replay_model_run.py --tolerance 1e-6
 
 # 回测-paper 偏差自动验收
-python3 scripts/check_backtest_paper_parity.py --track liquid --target BTC
+python3 scripts/check_backtest_paper_parity.py --track liquid --max-deviation 0.10 --min-completed-runs 5
+
+# Phase4/5 告警规则阈值验收
+python3 scripts/validate_phase45_alerts.py
+
+# CI 门禁（hard_metrics + parity + alerts；不通过返回非 0）
+bash scripts/ci_phase45_gate.sh
+
+# 主动触发 parity API 检查（供调度/人工验证）
+curl -s -X POST http://localhost:8000/api/v2/models/parity/check \
+  -H "content-type: application/json" \
+  -d '{"track":"liquid","max_deviation":0.10,"min_completed_runs":5}'
 
 # Coinbase live 连通性验收（无密钥会返回 skipped）
 python3 scripts/validate_coinbase_live.py
 
+# Bitget live 连通性验收（无密钥会返回 skipped）
+python3 scripts/validate_bitget_live.py
+
 # 混沌演练（示例：中断 Redis，再 recover）
 python3 scripts/chaos_drill.py redis_interrupt
 python3 scripts/chaos_drill.py recover
+
+# 回放失败 liquid 回测，补齐 completed 样本
+python3 scripts/rebuild_liquid_completed_backtests.py --limit 30
+
+# 严格口径批量回测（prod+model+prod_live）
+python3 scripts/run_prod_live_backtest_batch.py --api-base http://localhost:8000 --n-runs 12 --fee-bps 0.5 --slippage-bps 0.2 --signal-entry-z-min 0.08 --signal-exit-z-min 0.028 --position-max-weight-base 0.08 --cost-penalty-lambda 1.0 --signal-polarity-mode auto_train_ic
+
+# 清理旧 completed 样本（仅保留最近N条参与 hard gate 统计）
+python3 scripts/supersede_stale_backtests.py --track liquid --keep-latest 20
+
+# 校验回测 metrics contract（缺字段样本直接标红）
+python3 scripts/validate_backtest_contracts.py --track liquid --lookback-days 180 --enforce
+
+# 分析 backtest vs paper 的 target 偏差来源（含 fee/slippage/impact 成本归因）
+python3 scripts/analyze_parity_gap.py --track liquid --window-days 30 --score-source model --include-sources prod --exclude-sources smoke,async_test,maintenance --data-regimes prod_live
+
+# 策略参数网格调优（含反零交易约束）
+python3 scripts/tune_liquid_strategy_grid.py --run-source prod --data-regime prod_live --score-source model --max-trials 64 --min-turnover 0.05 --min-trades 5 --min-abs-pnl 1e-5 --min-active-targets 2
+
+# Phase-6.3 每日维护（重放+门禁+日报）
+bash scripts/daily_phase63_maintenance.sh
+
+# 持续修正循环（审查->选参->测试->门禁）
+python3 scripts/continuous_remediation_loop.py --api-base http://localhost:8000 --max-iterations 0 --green-windows 3 --candidate-source auto --candidate-top-k 8 --candidate-refresh-every 3 --fee-bps 0.5 --slippage-bps 0.2 --signal-polarity-mode auto_train_ic
+
+# 检查是否满足 GPU 切换门禁
+python3 scripts/check_gpu_cutover_readiness.py
 
 # 如需启动 GPU 推理/训练服务（默认 compose up 不启动这两个服务）
 docker compose --profile gpu up -d inference training
@@ -404,13 +526,34 @@ python3 scripts/data_quality_weekly_audit.py --api-base http://localhost:8000 --
 
 | 配置项 | 成本 |
 |--------|------|
-| 2×A100 GPU（AutoDL 按时计费） | ¥2000-5000 |
+| 笔记本本地训练/测试 | ¥0（算力成本按 0 计） |
+| 2×A100 GPU（AutoDL 按时） | ¥11.96/小时（包天/包月通常更低） |
 | 应用服务器（4 vCPU, 8GB） | ¥200 |
 | PostgreSQL + PGVector | ¥150 |
 | Redis | ¥50 |
 | ClickHouse | ¥150 |
 | Grafana + 监控 | ¥200 |
-| **总计** | **¥2750-5750** |
+| **总计** | **按 GPU 使用时长线性增长** |
+
+### HPO 分阶段算力成本（建议口径）
+
+| 阶段 | 目标 | 推荐算力 | 默认时长 | 估算方式 |
+|------|------|----------|----------|----------|
+| Stage 1 | 粗搜（单交易对、短窗口） | `local` | 1.5h | `cpu_hourly_cny * cpu_units * hours` |
+| Stage 2 | 候选精修（多交易对、中窗口） | `local` | 4h | `cpu_hourly_cny * cpu_units * hours` |
+| Stage 3 | 前瞻 OOS（仅 prod） | `a100x2` | 8h | `2 * a100_hourly_cny * hours + cpu_overhead` |
+
+可通过 HPO 脚本直接输出阶段成本估算：
+
+```bash
+python3 scripts/optuna_liquid_hpo.py \
+  --stage 3 \
+  --compute-tier a100x2 \
+  --n-trials 80 \
+  --a100-hourly-cny 11.96 \
+  --cpu-hourly-cny 0 \
+  --billing-mode hourly
+```
 
 ---
 
@@ -441,5 +584,18 @@ python3 scripts/data_quality_weekly_audit.py --api-base http://localhost:8000 --
 
 ---
 
-**报告生成时间：** 2026-02-14 19:35
-**状态：** MVP 已完成，可部署上线 ✅
+**报告生成时间：** 2026-02-15（持续更新）
+**状态：** 主链路可用但 `liquid` 门禁未达标；当前建议仅 `paper` 运行，待 hard-metrics 与 parity 连续窗口转绿后再灰度实盘。
+
+<!-- AUTO_STATUS_SNAPSHOT:BEGIN -->
+### Auto Snapshot (2026-02-15 11:26 UTC)
+- track: `liquid`
+- score_source: `model`
+- sharpe: `-18.582877`
+- max_drawdown: `0.002762`
+- execution_reject_rate: `0.00244`
+- hard_passed: `false`
+- parity_status: `insufficient_observation`
+- parity_matched_targets: `0`
+- parity_paper_filled_orders: `0`
+<!-- AUTO_STATUS_SNAPSHOT:END -->

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import os
 import random
 import time
@@ -16,9 +20,26 @@ except Exception:
 
 
 class PaperExecutionAdapter:
-    def __init__(self, reject_rate: float = 0.05, partial_fill_rate: float = 0.35):
+    def __init__(self, reject_rate: float = 0.0, partial_fill_rate: float = 0.35):
+        self.enable_random_reject = os.getenv("PAPER_ENABLE_RANDOM_REJECT", "0").strip().lower() in {"1", "true", "yes", "y"}
         self.reject_rate = reject_rate
         self.partial_fill_rate = partial_fill_rate
+        self.timeout_reject_guard = float(os.getenv("PAPER_MAX_TIMEOUT_REJECT_RATE_GUARD", "0.0") or 0.0)
+        self.timeout_by_symbol = self._parse_timeout_by_symbol(os.getenv("PAPER_TIMEOUT_BY_SYMBOL", "BTC=0.07,ETH=0.08,SOL=0.10"))
+
+    @staticmethod
+    def _parse_timeout_by_symbol(raw: str) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for token in (raw or "").split(","):
+            t = token.strip()
+            if not t or "=" not in t:
+                continue
+            k, v = t.split("=", 1)
+            try:
+                out[k.strip().upper()] = max(0.0, min(1.0, float(v.strip())))
+            except Exception:
+                continue
+        return out
 
     def execute(self, order: Dict, context: Optional[Dict] = None) -> Dict:
         context = context or {}
@@ -27,7 +48,17 @@ class PaperExecutionAdapter:
         max_retries = int(context.get("max_retries", 1) or 1)
         fee_bps = float(context.get("fee_bps", 5.0) or 5.0)
         lifecycle: List[Dict] = []
-        if random.random() < self.reject_rate:
+        if max_slippage_bps > 150.0:
+            lifecycle.append({"event": "validation", "status": "rejected", "reason": "slippage_too_wide"})
+            return {
+                "status": "rejected",
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "reject_reason": "slippage_too_wide",
+                "fees_paid": 0.0,
+                "lifecycle": lifecycle,
+            }
+        if self.enable_random_reject and random.random() < self.reject_rate:
             lifecycle.append({"event": "limit_submit", "status": "rejected", "reason": "paper_reject_simulated"})
             return {
                 "status": "rejected",
@@ -75,7 +106,10 @@ class PaperExecutionAdapter:
         while remaining > 1e-10 and retries <= max_retries:
             retries += 1
             lifecycle.append({"event": "cancel_limit", "status": "ok", "retry": retries})
-            if random.random() < 0.1 and retries <= max_retries:
+            target = str(order.get("target") or "").upper()
+            base_timeout_prob = self.timeout_by_symbol.get(target, 0.1)
+            timeout_prob = base_timeout_prob + max(0.0, self.timeout_reject_guard)
+            if random.random() < timeout_prob and retries <= max_retries:
                 lifecycle.append({"event": "market_submit", "status": "retry", "retry": retries, "reason": "venue_timeout_sim"})
                 continue
             market_filled = remaining
@@ -488,11 +522,269 @@ class CoinbaseLiveAdapter:
             }
 
 
+class BitgetLiveAdapter:
+    def __init__(self):
+        self.base_url = os.getenv("BITGET_BASE_URL", "https://api.bitget.com").strip().rstrip("/")
+        self.api_key = os.getenv("BITGET_API_KEY", "").strip()
+        self.api_secret = os.getenv("BITGET_API_SECRET", "").strip()
+        self.api_passphrase = os.getenv("BITGET_API_PASSPHRASE", "").strip()
+        self.timeout_sec = float(os.getenv("BITGET_TIMEOUT_SEC", "6") or 6.0)
+        self.recv_window_ms = str(int(float(os.getenv("BITGET_RECV_WINDOW_MS", "5000") or 5000)))
+        self.default_margin_coin = os.getenv("BITGET_DEFAULT_MARGIN_COIN", "USDT").strip().upper() or "USDT"
+
+    def _sign(self, ts_ms: str, method: str, path: str, body: str) -> str:
+        prehash = f"{ts_ms}{method.upper()}{path}{body}"
+        digest = hmac.new(self.api_secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+        return base64.b64encode(digest).decode("utf-8")
+
+    def _request(self, method: str, path: str, *, payload: Optional[Dict[str, Any]] = None) -> tuple[int, Dict[str, Any]]:
+        body_str = json.dumps(payload or {}, separators=(",", ":")) if payload is not None else ""
+        ts_ms = str(int(time.time() * 1000))
+        headers = {"Content-Type": "application/json"}
+        if self.api_key and self.api_secret and self.api_passphrase:
+            headers.update(
+                {
+                    "ACCESS-KEY": self.api_key,
+                    "ACCESS-SIGN": self._sign(ts_ms, method, path, body_str),
+                    "ACCESS-TIMESTAMP": ts_ms,
+                    "ACCESS-PASSPHRASE": self.api_passphrase,
+                    "ACCESS-RECV-WINDOW": self.recv_window_ms,
+                    "locale": "en-US",
+                }
+            )
+        resp = requests.request(
+            method=method.upper(),
+            url=f"{self.base_url}{path}",
+            headers=headers,
+            data=body_str if payload is not None else None,
+            timeout=self.timeout_sec,
+        )
+        parsed: Dict[str, Any] = {}
+        if resp.content:
+            try:
+                j = resp.json()
+                if isinstance(j, dict):
+                    parsed = j
+            except Exception:
+                parsed = {}
+        return int(resp.status_code), parsed
+
+    @staticmethod
+    def _symbol(target: str, market_type: str) -> str:
+        t = (target or "").strip().upper().replace("/", "").replace("-", "")
+        if not t:
+            return ""
+        if market_type == "perp_usdt":
+            return t if t.endswith("USDT") else f"{t}USDT"
+        return t if t.endswith("USDT") else f"{t}USDT"
+
+    @staticmethod
+    def _classify_error(http_code: int, body: Dict[str, Any], fallback: str = "venue_error") -> str:
+        if http_code == 429:
+            return "bitget_rate_limited"
+        code = str(body.get("code") or "")
+        msg = str(body.get("msg") or body.get("message") or "").lower()
+        if code in {"40009", "40011", "40012", "00171"} or "signature" in msg:
+            return "bitget_signature_error"
+        if "symbol" in msg and ("not exist" in msg or "invalid" in msg):
+            return "bitget_symbol_not_supported"
+        if "precision" in msg or "size too" in msg:
+            return "bitget_precision_invalid"
+        if "position" in msg or "reduceonly" in msg or "reduce only" in msg:
+            return "bitget_position_rule_violation"
+        if "rate limit" in msg or code in {"429", "13006"}:
+            return "bitget_rate_limited"
+        return fallback
+
+    @staticmethod
+    def _map_status(status: str, filled_qty: float, requested_qty: float) -> str:
+        s = (status or "").strip().lower()
+        if s in {"full-fill", "filled", "done"}:
+            return "filled"
+        if s in {"cancelled", "canceled"}:
+            return "canceled" if filled_qty <= 1e-10 else "partially_filled"
+        if s in {"reject", "rejected", "failed"}:
+            return "rejected" if filled_qty <= 1e-10 else "partially_filled"
+        if filled_qty >= requested_qty - 1e-10:
+            return "filled"
+        if filled_qty > 1e-10:
+            return "partially_filled"
+        return "submitted"
+
+    def execute(self, order: Dict, context: Optional[Dict] = None) -> Dict:
+        context = context or {}
+        venue = str(context.get("venue") or "bitget").strip().lower()
+        market_type = str(context.get("market_type") or "spot").strip().lower()
+        product_type = str(context.get("product_type") or "USDT-FUTURES").strip()
+        margin_mode = str(context.get("margin_mode") or "cross").strip().lower()
+        position_mode = str(context.get("position_mode") or "one_way").strip().lower()
+        reduce_only = bool(context.get("reduce_only") or False)
+        leverage = context.get("leverage")
+        lifecycle: List[Dict[str, Any]] = []
+        if venue != "bitget":
+            return {
+                "status": "rejected",
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "reject_reason": f"unsupported_venue:{venue}",
+                "venue_order_id": None,
+                "fees_paid": 0.0,
+                "lifecycle": lifecycle,
+            }
+        qty = float(order.get("quantity") or 0.0)
+        if qty <= 0:
+            return {
+                "status": "rejected",
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "reject_reason": "invalid_quantity",
+                "venue_order_id": None,
+                "fees_paid": 0.0,
+                "lifecycle": [{"event": "validation", "status": "rejected", "reason": "invalid_quantity"}],
+            }
+        if not self.api_key or not self.api_secret or not self.api_passphrase:
+            return {
+                "status": "rejected",
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "reject_reason": "bitget_credentials_not_configured",
+                "venue_order_id": None,
+                "fees_paid": 0.0,
+                "lifecycle": lifecycle,
+            }
+
+        symbol = self._symbol(str(order.get("target") or ""), market_type)
+        if not symbol:
+            return {
+                "status": "rejected",
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "reject_reason": "bitget_symbol_not_supported",
+                "venue_order_id": None,
+                "fees_paid": 0.0,
+                "lifecycle": lifecycle,
+            }
+        side = "buy" if str(order.get("side") or "").lower() == "buy" else "sell"
+        order_type = "limit" if float(order.get("est_price") or 0.0) > 0 else "market"
+        tif = str(context.get("time_in_force") or "IOC").upper()
+        client_oid = f"ms-{order.get('id') or order.get('decision_id') or uuid.uuid4().hex[:12]}"
+        req: Dict[str, Any]
+        path: str
+        if market_type == "perp_usdt":
+            path = "/api/v2/mix/order/place-order"
+            req = {
+                "symbol": symbol,
+                "productType": product_type,
+                "marginMode": margin_mode,
+                "marginCoin": self.default_margin_coin,
+                "side": side,
+                "orderType": order_type,
+                "size": f"{qty:.8f}",
+                "force": tif,
+                "clientOid": client_oid,
+                "reduceOnly": "YES" if reduce_only else "NO",
+                "tradeSide": "open" if not reduce_only else "close",
+            }
+            if order_type == "limit":
+                req["price"] = f"{float(order.get('est_price')):.8f}"
+            if leverage is not None:
+                req["leverage"] = f"{float(leverage):.2f}"
+            req["posMode"] = "hedge_mode" if position_mode == "hedge" else "one_way_mode"
+        else:
+            path = "/api/v2/spot/trade/place-order"
+            req = {
+                "symbol": symbol,
+                "side": side,
+                "orderType": order_type,
+                "size": f"{qty:.8f}",
+                "force": tif,
+                "clientOid": client_oid,
+            }
+            if order_type == "limit":
+                req["price"] = f"{float(order.get('est_price')):.8f}"
+
+        try:
+            code, body = self._request("POST", path, payload=req)
+            data = body.get("data") if isinstance(body.get("data"), dict) else {}
+            order_id = str(data.get("orderId") or data.get("ordId") or "")
+            lifecycle.append(
+                {
+                    "event": "submit",
+                    "status": "accepted" if code < 400 and str(body.get("code") or "00000") == "00000" else "rejected",
+                    "http_code": code,
+                    "venue_order_id": order_id or None,
+                }
+            )
+            if code >= 400 or str(body.get("code") or "00000") != "00000":
+                return {
+                    "status": "rejected",
+                    "filled_qty": 0.0,
+                    "avg_fill_price": None,
+                    "reject_reason": self._classify_error(code, body),
+                    "venue_order_id": order_id or None,
+                    "fees_paid": 0.0,
+                    "lifecycle": lifecycle,
+                }
+
+            # Bitget order-query endpoints differ by market; here we provide minimal polling and fallback.
+            poll_path = "/api/v2/mix/order/detail" if market_type == "perp_usdt" else "/api/v2/spot/trade/orderInfo"
+            poll_payload = {"symbol": symbol, "orderId": order_id}
+            if market_type == "perp_usdt":
+                poll_payload["productType"] = product_type
+            pcode, pbody = self._request("POST", poll_path, payload=poll_payload)
+            pdata = pbody.get("data") if isinstance(pbody.get("data"), dict) else {}
+            if pcode >= 400 or str(pbody.get("code") or "00000") != "00000":
+                lifecycle.append({"event": "poll", "status": "failed", "http_code": pcode})
+                return {
+                    "status": "rejected",
+                    "filled_qty": 0.0,
+                    "avg_fill_price": None,
+                    "reject_reason": self._classify_error(pcode, pbody, fallback="no_fill_after_retries"),
+                    "venue_order_id": order_id or None,
+                    "fees_paid": 0.0,
+                    "lifecycle": lifecycle,
+                }
+            filled_qty = float(pdata.get("baseVolume") or pdata.get("filledQty") or pdata.get("filledSize") or 0.0)
+            avg_fill_price = pdata.get("priceAvg") or pdata.get("fillPrice") or pdata.get("avgPrice")
+            avg_fill_price_val = float(avg_fill_price) if avg_fill_price not in (None, "") else float(order.get("est_price") or 0.0)
+            status = self._map_status(str(pdata.get("status") or pdata.get("state") or "submitted"), filled_qty, qty)
+            lifecycle.append(
+                {
+                    "event": "poll",
+                    "status": status,
+                    "filled_qty": round(filled_qty, 8),
+                    "remaining_qty": round(max(0.0, qty - filled_qty), 8),
+                    "venue_order_id": order_id or None,
+                }
+            )
+            return {
+                "status": status,
+                "filled_qty": round(filled_qty, 8),
+                "avg_fill_price": round(avg_fill_price_val, 8) if avg_fill_price_val > 0 else None,
+                "reject_reason": None if status in {"filled", "partially_filled"} else "no_fill_after_retries",
+                "venue_order_id": order_id or None,
+                "remaining_qty": round(max(0.0, qty - filled_qty), 8),
+                "fees_paid": 0.0,
+                "lifecycle": lifecycle,
+            }
+        except Exception:
+            return {
+                "status": "rejected",
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "reject_reason": "bitget_signature_error",
+                "venue_order_id": None,
+                "fees_paid": 0.0,
+                "lifecycle": lifecycle,
+            }
+
+
 class ExecutionEngine:
     def __init__(self):
         self.adapters = {
             "paper": PaperExecutionAdapter(),
             "coinbase_live": CoinbaseLiveAdapter(),
+            "bitget_live": BitgetLiveAdapter(),
         }
 
     def run(self, adapter: str, orders: List[Dict], context: Optional[Dict] = None) -> List[Dict]:

@@ -40,6 +40,8 @@ ROLLOUT_MIN_HIT_RATE = float(os.getenv("ROLLOUT_MIN_HIT_RATE", "0.45"))
 ROLLOUT_MIN_PNL_AFTER_COST = float(os.getenv("ROLLOUT_MIN_PNL_AFTER_COST", "0.0"))
 ROLLOUT_MAX_DRAWDOWN = float(os.getenv("ROLLOUT_MAX_DRAWDOWN", "0.25"))
 ROLLOUT_WINDOWS = int(os.getenv("ROLLOUT_WINDOWS", "3"))
+PARITY_MAX_DEVIATION = float(os.getenv("PARITY_MAX_DEVIATION", "0.10"))
+PARITY_MIN_COMPLETED_RUNS = int(os.getenv("PARITY_MIN_COMPLETED_RUNS", "5"))
 MODEL_NAME_LIQUID = os.getenv("MODEL_NAME_LIQUID", "liquid_ttm_ensemble")
 MODEL_VERSION_LIQUID = os.getenv("MODEL_VERSION_LIQUID", "v2.1")
 MODEL_NAME_VC = os.getenv("MODEL_NAME_VC", "vc_survival_model")
@@ -131,6 +133,32 @@ def _run_gate(track: str):
         )
     except Exception as exc:
         logger.error("gate tick failed track=%s err=%s", track, exc)
+
+    try:
+        out = _post(
+            "/api/v2/models/parity/check",
+            {
+                "track": track,
+                "max_deviation": PARITY_MAX_DEVIATION,
+                "min_completed_runs": PARITY_MIN_COMPLETED_RUNS,
+            },
+        )
+        logger.info(
+            "parity track=%s status=%s passed=%s rel30=%s",
+            track,
+            out.get("status"),
+            out.get("passed"),
+            ((out.get("windows") or {}).get("30d") or {}).get("relative_deviation"),
+        )
+        _audit_log(
+            track=track,
+            action="parity_check",
+            window={"alert_window": "7d", "gate_window": "30d"},
+            thresholds={"max_deviation": PARITY_MAX_DEVIATION, "min_completed_runs": PARITY_MIN_COMPLETED_RUNS},
+            decision={"status": out.get("status"), "passed": out.get("passed")},
+        )
+    except Exception as exc:
+        logger.error("parity tick failed track=%s err=%s", track, exc)
 
     if not ROLLOUT_AUTO_ADVANCE:
         return

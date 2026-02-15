@@ -40,8 +40,76 @@ class InferenceServiceV2:
         self.conn = None
         self.active_model_cache: Dict[str, Dict[str, object]] = {}
         self.active_model_ttl_sec = int(os.getenv("ACTIVE_MODEL_TTL_SEC", "30"))
-        self.feature_version = os.getenv("FEATURE_VERSION", "feature-store-v2.0")
+        self.feature_version = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
         self.data_version = os.getenv("DATA_VERSION", "v1")
+
+    @staticmethod
+    def _source_tier_weights() -> Dict[int, float]:
+        raw = os.getenv("SOURCE_TIER_WEIGHTS", "1=1.0,2=0.85,3=0.65,4=0.4,5=0.2")
+        out: Dict[int, float] = {1: 1.0, 2: 0.85, 3: 0.65, 4: 0.4, 5: 0.2}
+        for part in raw.split(","):
+            piece = part.strip()
+            if not piece or "=" not in piece:
+                continue
+            k_raw, v_raw = piece.split("=", 1)
+            try:
+                k = int(k_raw.strip())
+                v = float(v_raw.strip())
+            except Exception:
+                continue
+            if 1 <= k <= 5 and v >= 0:
+                out[k] = v
+        return out
+
+    def _event_quality_profile(self, event_ctx: List[Dict]) -> Dict[str, object]:
+        max_tier = int(os.getenv("EVENT_MAX_SOURCE_TIER", "5"))
+        min_conf = float(os.getenv("EVENT_MIN_CONFIDENCE", "0.0"))
+        tier_weights = self._source_tier_weights()
+        now = datetime.now(timezone.utc)
+        accepted: List[Dict[str, float]] = []
+        tier_counts: Dict[str, int] = {}
+        for e in event_ctx:
+            tier = int(e.get("source_tier") or 5)
+            conf = float(e.get("confidence_score") or 0.0)
+            if tier > max_tier or conf < min_conf:
+                continue
+            ts = e.get("occurred_at")
+            if isinstance(ts, datetime):
+                ts_utc = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            else:
+                ts_utc = now
+            age_hours = max(0.0, (now - ts_utc.astimezone(timezone.utc)).total_seconds() / 3600.0)
+            decay = float(np.exp(-age_hours / 12.0))
+            tier_w = float(tier_weights.get(tier, 0.1))
+            accepted.append(
+                {
+                    "decay": decay,
+                    "tier_weight": tier_w,
+                    "confidence": conf,
+                    "joint_weight": tier_w * conf,
+                }
+            )
+            tier_key = str(tier)
+            tier_counts[tier_key] = tier_counts.get(tier_key, 0) + 1
+        if not accepted:
+            return {
+                "event_decay": 0.0,
+                "source_tier_weight": 0.0,
+                "source_confidence": 0.0,
+                "source_tiers": {},
+                "missing_markers": ["event_quality_unavailable"],
+            }
+        den = float(sum(a["joint_weight"] for a in accepted))
+        event_decay = float(sum(a["joint_weight"] * a["decay"] for a in accepted) / max(1e-9, den))
+        tier_weight = float(sum(a["tier_weight"] for a in accepted) / max(1, len(accepted)))
+        conf_mean = float(sum(a["confidence"] for a in accepted) / max(1, len(accepted)))
+        return {
+            "event_decay": event_decay,
+            "source_tier_weight": tier_weight,
+            "source_confidence": conf_mean,
+            "source_tiers": {k: float(v) for k, v in sorted(tier_counts.items())},
+            "missing_markers": [],
+        }
 
     def connect(self):
         self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -189,7 +257,7 @@ class InferenceServiceV2:
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.occurred_at
+                SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at
                 FROM events e
                 LEFT JOIN event_links el ON el.event_id = e.id
                 LEFT JOIN entities en ON en.id = el.entity_id
@@ -211,14 +279,14 @@ class InferenceServiceV2:
                 WITH linked AS (
                     SELECT
                         COALESCE(UPPER(en.symbol), en.name) AS target_key,
-                        e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.occurred_at,
+                        e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at,
                         ROW_NUMBER() OVER (PARTITION BY COALESCE(UPPER(en.symbol), en.name) ORDER BY e.occurred_at DESC) AS rn
                     FROM events e
                     LEFT JOIN event_links el ON el.event_id = e.id
                     LEFT JOIN entities en ON en.id = el.entity_id
                     WHERE UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s)
                 )
-                SELECT target_key, id, event_type, title, source_url, confidence_score, occurred_at
+                SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at
                 FROM linked
                 WHERE rn <= %s
                 ORDER BY target_key, occurred_at DESC
@@ -351,6 +419,7 @@ class InferenceServiceV2:
         active_model = self.get_active_model("vc")
         for name in targets:
             event_ctx = self.get_event_context(name)
+            source_profile = self._event_quality_profile(event_ctx)
             feature = np.array([len(event_ctx), sum(float(e.get("confidence_score", 0.5)) for e in event_ctx), 1.0, 0.5, 0.2], dtype=np.float32)
             infer_lineage_id = f"infer-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{name.lower().replace(' ', '-')[:12]}"
             self.save_feature_snapshot(
@@ -377,7 +446,14 @@ class InferenceServiceV2:
                     "contribution": 0.05,
                 },
             ]
-            exp = build_explanation(f"{active_model['name']}-{active_model['version']}", "feature-store-v2.0", event_ctx, feature_contribs)
+            exp = build_explanation(
+                f"{active_model['name']}-{active_model['version']}",
+                self.feature_version,
+                event_ctx,
+                feature_contribs,
+                source_tier_summary=source_profile.get("source_tiers") or {},
+                missing_flags=source_profile.get("missing_markers") or [],
+            )
             score = float(out["p_next_round_12m"])
             out["lineage_id"] = infer_lineage_id
             out["data_version"] = self.data_version
@@ -396,6 +472,7 @@ class InferenceServiceV2:
             if not row:
                 continue
             event_ctx = event_map.get(symbol, [])
+            source_profile = self._event_quality_profile(event_ctx)
             price = float(row["price"])
             volume = float(row.get("volume") or 0.0)
             history = self.get_recent_prices(symbol, limit=144)
@@ -423,30 +500,11 @@ class InferenceServiceV2:
             funding_rate = float(funding_map.get(symbol, 0.0))
             onchain_flow = float(onchain_map.get(symbol, 0.0))
             onchain_norm = float(np.tanh(onchain_flow / 1e6))
+            orderbook_missing_flag = 0.0 if symbol in orderbook_map else 1.0
+            funding_missing_flag = 0.0 if symbol in funding_map else 1.0
+            onchain_missing_flag = 0.0 if symbol in onchain_map else 1.0
 
-            if event_ctx:
-                latest_event_ts = max(
-                    (
-                        e.get("occurred_at")
-                        for e in event_ctx
-                        if e.get("occurred_at") is not None
-                    ),
-                    default=None,
-                )
-                if latest_event_ts is not None and isinstance(latest_event_ts, datetime):
-                    if latest_event_ts.tzinfo is None:
-                        evt_ts = latest_event_ts.replace(tzinfo=timezone.utc)
-                    else:
-                        evt_ts = latest_event_ts.astimezone(timezone.utc)
-                    age_hours = max(
-                        0.0,
-                        (datetime.now(timezone.utc) - evt_ts).total_seconds() / 3600.0,
-                    )
-                    event_decay = float(np.exp(-age_hours / 12.0))
-                else:
-                    event_decay = 0.0
-            else:
-                event_decay = 0.0
+            event_decay = float(source_profile.get("event_decay") or 0.0)
 
             feature = np.array(
                 [
@@ -465,6 +523,9 @@ class InferenceServiceV2:
                     funding_rate,
                     onchain_norm,
                     event_decay,
+                    orderbook_missing_flag,
+                    funding_missing_flag,
+                    onchain_missing_flag,
                 ],
                 dtype=np.float32,
             )
@@ -491,6 +552,12 @@ class InferenceServiceV2:
                     "funding_rate": float(feature[12]),
                     "onchain_norm": float(feature[13]),
                     "event_decay": float(feature[14]),
+                    "orderbook_missing_flag": float(feature[15]),
+                    "funding_missing_flag": float(feature[16]),
+                    "onchain_missing_flag": float(feature[17]),
+                    "source_tier_weight": float(source_profile.get("source_tier_weight") or 0.0),
+                    "source_confidence": float(source_profile.get("source_confidence") or 0.0),
+                    "feature_payload_schema_version": "v2.1",
                 },
                 lineage_id=infer_lineage_id,
                 event_time=latest_event_time,
@@ -502,7 +569,21 @@ class InferenceServiceV2:
                 {"feature": "volume_impact", "value": round(float(feature[10]), 6), "contribution": round(-float(feature[10]), 6)},
                 {"feature": "orderbook_imbalance", "value": round(float(feature[11]), 6), "contribution": round(float(feature[11]) * 0.5, 6)},
             ]
-            exp = build_explanation(f"{active_model['name']}-{active_model['version']}", "feature-store-v2.0", event_ctx, feature_contribs)
+            missing_markers = list(source_profile.get("missing_markers") or [])
+            if orderbook_missing_flag > 0:
+                missing_markers.append("orderbook_missing")
+            if funding_missing_flag > 0:
+                missing_markers.append("funding_missing")
+            if onchain_missing_flag > 0:
+                missing_markers.append("onchain_missing")
+            exp = build_explanation(
+                f"{active_model['name']}-{active_model['version']}",
+                self.feature_version,
+                event_ctx,
+                feature_contribs,
+                source_tier_summary=source_profile.get("source_tiers") or {},
+                missing_flags=missing_markers,
+            )
             score = float(out["expected_return"])
             output_payload = {**out, "symbol": symbol, "lineage_id": infer_lineage_id, "data_version": self.data_version}
             pred_id = self.save_prediction_v2("liquid", symbol, score, float(out["signal_confidence"]), output_payload, exp, lineage_id=infer_lineage_id)

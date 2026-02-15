@@ -5,7 +5,7 @@ from typing import Dict, List
 
 import requests
 
-from connectors.base import BaseConnector
+from connectors.base import BaseConnector, RateLimitError
 
 
 class GDELTConnector(BaseConnector):
@@ -25,6 +25,8 @@ class GDELTConnector(BaseConnector):
             "sort": "datedesc",
         }
         resp = requests.get(url, params=params, timeout=20)
+        if resp.status_code == 429:
+            raise RateLimitError("gdelt_rate_limited")
         resp.raise_for_status()
         data = resp.json()
         return data.get("articles", [])
@@ -39,6 +41,7 @@ class GDELTConnector(BaseConnector):
         title = raw.get("title") or "Untitled"
         return {
             "event_type": "market",
+            "market_scope": "equity",
             "title": title,
             "occurred_at": occurred,
             "source_url": raw.get("url"),

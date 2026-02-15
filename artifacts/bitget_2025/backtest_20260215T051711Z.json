@@ -1,0 +1,133 @@
+{
+  "test_name": "bitget_2025_real_history_backtest",
+  "executed_at": "2026-02-15T05:17:11.149112+00:00",
+  "window_start": "2025-01-01T00:00:00+00:00",
+  "window_end": "2025-12-31T23:59:59+00:00",
+  "source": {
+    "exchange": "bitget",
+    "market": "USDT-FUTURES",
+    "granularity": "1H",
+    "symbols": {
+      "BTCUSDT": "BTC_BG2025",
+      "ETHUSDT": "ETH_BG2025",
+      "SOLUSDT": "SOL_BG2025"
+    }
+  },
+  "ingest_stats": {
+    "BTC_BG2025": {
+      "prices": 8759,
+      "features": 8662
+    },
+    "ETH_BG2025": {
+      "prices": 8759,
+      "features": 8662
+    },
+    "SOL_BG2025": {
+      "prices": 8759,
+      "features": 8662
+    }
+  },
+  "backtest_request": {
+    "track": "liquid",
+    "run_source": "maintenance",
+    "targets": [
+      "BTC_BG2025",
+      "ETH_BG2025",
+      "SOL_BG2025"
+    ],
+    "horizon": "1d",
+    "data_version": "bitget_2025_1h",
+    "lookback_days": 500,
+    "train_days": 35,
+    "test_days": 7,
+    "fee_bps": 5.0,
+    "slippage_bps": 3.0
+  },
+  "backtest_response": {
+    "run_id": 173,
+    "status": "completed",
+    "metrics": {
+      "status": "completed",
+      "run_source": "maintenance",
+      "targets": [
+        "BTC_BG2025",
+        "ETH_BG2025",
+        "SOL_BG2025"
+      ],
+      "samples": 15000,
+      "ic": -0.003189,
+      "hit_rate": 0.155,
+      "turnover": 11.557026,
+      "pnl_after_cost": -0.020357,
+      "max_drawdown": 0.020909,
+      "model_name": "liquid_ttm_ensemble",
+      "model_version": "v2.1",
+      "lineage_coverage": 0.0002,
+      "cost_breakdown": {
+        "fee": 0.00577851,
+        "slippage": 0.00346711,
+        "impact": 0.01015191
+      },
+      "per_target": {
+        "BTC_BG2025": {
+          "pnl_after_cost": -0.029944,
+          "max_drawdown": 0.029995,
+          "samples": 5000
+        },
+        "ETH_BG2025": {
+          "pnl_after_cost": -0.013495,
+          "max_drawdown": 0.013964,
+          "samples": 5000
+        },
+        "SOL_BG2025": {
+          "pnl_after_cost": -0.017633,
+          "max_drawdown": 0.018767,
+          "samples": 5000
+        }
+      },
+      "regime_breakdown": {
+        "sideways": {
+          "samples": 14998,
+          "hit_rate": 0.155021,
+          "turnover": 34.671077,
+          "pnl_after_cost": -0.061721
+        },
+        "bull": {
+          "samples": 2,
+          "hit_rate": 0.0,
+          "turnover": 0.0,
+          "pnl_after_cost": 0.0
+        }
+      },
+      "gate_passed": false
+    }
+  },
+  "key_metrics": {
+    "samples": 15000,
+    "ic": -0.003189,
+    "hit_rate": 0.155,
+    "turnover": 11.557026,
+    "pnl_after_cost": -0.020357,
+    "max_drawdown": 0.020909,
+    "lineage_coverage": 0.0002,
+    "cost_breakdown": {
+      "fee": 0.00577851,
+      "slippage": 0.00346711,
+      "impact": 0.01015191
+    },
+    "regime_breakdown": {
+      "sideways": {
+        "samples": 14998,
+        "hit_rate": 0.155021,
+        "turnover": 34.671077,
+        "pnl_after_cost": -0.061721
+      },
+      "bull": {
+        "samples": 2,
+        "hit_rate": 0.0,
+        "turnover": 0.0,
+        "pnl_after_cost": 0.0
+      }
+    }
+  }
+}

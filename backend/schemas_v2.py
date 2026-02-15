@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 EntityType = Literal["company", "investor", "asset"]
 EventType = Literal["funding", "mna", "product", "regulatory", "market"]
 TrackType = Literal["vc", "liquid"]
+DataRegimeType = Literal["prod_live", "maintenance_replay", "mixed"]
 
 
 class Entity(BaseModel):
@@ -19,6 +20,12 @@ class Entity(BaseModel):
     country: Optional[str] = None
     sector: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _asset_symbol_required(self) -> "Entity":
+        if self.entity_type == "asset" and not str(self.symbol or "").strip():
+            raise ValueError("symbol is required for asset entities")
+        return self
 
 
 class Event(BaseModel):
@@ -36,6 +43,7 @@ class Event(BaseModel):
     entity_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     latency_ms: Optional[int] = Field(default=None, ge=0)
     dedup_cluster_id: Optional[str] = None
+    market_scope: Literal["crypto", "equity", "macro"] = "crypto"
     payload: Dict[str, Any] = Field(default_factory=dict)
     entities: List[Entity] = Field(default_factory=list)
 
@@ -112,6 +120,10 @@ class PortfolioScoreResponse(BaseModel):
 class BacktestRunRequest(BaseModel):
     track: TrackType
     targets: List[str] = Field(default_factory=list)
+    run_source: Literal["prod", "smoke", "async_test", "maintenance"] = "prod"
+    data_regime: DataRegimeType = "prod_live"
+    score_source: Literal["model", "heuristic"] = "model"
+    require_model_artifact: bool = True
     horizon: Literal["1h", "1d", "7d"] = "1d"
     model_name: Optional[str] = None
     model_version: Optional[str] = None
@@ -121,6 +133,12 @@ class BacktestRunRequest(BaseModel):
     test_days: int = Field(default=7, ge=1, le=90)
     fee_bps: float = Field(default=5.0, ge=0.0, le=1000.0)
     slippage_bps: float = Field(default=3.0, ge=0.0, le=1000.0)
+    signal_entry_z_min: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    signal_exit_z_min: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    position_max_weight_base: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    position_max_weight_high_vol_mult: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    cost_penalty_lambda: Optional[float] = Field(default=None, ge=0.0, le=20.0)
+    signal_polarity_mode: Literal["normal", "auto_train_ic", "auto_train_pnl"] = "normal"
 
 
 class PnLAttributionRequest(BaseModel):
@@ -203,6 +221,7 @@ class PortfolioRebalanceRequest(BaseModel):
     current_positions: List[RebalancePosition] = Field(default_factory=list)
     capital: float = Field(default=1.0, gt=0.0)
     risk_budget: float = Field(default=1.0, gt=0.0)
+    realized_drawdown: float = Field(default=0.0, ge=0.0)
 
 
 class PortfolioRebalanceResponse(BaseModel):
@@ -321,15 +340,28 @@ class RollbackCheckResponse(BaseModel):
     metrics: Dict[str, Any]
 
 
+class ParityCheckRequest(BaseModel):
+    track: TrackType = "liquid"
+    score_source: Literal["model", "heuristic"] = "model"
+    max_deviation: float = Field(default=0.10, ge=0.0, le=10.0)
+    min_completed_runs: int = Field(default=5, ge=1, le=2000)
+
+
 class ExecuteOrdersRequest(BaseModel):
     decision_id: str
-    adapter: Literal["paper", "coinbase_live"] = "paper"
+    adapter: Literal["paper", "coinbase_live", "bitget_live"] = "paper"
     time_in_force: Literal["GTC", "IOC", "FOK"] = "IOC"
     max_slippage_bps: float = Field(default=20.0, ge=0.0, le=2000.0)
     venue: str = Field(default="coinbase", min_length=1, max_length=64)
+    market_type: Literal["spot", "perp_usdt"] = "spot"
+    product_type: str = Field(default="USDT-FUTURES", min_length=1, max_length=64)
+    leverage: Optional[float] = Field(default=None, ge=1.0, le=125.0)
+    reduce_only: bool = False
+    position_mode: Literal["one_way", "hedge"] = "one_way"
+    margin_mode: Literal["cross", "isolated"] = "cross"
     max_orders: int = Field(default=100, ge=1, le=1000)
-    limit_timeout_sec: float = Field(default=2.0, ge=0.1, le=30.0)
-    max_retries: int = Field(default=1, ge=0, le=10)
+    limit_timeout_sec: float = Field(default=3.0, ge=0.1, le=30.0)
+    max_retries: int = Field(default=2, ge=0, le=10)
     fee_bps: float = Field(default=5.0, ge=0.0, le=1000.0)
 
 
@@ -339,6 +371,7 @@ class ExecuteOrdersResponse(BaseModel):
     total: int
     filled: int
     rejected: int
+    reject_breakdown: Dict[str, int] = Field(default_factory=dict)
     orders: List[Dict[str, Any]]
 
 
@@ -354,10 +387,16 @@ class ExecutionOrderInput(BaseModel):
 
 
 class SubmitExecutionOrdersRequest(BaseModel):
-    adapter: Literal["paper", "coinbase_live"] = "paper"
+    adapter: Literal["paper", "coinbase_live", "bitget_live"] = "paper"
     venue: str = Field(default="coinbase", min_length=1, max_length=64)
     time_in_force: Literal["GTC", "IOC", "FOK"] = "IOC"
     max_slippage_bps: float = Field(default=20.0, ge=0.0, le=2000.0)
+    market_type: Literal["spot", "perp_usdt"] = "spot"
+    product_type: str = Field(default="USDT-FUTURES", min_length=1, max_length=64)
+    leverage: Optional[float] = Field(default=None, ge=1.0, le=125.0)
+    reduce_only: bool = False
+    position_mode: Literal["one_way", "hedge"] = "one_way"
+    margin_mode: Literal["cross", "isolated"] = "cross"
     orders: List[ExecutionOrderInput]
 
 

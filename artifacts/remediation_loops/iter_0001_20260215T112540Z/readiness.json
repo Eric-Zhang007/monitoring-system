@@ -1,0 +1,156 @@
+{
+  "cmd": [
+    "python3",
+    "scripts/check_gpu_cutover_readiness.py"
+  ],
+  "exit_code": 0,
+  "json": {
+    "ready_for_gpu_cutover": true,
+    "gates": {
+      "strict_contract_passed": true,
+      "hard_metrics_passed": true,
+      "parity_30d_passed": true,
+      "artifact_failure_ratio_le_0_05": true,
+      "samples_completed_ge_20": true,
+      "execution_reject_rate_lt_0_01": true
+    },
+    "blockers": [],
+    "strict_filters": {
+      "run_source": "prod",
+      "score_source": "model",
+      "data_regime": "prod_live"
+    },
+    "contracts": {
+      "evaluated_at": "2026-02-15T11:26:12.759960+00:00",
+      "window_start": "2025-08-19T11:26:12.759995+00:00",
+      "window_end": "2026-02-15T11:26:12.760005+00:00",
+      "track": "liquid",
+      "score_source": "model",
+      "include_sources": [
+        "prod"
+      ],
+      "exclude_sources": [
+        "smoke",
+        "async_test",
+        "maintenance"
+      ],
+      "data_regimes": [
+        "prod_live"
+      ],
+      "rows_total": 103,
+      "valid_contract_rows": 103,
+      "invalid_contract_rows": 0,
+      "min_valid_required": 20,
+      "regime_distribution": {
+        "prod_live": 103
+      },
+      "prod_model_missing_regime_rows": 16,
+      "suspected_backend_runtime_outdated": false,
+      "passed": true,
+      "issues": []
+    },
+    "hard_metrics": {
+      "track": "liquid",
+      "score_source": "model",
+      "track_mode": "liquid_strict",
+      "monitor_only": false,
+      "evaluated_at": "2026-02-15T11:26:08.873044+00:00",
+      "window_start": "2025-08-19T11:26:08.873044+00:00",
+      "window_end": "2026-02-15T11:26:08.873044+00:00",
+      "lookback_days": 180,
+      "min_completed_runs": 5,
+      "include_sources": [
+        "prod"
+      ],
+      "exclude_sources": [
+        "smoke",
+        "async_test",
+        "maintenance"
+      ],
+      "data_regimes": [
+        "prod_live"
+      ],
+      "data_regime_distribution": {
+        "prod_live": 103
+      },
+      "targets_filter": [],
+      "samples_completed": 21,
+      "samples_total": 103,
+      "samples_effective_total": 21,
+      "missing_required_metrics_count": 0,
+      "failed_runs_count": 0,
+      "failed_runs_effective_count": 0,
+      "artifact_missing_effective_count": 0,
+      "superseded_runs_count": 82,
+      "status": "passed",
+      "failed_ratio": 0.0,
+      "artifact_failure_ratio": 0.0,
+      "sharpe": 1.694592,
+      "sharpe_daily": 1.694592,
+      "sharpe_method": "daily_agg_v1",
+      "observation_days": 31,
+      "min_observation_days": 14,
+      "max_drawdown": 6.7e-05,
+      "execution_reject_rate": 0.00244,
+      "pnl_direction_adjusted": true,
+      "checks": {
+        "min_completed_runs_ok": true,
+        "observation_days_ok": true,
+        "oos_sharpe_daily_gt_1_5": true,
+        "maxdd_lt_0_12": true,
+        "reject_rate_lt_0_01": true
+      },
+      "hard_passed": true,
+      "passed": true
+    },
+    "parity": {
+      "status": "passed",
+      "passed": true,
+      "evaluated_at": "2026-02-15T11:26:10.017443+00:00",
+      "window_start": "2026-01-16T11:26:10.017443+00:00",
+      "window_end": "2026-02-15T11:26:10.017443+00:00",
+      "track": "liquid",
+      "score_source": "model",
+      "max_deviation": 0.1,
+      "include_sources": [
+        "prod"
+      ],
+      "exclude_sources": [
+        "smoke",
+        "async_test",
+        "maintenance"
+      ],
+      "data_regimes": [
+        "prod_live"
+      ],
+      "targets_filter": [],
+      "completed_runs": 21,
+      "matched_targets_count": 3,
+      "paper_filled_orders_count": 1373,
+      "comparison_basis": "matched_filled_orders",
+      "window_details": {
+        "7d": {
+          "backtest_avg_pnl_after_cost": 6.695735749741815e-05,
+          "paper_realized_return": 0.0003600070405881019,
+          "matched_targets": 3,
+          "paper_filled_orders": 1373,
+          "abs_delta": 0.00029304968309068377,
+          "relative_deviation": 0.014652484154534188
+        },
+        "30d": {
+          "backtest_avg_pnl_after_cost": 6.695735749741815e-05,
+          "paper_realized_return": 0.0003600070405881019,
+          "matched_targets": 3,
+          "paper_filled_orders": 1373,
+          "abs_delta": 0.00029304968309068377,
+          "relative_deviation": 0.014652484154534188
+        }
+      },
+      "gate_window": "30d",
+      "alert_window": "7d"
+    },
+    "recommended_window": "2026-02-20 to 2026-02-22"
+  },
+  "stdout": "{\"ready_for_gpu_cutover\": true, \"gates\": {\"strict_contract_passed\": true, \"hard_metrics_passed\": true, \"parity_30d_passed\": true, \"artifact_failure_ratio_le_0_05\": true, \"samples_completed_ge_20\": true, \"execution_reject_rate_lt_0_01\": true}, \"blockers\": [], \"strict_filters\": {\"run_source\": \"prod\", \"score_source\": \"model\", \"data_regime\": \"prod_live\"}, \"contracts\": {\"evaluated_at\": \"2026-02-15T11:26:12.759960+00:00\", \"window_start\": \"2025-08-19T11:26:12.759995+00:00\", \"window_end\": \"2026-02-15T11:26:12.760005+00:00\", \"track\": \"liquid\", \"score_source\": \"model\", \"include_sources\": [\"prod\"], \"exclude_sources\": [\"smoke\", \"async_test\", \"maintenance\"], \"data_regimes\": [\"prod_live\"], \"rows_total\": 103, \"valid_contract_rows\": 103, \"invalid_contract_rows\": 0, \"min_valid_required\": 20, \"regime_distribution\": {\"prod_live\": 103}, \"prod_model_missing_regime_rows\": 16, \"suspected_backend_runtime_outdated\": false, \"passed\": true, \"issues\": []}, \"hard_metrics\": {\"track\": \"liquid\", \"score_source\": \"model\", \"track_mode\": \"liquid_strict\", \"monitor_only\": false, \"evaluated_at\": \"2026-02-15T11:26:08.873044+00:00\", \"window_start\": \"2025-08-19T11:26:08.873044+00:00\", \"window_end\": \"2026-02-15T11:26:08.873044+00:00\", \"lookback_days\": 180, \"min_completed_runs\": 5, \"include_sources\": [\"prod\"], \"exclude_sources\": [\"smoke\", \"async_test\", \"maintenance\"], \"data_regimes\": [\"prod_live\"], \"data_regime_distribution\": {\"prod_live\": 103}, \"targets_filter\": [], \"samples_completed\": 21, \"samples_total\": 103, \"samples_effective_total\": 21, \"missing_required_metrics_count\": 0, \"failed_runs_count\": 0, \"failed_runs_effective_count\": 0, \"artifact_missing_effective_count\": 0, \"superseded_runs_count\": 82, \"status\": \"passed\", \"failed_ratio\": 0.0, \"artifact_failure_ratio\": 0.0, \"sharpe\": 1.694592, \"sharpe_daily\": 1.694592, \"sharpe_method\": \"daily_agg_v1\", \"observation_days\": 31, \"min_observation_days\": 14, \"max_drawdown\": 6.7e-05, \"execution_reject_rate\": 0.00244, \"pnl_direction_adjusted\": true, \"checks\": {\"min_completed_runs_ok\": true, \"observation_days_ok\": true, \"oos_sharpe_daily_gt_1_5\": true, \"maxdd_lt_0_12\": true, \"reject_rate_lt_0_01\": true}, \"hard_passed\": true, \"passed\": true}, \"parity\": {\"status\": \"passed\", \"passed\": true, \"evaluated_at\": \"2026-02-15T11:26:10.017443+00:00\", \"window_start\": \"2026-01-16T11:26:10.017443+00:00\", \"window_end\": \"2026-02-15T11:26:10.017443+00:00\", \"track\": \"liquid\", \"score_source\": \"model\", \"max_deviation\": 0.1, \"include_sources\": [\"prod\"], \"exclude_sources\": [\"smoke\", \"async_test\", \"maintenance\"], \"data_regimes\": [\"prod_live\"], \"targets_filter\": [], \"completed_runs\": 21, \"matched_targets_count\": 3, \"paper_filled_orders_count\": 1373, \"comparison_basis\": \"matched_filled_orders\", \"window_details\": {\"7d\": {\"backtest_avg_pnl_after_cost\": 6.695735749741815e-05, \"paper_realized_return\": 0.0003600070405881019, \"matched_targets\": 3, \"paper_filled_orders\": 1373, \"abs_delta\": 0.00029304968309068377, \"relative_deviation\": 0.014652484154534188}, \"30d\": {\"backtest_avg_pnl_after_cost\": 6.695735749741815e-05, \"paper_realized_return\": 0.0003600070405881019, \"matched_targets\": 3, \"paper_filled_orders\": 1373, \"abs_delta\": 0.00029304968309068377, \"relative_deviation\": 0.014652484154534188}}, \"gate_window\": \"30d\", \"alert_window\": \"7d\"}, \"recommended_window\": \"2026-02-20 to 2026-02-22\"}",
+  "stderr": ""
+}

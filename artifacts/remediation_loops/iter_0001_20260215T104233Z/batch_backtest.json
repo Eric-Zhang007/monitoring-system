@@ -1,0 +1,68 @@
+{
+  "cmd": [
+    "python3",
+    "scripts/run_prod_live_backtest_batch.py",
+    "--api-base",
+    "http://localhost:8000",
+    "--n-runs",
+    "1",
+    "--targets",
+    "BTC,ETH,SOL",
+    "--lookback-days",
+    "180",
+    "--train-days",
+    "56",
+    "--test-days",
+    "14"
+  ],
+  "exit_code": 0,
+  "json": {
+    "started_at": "2026-02-15T10:42:33.824034+00:00",
+    "finished_at": "2026-02-15T10:42:40.190378+00:00",
+    "track": "liquid",
+    "api_base": "http://localhost:8000",
+    "strict_filters": {
+      "run_source": "prod",
+      "score_source": "model",
+      "data_regime": "prod_live"
+    },
+    "payload": {
+      "track": "liquid",
+      "targets": [
+        "BTC",
+        "ETH",
+        "SOL"
+      ],
+      "run_source": "prod",
+      "data_regime": "prod_live",
+      "score_source": "model",
+      "require_model_artifact": true,
+      "horizon": "1d",
+      "model_name": "liquid_ttm_ensemble",
+      "model_version": "v2.1",
+      "data_version": "v1",
+      "lookback_days": 180,
+      "train_days": 56,
+      "test_days": 14,
+      "fee_bps": 5.0,
+      "slippage_bps": 3.0,
+      "signal_entry_z_min": null,
+      "signal_exit_z_min": null,
+      "position_max_weight_base": null,
+      "position_max_weight_high_vol_mult": null,
+      "cost_penalty_lambda": null
+    },
+    "attempted": 1,
+    "completed": 1,
+    "failed": 0,
+    "run_ids": [
+      919
+    ],
+    "contract_valid": 1,
+    "contract_invalid": 0,
+    "failures": [],
+    "contract_issues": []
+  },
+  "stdout": "{\"started_at\": \"2026-02-15T10:42:33.824034+00:00\", \"finished_at\": \"2026-02-15T10:42:40.190378+00:00\", \"track\": \"liquid\", \"api_base\": \"http://localhost:8000\", \"strict_filters\": {\"run_source\": \"prod\", \"score_source\": \"model\", \"data_regime\": \"prod_live\"}, \"payload\": {\"track\": \"liquid\", \"targets\": [\"BTC\", \"ETH\", \"SOL\"], \"run_source\": \"prod\", \"data_regime\": \"prod_live\", \"score_source\": \"model\", \"require_model_artifact\": true, \"horizon\": \"1d\", \"model_name\": \"liquid_ttm_ensemble\", \"model_version\": \"v2.1\", \"data_version\": \"v1\", \"lookback_days\": 180, \"train_days\": 56, \"test_days\": 14, \"fee_bps\": 5.0, \"slippage_bps\": 3.0, \"signal_entry_z_min\": null, \"signal_exit_z_min\": null, \"position_max_weight_base\": null, \"position_max_weight_high_vol_mult\": null, \"cost_penalty_lambda\": null}, \"attempted\": 1, \"completed\": 1, \"failed\": 0, \"run_ids\": [919], \"contract_valid\": 1, \"contract_invalid\": 0, \"failures\": [], \"contract_issues\": []}",
+  "stderr": ""
+}

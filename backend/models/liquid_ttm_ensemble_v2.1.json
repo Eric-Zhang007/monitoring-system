@@ -1,0 +1,22 @@
+{
+  "model_name": "liquid_ttm_ensemble",
+  "model_version": "v2.1",
+  "track": "liquid",
+  "type": "ensemble_manifest",
+  "created_at": "2026-02-15T00:00:00Z",
+  "feature_version": "feature-store-v2.1",
+  "data_version": "v1",
+  "components": {
+    "tabular": [
+      "liquid_btc_lgbm_baseline_v2.json",
+      "liquid_eth_lgbm_baseline_v2.json",
+      "liquid_sol_lgbm_baseline_v2.json"
+    ],
+    "neural": [
+      "liquid_btc_tsmixer_v2.pt",
+      "liquid_eth_tsmixer_v2.pt",
+      "liquid_sol_tsmixer_v2.pt"
+    ]
+  },
+  "notes": "non-placeholder manifest for model artifact validation"
+}

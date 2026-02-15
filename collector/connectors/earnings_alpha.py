@@ -7,7 +7,7 @@ from typing import Dict, List
 
 import requests
 
-from connectors.base import BaseConnector
+from connectors.base import BaseConnector, RateLimitError
 
 
 class EarningsAlphaVantageConnector(BaseConnector):
@@ -23,6 +23,8 @@ class EarningsAlphaVantageConnector(BaseConnector):
         url = "https://www.alphavantage.co/query"
         params = {"function": "EARNINGS_CALENDAR", "horizon": self.horizon, "apikey": self.api_key}
         resp = requests.get(url, params=params, timeout=20)
+        if resp.status_code == 429:
+            raise RateLimitError("alphavantage_rate_limited")
         resp.raise_for_status()
         text = resp.text.strip()
         if not text:
@@ -40,6 +42,7 @@ class EarningsAlphaVantageConnector(BaseConnector):
         eps_est = raw.get("estimate")
         return {
             "event_type": "market",
+            "market_scope": "equity",
             "title": f"Earnings calendar: {symbol}",
             "occurred_at": occurred_at,
             "source_url": "https://www.alphavantage.co/documentation/",

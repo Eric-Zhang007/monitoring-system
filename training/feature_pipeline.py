@@ -5,7 +5,7 @@ import os
 import uuid
 from bisect import bisect_right
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -39,6 +39,24 @@ class FeaturePipeline:
             "stale_ratio_max": float(os.getenv("DQ_MAX_STALE_RATIO", "0.1")),
             "min_rows": float(os.getenv("DQ_MIN_ROWS", "200")),
         }
+
+    @staticmethod
+    def _source_tier_weights() -> Dict[int, float]:
+        raw = os.getenv("SOURCE_TIER_WEIGHTS", "1=1.0,2=0.85,3=0.65,4=0.4,5=0.2")
+        out: Dict[int, float] = {1: 1.0, 2: 0.85, 3: 0.65, 4: 0.4, 5: 0.2}
+        for part in raw.split(","):
+            piece = part.strip()
+            if not piece or "=" not in piece:
+                continue
+            k_raw, v_raw = piece.split("=", 1)
+            try:
+                k = int(k_raw.strip())
+                v = float(v_raw.strip())
+            except Exception:
+                continue
+            if 1 <= k <= 5 and v >= 0:
+                out[k] = v
+        return out
 
     def check_data_quality(self, symbol: str, timeframe: str = "5m", lookback_hours: int = 48) -> Dict[str, float]:
         thresholds = self._dq_thresholds()
@@ -141,6 +159,7 @@ class FeaturePipeline:
         orderbook_rows: List[Dict] = []
         funding_rows: List[Dict] = []
         onchain_rows: List[Dict] = []
+        event_rows: List[Dict] = []
         with self._connect() as conn:
             with conn.cursor() as cur:
                 try:
@@ -190,6 +209,20 @@ class FeaturePipeline:
                         (symbol, limit * 2),
                     )
                     onchain_rows = [dict(r) for r in cur.fetchall()]
+                    cur.execute(
+                        """
+                        SELECT e.occurred_at AS timestamp, e.source_tier, e.confidence_score
+                        FROM events e
+                        JOIN event_links el ON el.event_id = e.id
+                        JOIN entities en ON en.id = el.entity_id
+                        WHERE UPPER(en.symbol) = UPPER(%s)
+                          AND COALESCE(en.metadata->>'synthetic_link', 'false') <> 'true'
+                        ORDER BY e.occurred_at ASC
+                        LIMIT %s
+                        """,
+                        (symbol, limit * 2),
+                    )
+                    event_rows = [dict(r) for r in cur.fetchall()]
                 except Exception:
                     rows = []
                 if not rows:
@@ -208,7 +241,7 @@ class FeaturePipeline:
         rows = sorted(rows, key=lambda r: r["timestamp"])
 
         if len(rows) < 10:
-            return SampleBatch(X=np.zeros((0, 15), dtype=np.float32), y=np.zeros((0,), dtype=np.float32), meta=[], extra_labels={})
+            return SampleBatch(X=np.zeros((0, 18), dtype=np.float32), y=np.zeros((0,), dtype=np.float32), meta=[], extra_labels={})
 
         ob_ts = [r["timestamp"] for r in orderbook_rows]
         ob_vals = [float(r.get("imbalance") or 0.0) for r in orderbook_rows]
@@ -216,6 +249,24 @@ class FeaturePipeline:
         fr_vals = [float(r.get("funding_rate") or 0.0) for r in funding_rows]
         oc_ts = [r["timestamp"] for r in onchain_rows]
         oc_vals = [float(r.get("metric_value") or 0.0) for r in onchain_rows]
+        min_event_conf = float(os.getenv("EVENT_MIN_CONFIDENCE", "0.0"))
+        max_event_tier = int(os.getenv("EVENT_MAX_SOURCE_TIER", "5"))
+        tier_weights = self._source_tier_weights()
+        ev_rows = []
+        for r in event_rows:
+            tier = int(r.get("source_tier") or 5)
+            conf = float(r.get("confidence_score") or 0.0)
+            if conf < min_event_conf or tier > max_event_tier:
+                continue
+            ev_rows.append(
+                {
+                    "timestamp": r["timestamp"],
+                    "tier": tier,
+                    "confidence": conf,
+                    "tier_weight": float(tier_weights.get(tier, 0.1)),
+                }
+            )
+        ev_ts = [r["timestamp"] for r in ev_rows]
 
         def latest_before(ts_list, values, ts):
             if not ts_list:
@@ -259,7 +310,25 @@ class FeaturePipeline:
             funding = latest_before(fr_ts, fr_vals, ts)
             onchain_flow = latest_before(oc_ts, oc_vals, ts)
             onchain_norm = float(np.tanh(onchain_flow / 1e6))
-            event_decay = float(np.exp(-i / 144.0))
+            evt_idx = bisect_right(ev_ts, ts) - 1 if ev_ts else -1
+            if evt_idx >= 0:
+                left_idx = bisect_right(ev_ts, ts - timedelta(hours=24))
+                num = 0.0
+                den = 0.0
+                for j in range(left_idx, evt_idx + 1):
+                    evt = ev_rows[j]
+                    evt_ts = evt["timestamp"]
+                    age_hours = max(0.0, float((ts - evt_ts).total_seconds()) / 3600.0)
+                    decay = float(np.exp(-age_hours / 12.0))
+                    ew = float(evt["tier_weight"]) * float(evt["confidence"])
+                    num += ew * decay
+                    den += ew
+                event_decay = float(num / max(1e-9, den))
+            else:
+                event_decay = 0.0
+            orderbook_missing_flag = 0.0 if ob_ts else 1.0
+            funding_missing_flag = 0.0 if fr_ts else 1.0
+            onchain_missing_flag = 0.0 if oc_ts else 1.0
             feats.append(
                 [
                     ret_1,
@@ -277,6 +346,9 @@ class FeaturePipeline:
                     funding,
                     onchain_norm,
                     event_decay,
+                    orderbook_missing_flag,
+                    funding_missing_flag,
+                    onchain_missing_flag,
                 ]
             )
 

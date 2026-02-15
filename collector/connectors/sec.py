@@ -5,7 +5,7 @@ from typing import Dict, List
 
 import requests
 
-from connectors.base import BaseConnector
+from connectors.base import BaseConnector, RateLimitError
 
 
 class SECSubmissionsConnector(BaseConnector):
@@ -21,6 +21,8 @@ class SECSubmissionsConnector(BaseConnector):
             padded = cik.zfill(10)
             url = f"https://data.sec.gov/submissions/CIK{padded}.json"
             resp = requests.get(url, headers=self.headers, timeout=20)
+            if resp.status_code == 429:
+                raise RateLimitError("sec_rate_limited")
             if resp.status_code != 200:
                 continue
             rows.append({"cik": cik, "data": resp.json()})
@@ -38,6 +40,7 @@ class SECSubmissionsConnector(BaseConnector):
 
         return {
             "event_type": "regulatory",
+            "market_scope": "equity",
             "title": f"SEC filing {form} by {name}",
             "occurred_at": f"{filing_date}T00:00:00Z",
             "source_url": f"https://www.sec.gov/cgi-bin/browse-edgar?CIK={raw['cik']}",

@@ -1,0 +1,282 @@
+{
+  "test_name": "bitget_2025_real_history_backtest",
+  "executed_at": "2026-02-15T05:41:09.652356+00:00",
+  "markets": {
+    "perp": {
+      "test_name": "bitget_2025_real_history_backtest_perp",
+      "executed_at": "2026-02-15T05:39:23.885188+00:00",
+      "window_start": "2025-01-01T00:00:00+00:00",
+      "window_end": "2025-12-31T23:59:59+00:00",
+      "source": {
+        "exchange": "bitget",
+        "market": "USDT-FUTURES",
+        "granularity": "1H",
+        "symbols": {
+          "BTCUSDT": "BTC_BG2025",
+          "ETHUSDT": "ETH_BG2025",
+          "SOLUSDT": "SOL_BG2025"
+        }
+      },
+      "ingest_stats": {
+        "BTC_BG2025_PERP": {
+          "prices": 8759,
+          "features": 8662
+        },
+        "ETH_BG2025_PERP": {
+          "prices": 8759,
+          "features": 8662
+        },
+        "SOL_BG2025_PERP": {
+          "prices": 8759,
+          "features": 8662
+        }
+      },
+      "backtest_request": {
+        "track": "liquid",
+        "run_source": "maintenance",
+        "targets": [
+          "BTC_BG2025_PERP",
+          "ETH_BG2025_PERP",
+          "SOL_BG2025_PERP"
+        ],
+        "horizon": "1d",
+        "data_version": "bitget_2025_perp_1h",
+        "lookback_days": 500,
+        "train_days": 35,
+        "test_days": 7,
+        "fee_bps": 5.0,
+        "slippage_bps": 3.0
+      },
+      "backtest_response": {
+        "run_id": 175,
+        "status": "completed",
+        "metrics": {
+          "status": "completed",
+          "run_source": "maintenance",
+          "targets": [
+            "BTC_BG2025_PERP",
+            "ETH_BG2025_PERP",
+            "SOL_BG2025_PERP"
+          ],
+          "samples": 15000,
+          "ic": -0.003189,
+          "sharpe": -5.326751,
+          "hit_rate": 0.155,
+          "turnover": 11.557026,
+          "pnl_after_cost": -0.020357,
+          "max_drawdown": 0.020909,
+          "model_name": "liquid_ttm_ensemble",
+          "model_version": "v2.1",
+          "lineage_coverage": 0.0002,
+          "cost_breakdown": {
+            "fee": 0.00577851,
+            "slippage": 0.00346711,
+            "impact": 0.01015191
+          },
+          "per_target": {
+            "BTC_BG2025_PERP": {
+              "pnl_after_cost": -0.029944,
+              "max_drawdown": 0.029995,
+              "sharpe": -9.975392,
+              "samples": 5000
+            },
+            "ETH_BG2025_PERP": {
+              "pnl_after_cost": -0.013495,
+              "max_drawdown": 0.013964,
+              "sharpe": -3.136893,
+              "samples": 5000
+            },
+            "SOL_BG2025_PERP": {
+              "pnl_after_cost": -0.017633,
+              "max_drawdown": 0.018767,
+              "sharpe": -2.867969,
+              "samples": 5000
+            }
+          },
+          "regime_breakdown": {
+            "sideways": {
+              "samples": 14998,
+              "hit_rate": 0.155021,
+              "turnover": 34.671077,
+              "pnl_after_cost": -0.061721
+            },
+            "bull": {
+              "samples": 2,
+              "hit_rate": 0.0,
+              "turnover": 0.0,
+              "pnl_after_cost": 0.0
+            }
+          },
+          "gate_passed": false
+        }
+      },
+      "key_metrics": {
+        "samples": 15000,
+        "ic": -0.003189,
+        "sharpe": -5.326751,
+        "hit_rate": 0.155,
+        "turnover": 11.557026,
+        "pnl_after_cost": -0.020357,
+        "max_drawdown": 0.020909,
+        "lineage_coverage": 0.0002,
+        "cost_breakdown": {
+          "fee": 0.00577851,
+          "slippage": 0.00346711,
+          "impact": 0.01015191
+        },
+        "regime_breakdown": {
+          "sideways": {
+            "samples": 14998,
+            "hit_rate": 0.155021,
+            "turnover": 34.671077,
+            "pnl_after_cost": -0.061721
+          },
+          "bull": {
+            "samples": 2,
+            "hit_rate": 0.0,
+            "turnover": 0.0,
+            "pnl_after_cost": 0.0
+          }
+        }
+      }
+    },
+    "spot": {
+      "test_name": "bitget_2025_real_history_backtest_spot",
+      "executed_at": "2026-02-15T05:40:16.618553+00:00",
+      "window_start": "2025-01-01T00:00:00+00:00",
+      "window_end": "2025-12-31T23:59:59+00:00",
+      "source": {
+        "exchange": "bitget",
+        "market": "spot",
+        "granularity": "1h",
+        "symbols": {
+          "BTCUSDT": "BTC_BG2025",
+          "ETHUSDT": "ETH_BG2025",
+          "SOLUSDT": "SOL_BG2025"
+        }
+      },
+      "ingest_stats": {
+        "BTC_BG2025_SPOT": {
+          "prices": 8759,
+          "features": 8662
+        },
+        "ETH_BG2025_SPOT": {
+          "prices": 8759,
+          "features": 8662
+        },
+        "SOL_BG2025_SPOT": {
+          "prices": 8759,
+          "features": 8662
+        }
+      },
+      "backtest_request": {
+        "track": "liquid",
+        "run_source": "maintenance",
+        "targets": [
+          "BTC_BG2025_SPOT",
+          "ETH_BG2025_SPOT",
+          "SOL_BG2025_SPOT"
+        ],
+        "horizon": "1d",
+        "data_version": "bitget_2025_spot_1h",
+        "lookback_days": 500,
+        "train_days": 35,
+        "test_days": 7,
+        "fee_bps": 5.0,
+        "slippage_bps": 3.0
+      },
+      "backtest_response": {
+        "run_id": 176,
+        "status": "completed",
+        "metrics": {
+          "status": "completed",
+          "run_source": "maintenance",
+          "targets": [
+            "BTC_BG2025_SPOT",
+            "ETH_BG2025_SPOT",
+            "SOL_BG2025_SPOT"
+          ],
+          "samples": 15000,
+          "ic": -0.002476,
+          "sharpe": -7.820391,
+          "hit_rate": 0.154267,
+          "turnover": 11.526002,
+          "pnl_after_cost": -0.030289,
+          "max_drawdown": 0.030712,
+          "model_name": "liquid_ttm_ensemble",
+          "model_version": "v2.1",
+          "lineage_coverage": 0.0002,
+          "cost_breakdown": {
+            "fee": 0.005763,
+            "slippage": 0.0034578,
+            "impact": 0.0207282
+          },
+          "per_target": {
+            "BTC_BG2025_SPOT": {
+              "pnl_after_cost": -0.039779,
+              "max_drawdown": 0.039786,
+              "sharpe": -13.170951,
+              "samples": 5000
+            },
+            "ETH_BG2025_SPOT": {
+              "pnl_after_cost": -0.027461,
+              "max_drawdown": 0.027835,
+              "sharpe": -6.442389,
+              "samples": 5000
+            },
+            "SOL_BG2025_SPOT": {
+              "pnl_after_cost": -0.023626,
+              "max_drawdown": 0.024514,
+              "sharpe": -3.847832,
+              "samples": 5000
+            }
+          },
+          "regime_breakdown": {
+            "sideways": {
+              "samples": 14997,
+              "hit_rate": 0.154297,
+              "turnover": 34.578005,
+              "pnl_after_cost": -0.092288
+            },
+            "bull": {
+              "samples": 3,
+              "hit_rate": 0.0,
+              "turnover": 0.0,
+              "pnl_after_cost": 0.0
+            }
+          },
+          "gate_passed": false
+        }
+      },
+      "key_metrics": {
+        "samples": 15000,
+        "ic": -0.002476,
+        "sharpe": -7.820391,
+        "hit_rate": 0.154267,
+        "turnover": 11.526002,
+        "pnl_after_cost": -0.030289,
+        "max_drawdown": 0.030712,
+        "lineage_coverage": 0.0002,
+        "cost_breakdown": {
+          "fee": 0.005763,
+          "slippage": 0.0034578,
+          "impact": 0.0207282
+        },
+        "regime_breakdown": {
+          "sideways": {
+            "samples": 14997,
+            "hit_rate": 0.154297,
+            "turnover": 34.578005,
+            "pnl_after_cost": -0.092288
+          },
+          "bull": {
+            "samples": 3,
+            "hit_rate": 0.0,
+            "turnover": 0.0,
+            "pnl_after_cost": 0.0
+          }
+        }
+      }
+    }
+  }
+}

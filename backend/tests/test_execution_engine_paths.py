@@ -8,7 +8,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from execution_engine import ExecutionEngine, PaperExecutionAdapter
 
 
-def test_paper_execution_reject_path_has_lifecycle():
+def test_paper_execution_reject_path_has_lifecycle(monkeypatch):
+    monkeypatch.setenv("PAPER_ENABLE_RANDOM_REJECT", "1")
     adapter = PaperExecutionAdapter(reject_rate=1.0, partial_fill_rate=0.0)
     out = adapter.execute({"quantity": 1.0, "side": "buy", "est_price": 100.0}, context={"max_retries": 1})
     assert out["status"] == "rejected"

@@ -1,0 +1,11 @@
+{
+  "cmd": [
+    "python3",
+    "scripts/generate_status_snapshot.py",
+    "--write"
+  ],
+  "exit_code": 0,
+  "json": {},
+  "stdout": "### Auto Snapshot (2026-02-15 10:38 UTC)\n- track: `liquid`\n- score_source: `model`\n- sharpe: `4.504729`\n- max_drawdown: `0.297553`\n- execution_reject_rate: `0.002455`\n- hard_passed: `false`\n- parity_status: `failed`\n- parity_matched_targets: `3`\n- parity_paper_filled_orders: `1373`",
+  "stderr": ""
+}

@@ -14,7 +14,7 @@ class _FakeRepo:
     def __init__(self):
         self.rollout_calls = []
 
-    def list_recent_backtest_runs(self, track: str, limit: int = 10):
+    def list_recent_backtest_runs(self, track: str, limit: int = 10, include_sources=None, exclude_sources=None, data_regimes=None):
         return [
             {"metrics": {"status": "completed", "hit_rate": 0.2, "max_drawdown": 0.4, "pnl_after_cost": -0.1}},
             {"metrics": {"status": "completed", "hit_rate": 0.3, "max_drawdown": 0.35, "pnl_after_cost": -0.05}},

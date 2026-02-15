@@ -30,8 +30,34 @@ services:
       - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=0
-      - FEATURE_VERSION=feature-store-v2.0
+      - FEATURE_VERSION=feature-store-v2.1
       - MODEL_VERSION=v2.0
+      - PAPER_ENABLE_RANDOM_REJECT=0
+      - PAPER_MAX_TIMEOUT_REJECT_RATE_GUARD=0.0
+      - PAPER_TIMEOUT_BY_SYMBOL=BTC=0.07,ETH=0.08,SOL=0.10
+      - SIGNAL_ENTRY_Z_MIN=0.01
+      - SIGNAL_EXIT_Z_MIN=0.005
+      - POSITION_MAX_WEIGHT_BASE=0.06
+      - POSITION_MAX_WEIGHT_HIGH_VOL_MULT=0.55
+      - COST_PENALTY_LAMBDA=0.4
+      - RISK_MAX_DRAWDOWN=0.12
+      - RISK_DRAWDOWN_WARN_THRESHOLD=0.08
+      - RISK_DRAWDOWN_NEAR_LIMIT=0.10
+      - PARITY_RETURN_FLOOR=0.02
+      - BACKTEST_GATE_INCLUDE_SOURCES=prod
+      - BACKTEST_GATE_EXCLUDE_SOURCES=smoke,async_test,maintenance
+      - BACKTEST_GATE_DATA_REGIMES=prod_live
+      - BACKTEST_GATE_MIN_OBSERVATION_DAYS=14
+      - COST_FEE_BPS=5.0
+      - COST_SLIPPAGE_BPS=3.0
+      - COST_IMPACT_COEFF=120.0
+      - BITGET_BASE_URL=https://api.bitget.com
+      - BITGET_TIMEOUT_SEC=6
+      - BITGET_RECV_WINDOW_MS=5000
+      - BITGET_DEFAULT_MARGIN_COIN=USDT
+      - BITGET_API_KEY=
+      - BITGET_API_SECRET=
+      - BITGET_API_PASSPHRASE=
     depends_on:
       - redis
       - postgres
@@ -55,11 +81,24 @@ services:
   # 数据采集器（后台任务）
   collector:
     build: ./collector
+    ports:
+      - "9101:9101"
     environment:
       - REDIS_URL=redis://redis:6379
       - EVENT_STREAM=event_stream
       - COLLECT_INTERVAL=300
+      - API_BASE=http://backend:8000
+      - LIQUID_SYMBOLS=BTC,ETH,SOL
+      - INGEST_MAX_RETRIES=3
+      - INGEST_TIMEOUT_SEC=8
+      - COLLECTOR_METRICS_PORT=9101
+      - CONNECTOR_MAX_RETRIES=3
+      - CONNECTOR_BACKOFF_BASE_SEC=0.5
+      - CONNECTOR_BACKOFF_MAX_SEC=10
+      - CONNECTOR_FAILURE_THRESHOLD=3
+      - CONNECTOR_COOLDOWN_SEC=120
     depends_on:
+      - backend
       - redis
     restart: unless-stopped
     deploy:
@@ -264,13 +303,19 @@ services:
       - ROLLOUT_MIN_HIT_RATE=0.45
       - ROLLOUT_MIN_PNL_AFTER_COST=0.0
       - ROLLOUT_MAX_DRAWDOWN=0.25
+      - PARITY_MAX_DEVIATION=0.10
+      - PARITY_MIN_COMPLETED_RUNS=5
     volumes:
       - ./monitoring:/app/monitoring:ro
     depends_on:
       - backend
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f model_ops_scheduler.py >/dev/null"]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import pathlib,sys; ok=False\nfor p in pathlib.Path('/proc').glob('[0-9]*/cmdline'):\n d=p.read_bytes().decode('utf-8','ignore')\n if 'model_ops_scheduler.py' in d:\n  ok=True; break\nsys.exit(0 if ok else 1)\"",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -295,7 +340,11 @@ services:
       - postgres
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f task_worker.py >/dev/null"]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import pathlib,sys; ok=False\nfor p in pathlib.Path('/proc').glob('[0-9]*/cmdline'):\n d=p.read_bytes().decode('utf-8','ignore')\n if 'task_worker.py' in d:\n  ok=True; break\nsys.exit(0 if ok else 1)\"",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3

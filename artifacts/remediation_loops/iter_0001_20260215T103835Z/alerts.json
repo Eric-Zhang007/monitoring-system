@@ -1,0 +1,50 @@
+{
+  "cmd": [
+    "python3",
+    "scripts/validate_phase45_alerts.py"
+  ],
+  "exit_code": 0,
+  "json": {
+    "passed": true,
+    "file": "monitoring/alerts.yml",
+    "checks": {
+      "ExecutionRejectRateCritical": {
+        "ok": true,
+        "missing": []
+      },
+      "ApiAvailabilityLow": {
+        "ok": true,
+        "missing": []
+      },
+      "ExecutionRejectReasonSkew": {
+        "ok": true,
+        "missing": []
+      },
+      "SignalLatencyP99Degraded": {
+        "ok": true,
+        "missing": []
+      },
+      "CollectorConnectorFailureSpike": {
+        "ok": true,
+        "missing": []
+      },
+      "CollectorConnectorRateLimited": {
+        "ok": true,
+        "missing": []
+      },
+      "CollectorConnectorSuccessRateLow": {
+        "ok": true,
+        "missing": []
+      },
+      "CollectorSourcePublishToIngestP95Degraded": {
+        "ok": true,
+        "missing": []
+      }
+    },
+    "evaluated_at": "2026-02-15T10:38:43.631747+00:00",
+    "window_start": null,
+    "window_end": null
+  },
+  "stdout": "{\"passed\": true, \"file\": \"monitoring/alerts.yml\", \"checks\": {\"ExecutionRejectRateCritical\": {\"ok\": true, \"missing\": []}, \"ApiAvailabilityLow\": {\"ok\": true, \"missing\": []}, \"ExecutionRejectReasonSkew\": {\"ok\": true, \"missing\": []}, \"SignalLatencyP99Degraded\": {\"ok\": true, \"missing\": []}, \"CollectorConnectorFailureSpike\": {\"ok\": true, \"missing\": []}, \"CollectorConnectorRateLimited\": {\"ok\": true, \"missing\": []}, \"CollectorConnectorSuccessRateLow\": {\"ok\": true, \"missing\": []}, \"CollectorSourcePublishToIngestP95Degraded\": {\"ok\": true, \"missing\": []}}, \"evaluated_at\": \"2026-02-15T10:38:43.631747+00:00\", \"window_start\": null, \"window_end\": null}",
+  "stderr": ""
+}

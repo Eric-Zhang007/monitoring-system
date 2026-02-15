@@ -38,6 +38,7 @@ class MacroFREDConnector(BaseConnector):
         summary = entry.get("summary", "")
         return {
             "event_type": "market",
+            "market_scope": "macro",
             "title": f"Macro release: {title}",
             "occurred_at": occurred_at.isoformat(),
             "source_url": entry.get("link"),
@@ -53,7 +54,7 @@ class MacroFREDConnector(BaseConnector):
                 {
                     "entity_type": "asset",
                     "name": "US_MACRO",
-                    "symbol": "DXY",
+                    "symbol": "US_MACRO",
                     "country": "US",
                     "sector": "macro",
                     "metadata": {"rid": raw.get("rid")},

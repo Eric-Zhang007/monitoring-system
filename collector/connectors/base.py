@@ -4,6 +4,14 @@ from abc import ABC, abstractmethod
 from typing import Dict, List
 
 
+class ConnectorError(RuntimeError):
+    pass
+
+
+class RateLimitError(ConnectorError):
+    pass
+
+
 class BaseConnector(ABC):
     name: str = "base"
 

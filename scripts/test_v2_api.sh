@@ -2,6 +2,8 @@
 set -euo pipefail
 
 API_BASE="${API_BASE:-http://localhost:8000}"
+ASSERT_LIQUID_REJECT_RATE_MAX="${ASSERT_LIQUID_REJECT_RATE_MAX:-0.01}"
+ASSERT_BACKTEST_COMPLETION_MIN="${ASSERT_BACKTEST_COMPLETION_MIN:-0}"
 if command -v jq >/dev/null 2>&1; then
   PRETTY="jq ."
 else
@@ -127,6 +129,7 @@ if [ "$EXEC_RUN_CODE" = "423" ]; then
   assert_json "$(cat "$EXEC_RUN_BODY")" "'detail' in data and ('risk_blocked:' in data['detail'] or 'kill_switch_triggered:' in data['detail'])"
 elif [ "$EXEC_RUN_CODE" = "200" ]; then
   assert_json "$(cat "$EXEC_RUN_BODY")" "'orders' in data and isinstance(data['orders'], list)"
+  assert_json "$(cat "$EXEC_RUN_BODY")" "(data.get('rejected', 0) / max(1, data.get('total', 1))) <= float('${ASSERT_LIQUID_REJECT_RATE_MAX}')"
 else
   echo "unexpected execution status: $EXEC_RUN_CODE"
   exit 1
@@ -166,13 +169,42 @@ else
   echo "{\"status\":\"skip\",\"reason\":\"no_order_ids\"}" | eval "$PRETTY"
 fi
 
+echo "[12.1/27] bitget execution path (missing credentials expected)"
+BG_SUBMIT_BODY=$(mktemp)
+BG_SUBMIT_CODE=$(curl -sS -o "$BG_SUBMIT_BODY" -w "%{http_code}" -X POST "${API_BASE}/api/v2/execution/orders" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "adapter":"bitget_live",
+    "venue":"bitget",
+    "market_type":"perp_usdt",
+    "product_type":"USDT-FUTURES",
+    "orders":[
+      {"target":"BTC","track":"liquid","side":"buy","quantity":0.01,"est_price":50000,"strategy_id":"smoke-bitget"}
+    ]
+  }')
+cat "$BG_SUBMIT_BODY" | eval "$PRETTY"
+if [ "$BG_SUBMIT_CODE" = "423" ]; then
+  assert_json "$(cat "$BG_SUBMIT_BODY")" "'detail' in data and 'kill_switch_triggered:' in data['detail']"
+else
+  BG_DECISION_ID=$(cat "$BG_SUBMIT_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['decision_id'])")
+  BG_RUN=$(curl -fsS -X POST "${API_BASE}/api/v2/execution/run" \
+    -H 'Content-Type: application/json' \
+    -d "{\"decision_id\":\"${BG_DECISION_ID}\",\"adapter\":\"bitget_live\",\"venue\":\"bitget\",\"market_type\":\"perp_usdt\",\"product_type\":\"USDT-FUTURES\",\"leverage\":3,\"time_in_force\":\"IOC\"}")
+  echo "$BG_RUN" | eval "$PRETTY"
+  assert_json "$BG_RUN" "data.get('rejected', 0) >= 1 and isinstance(data.get('reject_breakdown', {}), dict)"
+fi
+rm -f "$BG_SUBMIT_BODY"
+
 echo "[13/27] backtest run"
 BT_RESP=$(curl -fsS -X POST "${API_BASE}/api/v2/backtest/run" \
   -H 'Content-Type: application/json' \
-  -d '{"track":"liquid","targets":["BTC"],"horizon":"1d","model_name":"liquid_ttm_ensemble","model_version":"v2.1","data_version":"v1","lookback_days":30,"train_days":14,"test_days":3,"fee_bps":5,"slippage_bps":3}')
+  -d '{"track":"liquid","run_source":"smoke","targets":["BTC"],"horizon":"1d","model_name":"liquid_ttm_ensemble","model_version":"v2.1","data_version":"v1","lookback_days":30,"train_days":14,"test_days":3,"fee_bps":5,"slippage_bps":3}')
 echo "$BT_RESP" | eval "$PRETTY"
 assert_json "$BT_RESP" "'metrics' in data and isinstance(data['metrics'], dict)"
 assert_json "$BT_RESP" "'model_name' in data['metrics'] and 'model_version' in data['metrics'] and 'lineage_coverage' in data['metrics'] and 'cost_breakdown' in data['metrics']"
+if [ "$ASSERT_BACKTEST_COMPLETION_MIN" = "1" ]; then
+  assert_json "$BT_RESP" "data.get('status') == 'completed' and data['metrics'].get('status') == 'completed'"
+fi
 RUN_ID=$(echo "$BT_RESP" | python3 -c "import sys, json; print(json.load(sys.stdin)['run_id'])")
 
 echo "[14/27] backtest detail"
@@ -262,7 +294,7 @@ curl -fsS "${API_BASE}/api/v2/data-quality/consistency?lookback_days=30" | eval 
 echo "[30/31] async backtest task submit"
 BT_TASK=$(curl -fsS -X POST "${API_BASE}/api/v2/tasks/backtest" \
   -H 'Content-Type: application/json' \
-  -d '{"track":"liquid","targets":["BTC"],"horizon":"1d","lookback_days":30,"train_days":14,"test_days":3,"fee_bps":5,"slippage_bps":3}')
+  -d '{"track":"liquid","run_source":"async_test","targets":["BTC"],"horizon":"1d","lookback_days":30,"train_days":14,"test_days":3,"fee_bps":5,"slippage_bps":3}')
 echo "$BT_TASK" | eval "$PRETTY"
 assert_json "$BT_TASK" "'task_id' in data and data.get('task_type') == 'backtest_run'"
 BT_TASK_ID=$(echo "$BT_TASK" | python3 -c "import sys, json; print(json.load(sys.stdin)['task_id'])")

@@ -126,12 +126,7 @@ class RedisConsumer:
     def process_message(self, stream: str, data: Dict[str, str]):
         """Process message (business logic placeholder)"""
         try:
-            if stream == 'news_stream':
-                title = data.get('title', 'N/A')
-                logger.info(f"📰 Processing news: {title}")
-                self._store_news_event(data)
-
-            elif stream == 'price_stream':
+            if stream == 'price_stream':
                 price = data.get('price', 'N/A')
                 symbol = data.get('symbol', 'N/A')
                 logger.info(f"💰 Processing price: {symbol} = {price}")
@@ -142,6 +137,8 @@ class RedisConsumer:
                 symbol = data.get('symbol', 'N/A')
                 logger.info(f"🎯 Processing prediction: {symbol} {horizon}")
                 self._store_prediction_signal(data)
+            else:
+                logger.debug(f"skip stream={stream}")
 
         except Exception as e:
             logger.error(f"❌ Processing logic failed: {e}")

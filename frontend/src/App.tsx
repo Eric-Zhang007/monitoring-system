@@ -19,18 +19,13 @@ function App() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
 
   // WebSocket connection
-  const { isConnected, subscribe } = useWebSocket()
+  const { isConnected, subscribe, messages } = useWebSocket()
 
-  // Handle incoming WebSocket messages
   useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      const message: WebSocketMessage = JSON.parse(event.data)
-      console.log('Received message:', message)
-    }
-
-    window.addEventListener('message', handleMessage)
-    return () => window.removeEventListener('message', handleMessage)
-  }, [])
+    if (!messages.length) return
+    const message: WebSocketMessage = messages[messages.length - 1]
+    console.log('Received message:', message)
+  }, [messages])
 
   // Subscribe to active symbol
   useEffect(() => {

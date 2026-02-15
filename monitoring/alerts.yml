@@ -1,0 +1,64 @@
+groups:
+  - name: monitoring-system-p1
+    rules:
+      - alert: TradingRiskBlocksSpike
+        expr: increase(ms_risk_hard_blocks_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: P1
+          route: trading_risk
+        annotations:
+          summary: "Risk hard block triggered"
+          description: "At least one hard risk block occurred in the last 5 minutes."
+
+      - alert: ExecutionRejectRateHigh
+        expr: max(ms_execution_reject_rate) > 0.15
+        for: 5m
+        labels:
+          severity: P1
+          route: trading_execution
+        annotations:
+          summary: "Execution reject rate high"
+          description: "Recent execution reject rate exceeded 15% for at least 5 minutes."
+
+      - alert: ApiAvailabilityLow
+        expr: (sum(rate(ms_http_requests_total[5m])) - sum(rate(ms_http_requests_total{status=~"5.."}[5m]))) / sum(rate(ms_http_requests_total[5m])) < 0.999
+        for: 5m
+        labels:
+          severity: P1
+          route: platform_reliability
+        annotations:
+          summary: "API availability below 99.9%"
+          description: "5xx-based availability dropped below 99.9% for at least 5 minutes."
+
+  - name: monitoring-system-p2
+    rules:
+      - alert: DriftEventsDetected
+        expr: increase(ms_model_drift_events_total{action="rollback_check"}[15m]) > 0
+        for: 1m
+        labels:
+          severity: P2
+          route: model_data
+        annotations:
+          summary: "Model drift rollback check triggered"
+          description: "Drift evaluation triggered rollback_check in the last 15 minutes."
+
+      - alert: DataFreshnessDegraded
+        expr: max(ms_data_freshness_seconds) > 600
+        for: 10m
+        labels:
+          severity: P2
+          route: model_data
+        annotations:
+          summary: "Data freshness degraded"
+          description: "At least one target has data freshness older than 10 minutes."
+
+      - alert: SignalLatencyP99Degraded
+        expr: histogram_quantile(0.99, sum(rate(ms_signal_latency_seconds_bucket[10m])) by (le)) > 0.25
+        for: 10m
+        labels:
+          severity: P2
+          route: model_data
+        annotations:
+          summary: "Signal latency p99 degraded"
+          description: "Signal generation p99 latency is above 250ms for at least 10 minutes."

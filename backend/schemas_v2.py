@@ -113,11 +113,19 @@ class BacktestRunRequest(BaseModel):
     track: TrackType
     targets: List[str] = Field(default_factory=list)
     horizon: Literal["1h", "1d", "7d"] = "1d"
+    model_name: Optional[str] = None
+    model_version: Optional[str] = None
+    data_version: str = Field(default="v1", min_length=1, max_length=64)
     lookback_days: int = Field(default=90, ge=14, le=730)
     train_days: int = Field(default=35, ge=7, le=365)
     test_days: int = Field(default=7, ge=1, le=90)
     fee_bps: float = Field(default=5.0, ge=0.0, le=1000.0)
     slippage_bps: float = Field(default=3.0, ge=0.0, le=1000.0)
+
+
+class PnLAttributionRequest(BaseModel):
+    track: TrackType = "liquid"
+    lookback_hours: int = Field(default=24 * 7, ge=1, le=24 * 365)
 
 
 class BacktestRunResponse(BaseModel):
@@ -127,6 +135,25 @@ class BacktestRunResponse(BaseModel):
     status: Literal["completed", "failed", "running"]
     metrics: Dict[str, Any]
     config: Dict[str, Any]
+
+
+class AsyncTaskSubmitResponse(BaseModel):
+    task_id: str
+    task_type: str
+    status: Literal["queued"]
+    created_at: datetime
+
+
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    task_type: str
+    status: Literal["queued", "running", "completed", "failed"]
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
 
 class SignalGenerateRequest(BaseModel):
@@ -201,6 +228,9 @@ class RiskCheckRequest(BaseModel):
     proposed_positions: List[RebalancePosition]
     current_positions: List[RebalancePosition] = Field(default_factory=list)
     realized_drawdown: float = Field(default=0.0, ge=0.0)
+    daily_loss: float = Field(default=0.0, ge=0.0)
+    consecutive_losses: int = Field(default=0, ge=0)
+    strategy_id: str = Field(default="global", min_length=1, max_length=64)
     max_sector_exposure_override: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     max_style_exposure_override: Optional[float] = Field(default=None, gt=0.0, le=1.0)
 
@@ -214,6 +244,42 @@ class RiskCheckResponse(BaseModel):
     hard_block: bool = False
     kill_switch_state: Literal["armed", "triggered"] = "armed"
     risk_budget_used: float = Field(default=0.0, ge=0.0)
+
+
+class KillSwitchTriggerRequest(BaseModel):
+    track: TrackType
+    strategy_id: str = Field(default="global", min_length=1, max_length=64)
+    reason: str = Field(default="manual_trigger", min_length=1, max_length=256)
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=60 * 24 * 7)
+
+
+class KillSwitchResetRequest(BaseModel):
+    track: TrackType
+    strategy_id: str = Field(default="global", min_length=1, max_length=64)
+    reason: str = Field(default="manual_reset", min_length=1, max_length=256)
+
+
+class KillSwitchStateResponse(BaseModel):
+    track: TrackType
+    strategy_id: str
+    state: Literal["armed", "triggered"] = "armed"
+    reason: str
+    triggered: bool
+    updated_at: datetime
+    expires_at: Optional[datetime] = None
+    remaining_seconds: int = 0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PositionOpeningStatusResponse(BaseModel):
+    track: TrackType
+    strategy_id: str
+    can_open_new_positions: bool
+    state: Literal["armed", "triggered"] = "armed"
+    block_reason: str = "none"
+    updated_at: datetime
+    expires_at: Optional[datetime] = None
+    remaining_seconds: int = 0
 
 
 class ModelGateRequest(BaseModel):
@@ -250,6 +316,8 @@ class RollbackCheckResponse(BaseModel):
     reason: str
     from_model: str
     to_model: str
+    windows_failed: int = Field(default=0, ge=0)
+    trigger_rule: str = "none"
     metrics: Dict[str, Any]
 
 
@@ -260,6 +328,9 @@ class ExecuteOrdersRequest(BaseModel):
     max_slippage_bps: float = Field(default=20.0, ge=0.0, le=2000.0)
     venue: str = Field(default="coinbase", min_length=1, max_length=64)
     max_orders: int = Field(default=100, ge=1, le=1000)
+    limit_timeout_sec: float = Field(default=2.0, ge=0.1, le=30.0)
+    max_retries: int = Field(default=1, ge=0, le=10)
+    fee_bps: float = Field(default=5.0, ge=0.0, le=1000.0)
 
 
 class ExecuteOrdersResponse(BaseModel):
@@ -312,6 +383,15 @@ class ExecutionOrderStatusResponse(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class TradeAuditResponse(BaseModel):
+    decision_id: str
+    signals: List[Dict[str, Any]]
+    orders: List[Dict[str, Any]]
+    positions: List[Dict[str, Any]]
+    pnl: Dict[str, Any]
+    generated_at: datetime
+
+
 class DriftEvaluateRequest(BaseModel):
     track: TrackType
     lookback_hours: int = Field(default=48, ge=1, le=24 * 30)
@@ -351,12 +431,55 @@ class AutoGateEvaluateResponse(BaseModel):
     metrics_summary: Dict[str, Any]
 
 
+class RolloutAdvanceRequest(BaseModel):
+    track: TrackType
+    model_name: str
+    model_version: str
+    current_stage_pct: int = Field(default=10, ge=10, le=100)
+    next_stage_pct: int = Field(default=30, ge=10, le=100)
+    min_hit_rate: float = Field(default=0.45, ge=0.0, le=1.0)
+    min_pnl_after_cost: float = Field(default=0.0)
+    max_drawdown: float = Field(default=0.25, ge=0.0, le=1.0)
+    windows: int = Field(default=3, ge=1, le=30)
+
+
+class RolloutAdvanceResponse(BaseModel):
+    track: TrackType
+    model_name: str
+    model_version: str
+    current_stage_pct: int
+    next_stage_pct: int
+    promoted: bool
+    reason: str
+    hard_limits: Dict[str, float]
+    metrics: Dict[str, float]
+
+
+class RolloutStateResponse(BaseModel):
+    track: TrackType
+    model_name: str
+    model_version: str
+    stage_pct: int
+    status: str
+    hard_limits: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    updated_at: datetime
+
+
 class PnLAttributionResponse(BaseModel):
     track: TrackType
     lookback_hours: int
     totals: Dict[str, float]
     by_target: List[Dict[str, Any]]
     generated_at: datetime
+
+
+class SchedulerAuditLogRequest(BaseModel):
+    track: TrackType
+    action: str = Field(min_length=1, max_length=64)
+    window: Dict[str, Any] = Field(default_factory=dict)
+    thresholds: Dict[str, Any] = Field(default_factory=dict)
+    decision: Dict[str, Any] = Field(default_factory=dict)
 
 
 class DataQualitySampleRequest(BaseModel):
@@ -376,3 +499,35 @@ class DataQualityStatsResponse(BaseModel):
     totals: Dict[str, float]
     by_source: List[Dict[str, Any]]
     generated_at: datetime
+
+
+class DataQualityConsistencyResponse(BaseModel):
+    lookback_days: int
+    total_review_logs: int
+    multi_review_events: int
+    pairwise_agreement: float
+    reviewer_pairs: List[Dict[str, Any]]
+    generated_at: datetime
+
+
+class LineageConsistencyRequest(BaseModel):
+    track: TrackType
+    target: Optional[str] = None
+    lineage_id: str = Field(min_length=6, max_length=64)
+    data_version: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    strict: bool = True
+    max_mismatch_keys: int = Field(default=20, ge=1, le=200)
+    tolerance: float = Field(default=1e-6, ge=0.0, le=1.0)
+
+
+class LineageConsistencyResponse(BaseModel):
+    passed: bool
+    track: TrackType
+    target: Optional[str] = None
+    lineage_id: str
+    data_version: Optional[str] = None
+    compared_snapshots: int
+    max_abs_diff: float
+    mean_abs_diff: float
+    mismatch_keys: List[str] = Field(default_factory=list)
+    reason: str

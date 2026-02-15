@@ -4,19 +4,28 @@ FastAPI Main Application - Backend Service (修复版)
 """
 import os
 import logging
+import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 import asyncio
 import json
 from datetime import datetime, timedelta
+from contextlib import suppress
 
 from gpu_manager import GPUManager
 from nim_integration import get_nim_cache
 from redis_streams import get_redis_consumer
 from v2_router import router as v2_router
+from metrics import (
+    CONTENT_TYPE_LATEST,
+    WEBSOCKET_ACTIVE_CONNECTIONS,
+    WEBSOCKET_DROPPED_MESSAGES_TOTAL,
+    observe_http_request,
+    render_metrics,
+)
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import redis
@@ -43,20 +52,81 @@ _redis_client = None
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
-        self.subscriptions: dict = {}  # websocket -> set of symbols
+        self.subscriptions: Dict[WebSocket, Set[str]] = {}  # websocket -> set of symbols
+        self.channels: Dict[WebSocket, str] = {}  # websocket -> stream channel
+        self.queues: Dict[WebSocket, asyncio.Queue] = {}
+        self.sender_tasks: Dict[WebSocket, asyncio.Task] = {}
+        self.queue_max = int(os.getenv("WS_QUEUE_MAX", "256"))
+        self.batch_max = int(os.getenv("WS_BATCH_MAX", "32"))
+        self.flush_ms = int(os.getenv("WS_FLUSH_MS", "120"))
+        self.send_timeout_sec = float(os.getenv("WS_SEND_TIMEOUT_SEC", "1.0"))
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, channel: str):
         await websocket.accept()
         self.active_connections.append(websocket)
         self.subscriptions[websocket] = set()
+        self.channels[websocket] = channel
+        q: asyncio.Queue = asyncio.Queue(maxsize=max(1, self.queue_max))
+        self.queues[websocket] = q
+        self.sender_tasks[websocket] = asyncio.create_task(self._sender_loop(websocket, q, channel))
+        WEBSOCKET_ACTIVE_CONNECTIONS.set(len(self.active_connections))
         logger.info(f"✅ WebSocket connected (total: {len(self.active_connections)})")
 
-    def disconnect(self, websocket: WebSocket):
+    def disconnect(self, websocket: WebSocket, reason: str = "disconnect"):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-        if websocket in self.subscriptions:
-            del self.subscriptions[websocket]
-        logger.info(f"❌ WebSocket disconnected (total: {len(self.active_connections)})")
+        self.subscriptions.pop(websocket, None)
+        self.channels.pop(websocket, None)
+        self.queues.pop(websocket, None)
+        task = self.sender_tasks.pop(websocket, None)
+        if task:
+            task.cancel()
+        with suppress(Exception):
+            asyncio.create_task(websocket.close(code=1000))
+        WEBSOCKET_ACTIVE_CONNECTIONS.set(len(self.active_connections))
+        logger.info(f"❌ WebSocket disconnected (reason={reason}, total: {len(self.active_connections)})")
+
+    async def _sender_loop(self, websocket: WebSocket, q: asyncio.Queue, channel: str):
+        flush_sec = max(0.01, self.flush_ms / 1000.0)
+        try:
+            while True:
+                first = await q.get()
+                batch = [first]
+                deadline = time.perf_counter() + flush_sec
+                while len(batch) < self.batch_max:
+                    remain = deadline - time.perf_counter()
+                    if remain <= 0:
+                        break
+                    try:
+                        nxt = await asyncio.wait_for(q.get(), timeout=remain)
+                        batch.append(nxt)
+                    except asyncio.TimeoutError:
+                        break
+                payload = batch[0] if len(batch) == 1 else {
+                    "type": "batch",
+                    "channel": channel,
+                    "count": len(batch),
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "items": batch,
+                }
+                await asyncio.wait_for(websocket.send_json(payload), timeout=self.send_timeout_sec)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            WEBSOCKET_DROPPED_MESSAGES_TOTAL.labels(reason="send_error").inc()
+            logger.error(f"❌ WebSocket sender failed: {e}")
+            self.disconnect(websocket, reason="send_error")
+
+    def _enqueue(self, websocket: WebSocket, message: dict):
+        q = self.queues.get(websocket)
+        if not q:
+            return
+        if q.full():
+            WEBSOCKET_DROPPED_MESSAGES_TOTAL.labels(reason="queue_full").inc()
+            self.disconnect(websocket, reason="queue_full")
+            return
+        with suppress(Exception):
+            q.put_nowait(message)
 
     def subscribe(self, websocket: WebSocket, symbol: str):
         """订阅符号"""
@@ -71,20 +141,15 @@ class ConnectionManager:
 
     async def broadcast_symbol(self, symbol: str, message: dict):
         """广播消息给订阅该符号的所有连接"""
-        for connection in self.active_connections:
-            if connection in self.subscriptions and symbol in self.subscriptions[connection]:
-                try:
-                    await connection.send_json(message)
-                except Exception as e:
-                    logger.error(f"❌ Failed to send WebSocket message: {e}")
+        for connection in list(self.active_connections):
+            channel = self.channels.get(connection, "")
+            if channel == "signals" and symbol in self.subscriptions.get(connection, set()):
+                self._enqueue(connection, message)
 
     async def broadcast(self, message: dict):
         """广播给所有连接（系统消息）"""
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except Exception as e:
-                logger.error(f"❌ Failed to send WebSocket message: {e}")
+        for connection in list(self.active_connections):
+            self._enqueue(connection, message)
 
 manager = ConnectionManager()
 
@@ -226,6 +291,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(v2_router)
+
+
+@app.middleware("http")
+async def metrics_middleware(request, call_next):
+    start = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    except Exception:
+        raise
+    finally:
+        elapsed = time.perf_counter() - start
+        observe_http_request(request.method, request.url.path, status_code, elapsed)
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    return PlainTextResponse(render_metrics(), media_type=CONTENT_TYPE_LATEST)
 
 
 # ======================================
@@ -717,125 +802,59 @@ async def websocket_endpoint(websocket: WebSocket):
     )
     await websocket.close(code=1008)
     return
-    """WebSocket端点（修复版：真实数据推送）"""
-    await manager.connect(websocket)
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-
-            if data.get("type") == "subscribe":
-                symbol = data.get("symbol")
-                if symbol:
-                    manager.subscribe(websocket, symbol.upper())
-                    await websocket.send_json({
-                        "type": "subscribed",
-                        "symbol": symbol.upper(),
-                        "message": f"Subscribed to {symbol.upper()}"
-                    })
-
-                    # 立即发送最新预测
-                    try:
-                        # 获取最新预测
-                        conn = get_postgres()
-                        cursor = conn.cursor()
-                        query = """
-                            SELECT * FROM predictions
-                            WHERE symbol = UPPER(%s)
-                            ORDER BY created_at DESC
-                            LIMIT 5
-                        """
-                        cursor.execute(query, (symbol,))
-                        rows = cursor.fetchall()
-
-                        for row in rows:
-                            pred = dict(row)
-                            pred['scenario_probabilities'] = json.loads(pred['scenario_probabilities'])
-                            await websocket.send_json({
-                                "type": "prediction",
-                                "data": pred
-                            })
-
-                        cursor.close()
-                        conn.close()
-                    except Exception as e:
-                        logger.error(f"❌ Failed to send initial predictions: {e}")
-
-            elif data.get("type") == "unsubscribe":
-                symbol = data.get("symbol")
-                if symbol:
-                    manager.unsubscribe(websocket, symbol.upper())
-                    await websocket.send_json({
-                        "type": "unsubscribed",
-                        "symbol": symbol.upper(),
-                        "message": f"Unsubscribed from {symbol.upper()}"
-                    })
-
-            elif data.get("type") == "ping":
-                await websocket.send_json({"type": "pong", "timestamp": datetime.utcnow().isoformat()})
-
-            elif data.get("type") == "ping":
-                await websocket.send_json({"type": "pong"})
-
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
 
 
 @app.websocket("/stream/events")
 async def websocket_events(websocket: WebSocket):
     """V2 events stream channel."""
-    await manager.connect(websocket)
+    await manager.connect(websocket, channel="events")
+    await websocket.send_json({"type": "events", "status": "subscribed", "timestamp": datetime.utcnow().isoformat()})
     try:
         while True:
             _ = await websocket.receive_text()
-            await websocket.send_json(
-                {
-                    "type": "events",
-                    "status": "subscribed",
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            )
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(websocket, reason="client_disconnect")
 
 
 @app.websocket("/stream/signals")
 async def websocket_signals(websocket: WebSocket):
     """V2 signals stream channel."""
-    await manager.connect(websocket)
+    await manager.connect(websocket, channel="signals")
+    await websocket.send_json({"type": "signals", "status": "subscribed", "timestamp": datetime.utcnow().isoformat()})
     try:
         while True:
-            _ = await websocket.receive_text()
-            await websocket.send_json(
-                {
-                    "type": "signals",
-                    "status": "subscribed",
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            )
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw) if raw else {}
+            except Exception:
+                msg = {}
+            msg_type = str(msg.get("type") or "").lower()
+            symbol = str(msg.get("symbol") or "").upper()
+            if msg_type == "subscribe" and symbol:
+                manager.subscribe(websocket, symbol)
+                await websocket.send_json({"type": "signals", "status": "subscribed_symbol", "symbol": symbol, "timestamp": datetime.utcnow().isoformat()})
+            elif msg_type == "unsubscribe" and symbol:
+                manager.unsubscribe(websocket, symbol)
+                await websocket.send_json({"type": "signals", "status": "unsubscribed_symbol", "symbol": symbol, "timestamp": datetime.utcnow().isoformat()})
+            else:
+                await websocket.send_json({"type": "signals", "status": "noop", "timestamp": datetime.utcnow().isoformat()})
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(websocket, reason="client_disconnect")
 
 
 @app.websocket("/stream/risk")
 async def websocket_risk(websocket: WebSocket):
     """V2 risk stream channel."""
-    await manager.connect(websocket)
+    await manager.connect(websocket, channel="risk")
+    await websocket.send_json({"type": "risk", "status": "subscribed", "timestamp": datetime.utcnow().isoformat()})
     try:
         while True:
             _ = await websocket.receive_text()
-            await websocket.send_json(
-                {
-                    "type": "risk",
-                    "status": "subscribed",
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            )
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(websocket, reason="client_disconnect")
     except Exception as e:
         logger.error(f"❌ WebSocket error: {e}")
-        manager.disconnect(websocket)
+        manager.disconnect(websocket, reason="server_error")
 
 
 # ======================================

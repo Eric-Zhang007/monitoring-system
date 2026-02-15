@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from numbers import Number
 from contextlib import AbstractContextManager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
@@ -104,7 +105,7 @@ class V2Repository:
                             novelty_score, entity_confidence, latency_ms, dedup_cluster_id,
                             payload, fingerprint, created_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                         ON CONFLICT (fingerprint) DO NOTHING
                         RETURNING id
                         """,
@@ -403,6 +404,25 @@ class V2Repository:
                 )
                 return [dict(r) for r in cur.fetchall()]
 
+    def model_artifact_exists(self, model_name: str, track: str, model_version: str) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT artifact_path
+                    FROM model_registry
+                    WHERE model_name = %s AND track = %s AND model_version = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (model_name, track, model_version),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+                p = str(row.get("artifact_path") or "")
+                return bool(p)
+
     def load_price_history(self, symbol: str, lookback_days: int = 90) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -602,6 +622,41 @@ class V2Repository:
                 row = cur.fetchone()
                 return dict(row) if row else None
 
+    def get_trade_audit_chain(self, decision_id: str) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM signal_candidates
+                    WHERE decision_id = %s
+                    ORDER BY created_at ASC
+                    """,
+                    (decision_id,),
+                )
+                signals = [dict(r) for r in cur.fetchall()]
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM orders_sim
+                    WHERE decision_id = %s
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (decision_id,),
+                )
+                orders = [dict(r) for r in cur.fetchall()]
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM positions_snapshots
+                    WHERE decision_id = %s
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (decision_id,),
+                )
+                positions = [dict(r) for r in cur.fetchall()]
+        return {"signals": signals, "orders": orders, "positions": positions}
+
     def update_order_execution(self, order_id: int, status: str, metadata: Dict[str, Any]) -> None:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -626,6 +681,98 @@ class V2Repository:
                     (decision_id, severity, code, message, json.dumps(payload)),
                 )
 
+    def save_scheduler_audit_log(
+        self,
+        track: str,
+        action: str,
+        window: Dict[str, Any],
+        thresholds: Dict[str, Any],
+        decision: Dict[str, Any],
+    ) -> None:
+        self.save_risk_event(
+            decision_id=f"scheduler-{track}-{action}-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}",
+            severity="info",
+            code="scheduler_audit_log",
+            message=f"{track}:{action}",
+            payload={
+                "who": "system",
+                "source": "scheduler",
+                "track": track,
+                "action": action,
+                "window": window,
+                "thresholds": thresholds,
+                "decision": decision,
+            },
+        )
+
+    def upsert_kill_switch_state(
+        self,
+        track: str,
+        strategy_id: str,
+        state: str,
+        reason: str,
+        duration_minutes: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        expires_at = None
+        if duration_minutes and duration_minutes > 0:
+            expires_at = datetime.utcnow() + timedelta(minutes=int(duration_minutes))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO risk_control_state (
+                        track, strategy_id, state, reason, metadata, triggered_at, expires_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, NOW(), %s, NOW())
+                    ON CONFLICT (track, strategy_id)
+                    DO UPDATE SET
+                        state = EXCLUDED.state,
+                        reason = EXCLUDED.reason,
+                        metadata = EXCLUDED.metadata,
+                        triggered_at = EXCLUDED.triggered_at,
+                        expires_at = EXCLUDED.expires_at,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (
+                        track,
+                        strategy_id,
+                        state,
+                        reason,
+                        json.dumps(metadata or {}),
+                        expires_at,
+                    ),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {}
+
+    def get_kill_switch_state(self, track: str, strategy_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM risk_control_state
+                    WHERE track = %s AND strategy_id = %s
+                    LIMIT 1
+                    """,
+                    (track, strategy_id),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
+        row = self.get_kill_switch_state(track, strategy_id)
+        if not row:
+            return False
+        if str(row.get("state") or "armed") != "triggered":
+            return False
+        expires_at = row.get("expires_at")
+        if expires_at is None:
+            return True
+        now = datetime.now(tz=expires_at.tzinfo) if getattr(expires_at, "tzinfo", None) else datetime.utcnow()
+        return expires_at > now
+
     def promote_model(
         self,
         track: str,
@@ -642,6 +789,12 @@ class V2Repository:
                     INSERT INTO model_promotions (
                         track, model_name, model_version, passed, metrics, gate_reason, promoted_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (track, model_name, model_version)
+                    DO UPDATE SET
+                        passed = EXCLUDED.passed,
+                        metrics = EXCLUDED.metrics,
+                        gate_reason = EXCLUDED.gate_reason,
+                        promoted_at = NOW()
                     """,
                     (track, model_name, model_version, passed, json.dumps(metrics), gate_reason),
                 )
@@ -665,6 +818,9 @@ class V2Repository:
     def update_data_quality_audit(self, audit_id: int, reviewer: str, verdict: str, note: Optional[str]) -> None:
         with self._connect() as conn:
             with conn.cursor() as cur:
+                cur.execute("SELECT event_id FROM data_quality_audit WHERE id = %s", (audit_id,))
+                row = cur.fetchone()
+                event_id = int(row["event_id"]) if row and row.get("event_id") is not None else None
                 cur.execute(
                     """
                     UPDATE data_quality_audit
@@ -676,6 +832,14 @@ class V2Repository:
                     WHERE id = %s
                     """,
                     (f"[{reviewer}] verdict={verdict}; note={note or ''}", reviewer, verdict, audit_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO data_quality_review_logs (
+                        audit_id, event_id, reviewer, verdict, note, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, NOW())
+                    """,
+                    (audit_id, event_id, reviewer, verdict, note),
                 )
 
     def get_data_quality_stats(self, lookback_days: int = 7) -> Dict[str, Any]:
@@ -758,6 +922,270 @@ class V2Repository:
 
         return {"totals": totals, "by_source": by_source}
 
+    def get_data_quality_consistency(self, lookback_days: int = 30) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT reviewer, verdict, event_id
+                    FROM data_quality_review_logs
+                    WHERE created_at > NOW() - make_interval(days => %s)
+                      AND event_id IS NOT NULL
+                    ORDER BY event_id, created_at
+                    """,
+                    (lookback_days,),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+        total_logs = len(rows)
+        by_event: Dict[int, List[Dict[str, Any]]] = {}
+        for r in rows:
+            eid = int(r["event_id"])
+            by_event.setdefault(eid, []).append(r)
+        multi_events = 0
+        agree = 0
+        total_pairs = 0
+        pair_stats: Dict[Tuple[str, str], Dict[str, int]] = {}
+        for _, reviews in by_event.items():
+            reviewers_seen = set()
+            uniq = []
+            for rev in reviews:
+                rv = str(rev.get("reviewer") or "")
+                if rv in reviewers_seen:
+                    continue
+                reviewers_seen.add(rv)
+                uniq.append(rev)
+            if len(uniq) < 2:
+                continue
+            multi_events += 1
+            for i in range(len(uniq)):
+                for j in range(i + 1, len(uniq)):
+                    a = uniq[i]
+                    b = uniq[j]
+                    ra = str(a.get("reviewer") or "")
+                    rb = str(b.get("reviewer") or "")
+                    key = tuple(sorted((ra, rb)))
+                    st = pair_stats.setdefault(key, {"pairs": 0, "agree": 0})
+                    st["pairs"] += 1
+                    total_pairs += 1
+                    if a.get("verdict") == b.get("verdict"):
+                        st["agree"] += 1
+                        agree += 1
+        reviewer_pairs = [
+            {
+                "reviewer_a": k[0],
+                "reviewer_b": k[1],
+                "pairs": int(v["pairs"]),
+                "agreement": round(float(v["agree"] / max(1, v["pairs"])), 6),
+            }
+            for k, v in sorted(pair_stats.items(), key=lambda item: item[1]["pairs"], reverse=True)
+        ]
+        return {
+            "total_review_logs": total_logs,
+            "multi_review_events": multi_events,
+            "pairwise_agreement": round(float(agree / max(1, total_pairs)), 6),
+            "reviewer_pairs": reviewer_pairs[:50],
+        }
+
+    @staticmethod
+    def _feature_payload_diff(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[float, float]:
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return 0.0, 0.0
+        keys = set(a.keys()) | set(b.keys())
+        diffs: List[float] = []
+        for k in keys:
+            av = a.get(k, 0.0)
+            bv = b.get(k, 0.0)
+            if isinstance(av, Number) and isinstance(bv, Number):
+                diffs.append(abs(float(av) - float(bv)))
+            else:
+                if av != bv:
+                    diffs.append(1.0)
+        if not diffs:
+            return 0.0, 0.0
+        return float(max(diffs)), float(sum(diffs) / len(diffs))
+
+    def check_feature_lineage_consistency(
+        self,
+        track: str,
+        lineage_id: str,
+        target: Optional[str] = None,
+        data_version: Optional[str] = None,
+        strict: bool = True,
+        max_mismatch_keys: int = 20,
+        tolerance: float = 1e-6,
+    ) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if target:
+                    if data_version:
+                        cur.execute(
+                            """
+                            SELECT id, target, track, lineage_id, data_version, feature_payload, created_at
+                            FROM feature_snapshots
+                            WHERE track = %s AND lineage_id = %s AND target = %s AND data_version = %s
+                            ORDER BY created_at DESC
+                            LIMIT 2
+                            """,
+                            (track, lineage_id, target, data_version),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT id, target, track, lineage_id, data_version, feature_payload, created_at
+                            FROM feature_snapshots
+                            WHERE track = %s AND lineage_id = %s AND target = %s
+                            ORDER BY created_at DESC
+                            LIMIT 2
+                            """,
+                            (track, lineage_id, target),
+                        )
+                    rows = [dict(r) for r in cur.fetchall()]
+                else:
+                    if data_version:
+                        cur.execute(
+                            """
+                            WITH ranked AS (
+                                SELECT
+                                    id, target, track, lineage_id, data_version, feature_payload, created_at,
+                                    ROW_NUMBER() OVER (PARTITION BY target ORDER BY created_at DESC) AS rn
+                                FROM feature_snapshots
+                                WHERE track = %s AND lineage_id = %s AND data_version = %s
+                            )
+                            SELECT id, target, track, lineage_id, data_version, feature_payload, created_at
+                            FROM ranked
+                            WHERE rn <= 2
+                            ORDER BY target ASC, created_at DESC
+                            """,
+                            (track, lineage_id, data_version),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            WITH ranked AS (
+                                SELECT
+                                    id, target, track, lineage_id, data_version, feature_payload, created_at,
+                                    ROW_NUMBER() OVER (PARTITION BY target ORDER BY created_at DESC) AS rn
+                                FROM feature_snapshots
+                                WHERE track = %s AND lineage_id = %s
+                            )
+                            SELECT id, target, track, lineage_id, data_version, feature_payload, created_at
+                            FROM ranked
+                            WHERE rn <= 2
+                            ORDER BY target ASC, created_at DESC
+                            """,
+                            (track, lineage_id),
+                        )
+                    rows = [dict(r) for r in cur.fetchall()]
+
+        if len(rows) < 2:
+            return {
+                "passed": False,
+                "compared_snapshots": len(rows),
+                "max_abs_diff": 0.0,
+                "mean_abs_diff": 0.0,
+                "reason": "insufficient_snapshots",
+            }
+
+        if target:
+            a = rows[0].get("feature_payload") or {}
+            b = rows[1].get("feature_payload") or {}
+            max_abs, mean_abs = self._feature_payload_diff(a, b)
+            mismatch_keys = self._feature_mismatch_keys(a, b, tolerance=tolerance, max_keys=max_mismatch_keys)
+            compared_snapshots = len(rows)
+        else:
+            by_target: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                k = str(row.get("target") or "")
+                by_target.setdefault(k, []).append(row)
+            pair_max: List[float] = []
+            pair_mean: List[float] = []
+            compared_snapshots = 0
+            mismatch_keys: List[str] = []
+            for rs in by_target.values():
+                if len(rs) < 2:
+                    continue
+                a = rs[0].get("feature_payload") or {}
+                b = rs[1].get("feature_payload") or {}
+                mx, mn = self._feature_payload_diff(a, b)
+                pair_max.append(mx)
+                pair_mean.append(mn)
+                if strict:
+                    mismatch_keys.extend(self._feature_mismatch_keys(a, b, tolerance=tolerance, max_keys=max_mismatch_keys))
+                compared_snapshots += 2
+            if not pair_max:
+                return {
+                    "passed": False,
+                    "compared_snapshots": 0,
+                    "max_abs_diff": 0.0,
+                    "mean_abs_diff": 0.0,
+                    "reason": "insufficient_snapshots",
+                }
+            max_abs = float(max(pair_max))
+            mean_abs = float(sum(pair_mean) / len(pair_mean))
+            mismatch_keys = mismatch_keys[:max_mismatch_keys]
+
+        passed = max_abs <= tolerance if strict else mean_abs <= tolerance
+        return {
+            "passed": passed,
+            "compared_snapshots": compared_snapshots,
+            "max_abs_diff": round(max_abs, 10),
+            "mean_abs_diff": round(mean_abs, 10),
+            "mismatch_keys": mismatch_keys,
+            "reason": "ok" if passed else "payload_mismatch",
+        }
+
+    @staticmethod
+    def _feature_mismatch_keys(a: Dict[str, Any], b: Dict[str, Any], tolerance: float, max_keys: int) -> List[str]:
+        out: List[str] = []
+        for k in sorted(set(a.keys()) | set(b.keys())):
+            av = a.get(k)
+            bv = b.get(k)
+            if isinstance(av, Number) and isinstance(bv, Number):
+                if abs(float(av) - float(bv)) > tolerance:
+                    out.append(str(k))
+            elif av != bv:
+                out.append(str(k))
+            if len(out) >= max_keys:
+                break
+        return out
+
+    def load_feature_history(
+        self,
+        target: str,
+        track: str,
+        lookback_days: int,
+        data_version: Optional[str] = None,
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if data_version:
+                    cur.execute(
+                        """
+                        SELECT target, track, as_of_ts, data_version, lineage_id, feature_payload
+                        FROM feature_snapshots
+                        WHERE target = %s AND track = %s
+                          AND data_version = %s
+                          AND as_of_ts > NOW() - make_interval(days => %s)
+                        ORDER BY as_of_ts ASC
+                        LIMIT %s
+                        """,
+                        (target, track, data_version, lookback_days, limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT target, track, as_of_ts, data_version, lineage_id, feature_payload
+                        FROM feature_snapshots
+                        WHERE target = %s AND track = %s
+                          AND as_of_ts > NOW() - make_interval(days => %s)
+                        ORDER BY as_of_ts ASC
+                        LIMIT %s
+                        """,
+                        (target, track, lookback_days, limit),
+                    )
+                return [dict(r) for r in cur.fetchall()]
+
     def get_active_model_state(self, track: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -835,6 +1263,72 @@ class V2Repository:
                 )
                 return [float(r["score"]) for r in cur.fetchall()]
 
+    def get_feature_payloads_window(self, track: str, offset_hours: int, window_hours: int, limit: int = 500) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT feature_payload
+                    FROM feature_snapshots
+                    WHERE track = %s
+                      AND created_at <= NOW() - make_interval(hours => %s)
+                      AND created_at > NOW() - make_interval(hours => %s)
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (track, offset_hours, offset_hours + window_hours, limit),
+                )
+                return [dict(r.get("feature_payload") or {}) for r in cur.fetchall()]
+
+    def get_recent_feature_payloads(self, track: str, lookback_hours: int, limit: int = 500) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT feature_payload
+                    FROM feature_snapshots
+                    WHERE track = %s
+                      AND created_at > NOW() - make_interval(hours => %s)
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (track, lookback_hours, limit),
+                )
+                return [dict(r.get("feature_payload") or {}) for r in cur.fetchall()]
+
+    def get_backtest_metric_window(self, track: str, metric_key: str, offset_hours: int, window_hours: int) -> List[float]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT (metrics->>%s)::double precision AS metric
+                    FROM backtest_runs
+                    WHERE track = %s
+                      AND created_at <= NOW() - make_interval(hours => %s)
+                      AND created_at > NOW() - make_interval(hours => %s)
+                      AND metrics ? %s
+                    ORDER BY created_at DESC
+                    """,
+                    (metric_key, track, offset_hours, offset_hours + window_hours, metric_key),
+                )
+                return [float(r["metric"]) for r in cur.fetchall() if r.get("metric") is not None]
+
+    def get_recent_backtest_metric(self, track: str, metric_key: str, lookback_hours: int) -> List[float]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT (metrics->>%s)::double precision AS metric
+                    FROM backtest_runs
+                    WHERE track = %s
+                      AND created_at > NOW() - make_interval(hours => %s)
+                      AND metrics ? %s
+                    ORDER BY created_at DESC
+                    """,
+                    (metric_key, track, lookback_hours, metric_key),
+                )
+                return [float(r["metric"]) for r in cur.fetchall() if r.get("metric") is not None]
+
     def get_execution_slippage_samples(self, track: str, lookback_hours: int) -> List[float]:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -849,7 +1343,7 @@ class V2Repository:
                     FROM orders_sim
                     WHERE track = %s
                       AND created_at > NOW() - make_interval(hours => %s)
-                      AND status IN ('filled', 'submitted')
+                      AND status IN ('filled', 'partially_filled')
                     """,
                     (track, lookback_hours),
                 )
@@ -859,6 +1353,187 @@ class V2Repository:
                     if v is not None:
                         vals.append(float(v))
                 return vals
+
+    def get_execution_reject_rate(self, track: str, lookback_hours: int) -> float:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*)::double precision AS total,
+                        COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0)::double precision AS rejected
+                    FROM orders_sim
+                    WHERE track = %s
+                      AND created_at > NOW() - make_interval(hours => %s)
+                    """,
+                    (track, lookback_hours),
+                )
+                row = dict(cur.fetchone() or {})
+        total = float(row.get("total") or 0.0)
+        rejected = float(row.get("rejected") or 0.0)
+        return float(rejected / max(1.0, total))
+
+    def get_execution_reject_rate_window(self, track: str, offset_hours: int, window_hours: int) -> float:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*)::double precision AS total,
+                        COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0)::double precision AS rejected
+                    FROM orders_sim
+                    WHERE track = %s
+                      AND created_at <= NOW() - make_interval(hours => %s)
+                      AND created_at > NOW() - make_interval(hours => %s)
+                    """,
+                    (track, offset_hours, offset_hours + window_hours),
+                )
+                row = dict(cur.fetchone() or {})
+        total = float(row.get("total") or 0.0)
+        rejected = float(row.get("rejected") or 0.0)
+        return float(rejected / max(1.0, total))
+
+    def get_execution_edge_pnls(
+        self,
+        track: str,
+        lookback_hours: int,
+        limit: int = 500,
+        strategy_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if strategy_id:
+                    cur.execute(
+                        """
+                        SELECT
+                            created_at,
+                            side,
+                            quantity::double precision AS quantity,
+                            est_price::double precision AS est_price,
+                            (metadata->'execution'->>'avg_fill_price')::double precision AS avg_fill_price
+                        FROM orders_sim
+                        WHERE track = %s
+                          AND strategy_id = %s
+                          AND created_at > NOW() - make_interval(hours => %s)
+                          AND status IN ('filled', 'partially_filled')
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (track, strategy_id, lookback_hours, limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT
+                            created_at,
+                            side,
+                            quantity::double precision AS quantity,
+                            est_price::double precision AS est_price,
+                            (metadata->'execution'->>'avg_fill_price')::double precision AS avg_fill_price
+                        FROM orders_sim
+                        WHERE track = %s
+                          AND created_at > NOW() - make_interval(hours => %s)
+                          AND status IN ('filled', 'partially_filled')
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (track, lookback_hours, limit),
+                    )
+                rows = [dict(r) for r in cur.fetchall()]
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            qty = float(r.get("quantity") or 0.0)
+            est = r.get("est_price")
+            avg = r.get("avg_fill_price")
+            if qty <= 0 or est is None or avg is None:
+                edge_pnl = 0.0
+                notional = 0.0
+            else:
+                est_f = float(est)
+                avg_f = float(avg)
+                if est_f <= 0 or avg_f <= 0:
+                    edge_pnl = 0.0
+                    notional = 0.0
+                else:
+                    side = str(r.get("side") or "").lower()
+                    sign = 1.0 if side == "buy" else -1.0
+                    edge_pnl = (est_f - avg_f) * qty * sign
+                    notional = abs(est_f * qty)
+            out.append(
+                {
+                    "created_at": r.get("created_at"),
+                    "edge_pnl": float(edge_pnl),
+                    "notional": float(notional),
+                }
+            )
+        return out
+
+    def get_execution_daily_loss_ratio(self, track: str, lookback_hours: int = 24, strategy_id: Optional[str] = None) -> float:
+        rows = self.get_execution_edge_pnls(track=track, lookback_hours=lookback_hours, limit=5000, strategy_id=strategy_id)
+        if not rows:
+            return 0.0
+        net_edge = float(sum(float(r.get("edge_pnl") or 0.0) for r in rows))
+        gross = float(sum(float(r.get("notional") or 0.0) for r in rows))
+        if net_edge >= 0 or gross <= 1e-9:
+            return 0.0
+        return float(max(0.0, min(5.0, (-net_edge) / gross)))
+
+    def get_execution_consecutive_losses(
+        self,
+        track: str,
+        lookback_hours: int = 24,
+        limit: int = 200,
+        strategy_id: Optional[str] = None,
+    ) -> int:
+        rows = self.get_execution_edge_pnls(track=track, lookback_hours=lookback_hours, limit=limit, strategy_id=strategy_id)
+        streak = 0
+        for r in rows:
+            pnl = float(r.get("edge_pnl") or 0.0)
+            if pnl < -1e-12:
+                streak += 1
+            else:
+                break
+        return int(streak)
+
+    def get_model_rollout_state(self, track: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM model_rollout_state WHERE track = %s LIMIT 1", (track,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def upsert_model_rollout_state(
+        self,
+        track: str,
+        model_name: str,
+        model_version: str,
+        stage_pct: int,
+        status: str,
+        hard_limits: Dict[str, Any],
+        metrics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO model_rollout_state (
+                        track, model_name, model_version, stage_pct, status, hard_limits, metrics, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (track)
+                    DO UPDATE SET
+                        model_name = EXCLUDED.model_name,
+                        model_version = EXCLUDED.model_version,
+                        stage_pct = EXCLUDED.stage_pct,
+                        status = EXCLUDED.status,
+                        hard_limits = EXCLUDED.hard_limits,
+                        metrics = EXCLUDED.metrics,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (track, model_name, model_version, stage_pct, status, json.dumps(hard_limits), json.dumps(metrics)),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {}
 
     def build_pnl_attribution(self, track: str, lookback_hours: int) -> Dict[str, Any]:
         with self._connect() as conn:

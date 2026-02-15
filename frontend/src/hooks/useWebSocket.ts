@@ -7,7 +7,7 @@ interface UseWebSocketReturn {
   unsubscribe: (symbol: string) => void;
 }
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws';
+const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/stream/signals';
 
 export function useWebSocket(): UseWebSocketReturn {
   const [isConnected, setIsConnected] = useState(false);
@@ -58,7 +58,8 @@ export function useWebSocket(): UseWebSocketReturn {
     if (wsRef.current && isConnected) {
       wsRef.current.send(JSON.stringify({
         type: 'subscribe',
-        symbol: symbol
+        channel: 'signals',
+        symbol: symbol,
       }));
     }
   };
@@ -67,7 +68,8 @@ export function useWebSocket(): UseWebSocketReturn {
     if (wsRef.current && isConnected) {
       wsRef.current.send(JSON.stringify({
         type: 'unsubscribe',
-        symbol: symbol
+        channel: 'signals',
+        symbol: symbol,
       }));
     }
   };

@@ -64,10 +64,12 @@ export interface ColorSchemeContextType {
 }
 
 export interface WebSocketMessage {
-  type: 'price_update' | 'news_update' | 'prediction' | 'pong';
+  type: 'price_update' | 'news_update' | 'prediction' | 'pong' | 'signals' | 'events' | 'risk' | 'error';
   symbol?: string;
   price?: number;
   change?: string;
-  timestamp?: number;
+  status?: string;
+  detail?: string;
+  timestamp?: number | string;
   [key: string]: any;
 }

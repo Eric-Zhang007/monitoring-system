@@ -207,6 +207,25 @@ class VCModelTrainer:
             },
             nn_model_path,
         )
+        train_manifest = {
+            "seed": SEED,
+            "epochs": EPOCHS,
+            "batch_size": BATCH_SIZE,
+            "grad_acc_steps": GRAD_ACC_STEPS,
+            "val_ratio": VAL_RATIO,
+            "early_stop_patience": PATIENCE,
+            "checkpoint_path": CHECKPOINT_PATH,
+            "samples": int(X.shape[0]),
+            "val_samples": int(val_idx.shape[0]),
+            "feature_dim": int(X.shape[1]),
+            "best_val_loss": round(best_val_loss, 8),
+            "val_accuracy": round(acc, 6),
+            "distill_gap": round(distill_gap, 6),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        manifest_path = os.path.join(MODEL_DIR, "vc_train_manifest_v2.json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(train_manifest, f)
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -253,6 +272,7 @@ class VCModelTrainer:
                                 "grad_acc_steps": GRAD_ACC_STEPS,
                                 "seed": SEED,
                                 "best_val_loss": round(best_val_loss, 8),
+                                "train_manifest_path": manifest_path,
                                 "data_quality": dq,
                             }
                         ),

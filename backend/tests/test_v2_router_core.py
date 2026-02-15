@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from v2_router import _evaluate_risk, _ks_statistic, _psi, _walk_forward_metrics  # noqa: E402
-from schemas_v2 import ExecuteOrdersRequest, RebalancePosition, SignalGenerateRequest  # noqa: E402
+import v2_router as router_mod  # noqa: E402
+from v2_router import _evaluate_risk, _execution_volatility_violations, _infer_daily_loss_ratio, _ks_statistic, _normalize_execution_payload, _psi, _walk_forward_metrics  # noqa: E402
+from schemas_v2 import ExecuteOrdersRequest, RebalancePosition, RiskCheckRequest, SignalGenerateRequest  # noqa: E402
 from execution_engine import ExecutionEngine  # noqa: E402
 
 
@@ -24,23 +26,23 @@ def test_evaluate_risk_caps_single_weight():
 
 def test_evaluate_risk_caps_sector_and_style_exposure():
     proposed = [
-        RebalancePosition(target="AAPL", track="liquid", weight=0.3, sector="tech", style_bucket="growth"),
-        RebalancePosition(target="NVDA", track="liquid", weight=0.3, sector="tech", style_bucket="growth"),
+        RebalancePosition(target="AAPL", track="liquid", weight=0.2, sector="tech", style_bucket="growth"),
+        RebalancePosition(target="NVDA", track="liquid", weight=0.2, sector="tech", style_bucket="growth"),
     ]
     adjusted, violations, gross, turnover = _evaluate_risk(
         proposed,
         [],
         0.0,
-        max_sector_exposure_override=0.4,
-        max_style_exposure_override=0.35,
+        max_sector_exposure_override=0.3,
+        max_style_exposure_override=0.25,
     )
     assert adjusted
     assert any(v.startswith("sector_exposure_exceeded:tech") for v in violations)
     assert any(v.startswith("style_exposure_exceeded:growth") for v in violations)
     sector_exp = sum(abs(p.weight) for p in adjusted if (p.sector or "").lower() == "tech")
     style_exp = sum(abs(p.weight) for p in adjusted if (p.style_bucket or "").lower() == "growth")
-    assert sector_exp <= 0.4 + 1e-9
-    assert style_exp <= 0.35 + 1e-9
+    assert sector_exp <= 0.3 + 1e-9
+    assert style_exp <= 0.25 + 1e-9
     assert gross <= 1.0 + 1e-9
     assert turnover >= 0.0
 
@@ -56,6 +58,17 @@ def test_walk_forward_metrics_outputs():
     assert "ic" in m
     assert "hit_rate" in m
     assert "pnl_after_cost" in m
+
+
+def test_walk_forward_metrics_keeps_weekend_rows_for_crypto():
+    start = datetime(2026, 2, 14, 0, 0, tzinfo=timezone.utc)  # Saturday
+    rows = []
+    p = 100.0
+    for i in range(40):
+        p = p * (1.0 + (0.001 if i % 2 == 0 else -0.0007))
+        rows.append({"price": p, "volume": 1000.0 + i, "timestamp": start + timedelta(hours=i)})
+    m = _walk_forward_metrics(rows, train_days=20, test_days=5, fee_bps=5, slippage_bps=3)
+    assert m["samples"] > 0
 
 
 def test_execution_engine_paper():
@@ -86,3 +99,190 @@ def test_extended_request_models():
         venue="coinbase",
     )
     assert run.venue == "coinbase"
+
+
+def test_risk_check_kill_switch_violation_code_is_consistent(monkeypatch):
+    class _FakeRepo:
+        def __init__(self):
+            self.events = []
+
+        def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
+            return track == "liquid" and strategy_id == "global"
+
+        def upsert_kill_switch_state(self, *args, **kwargs):
+            return {}
+
+        def save_risk_event(self, **kwargs):
+            self.events.append(kwargs)
+
+    fake_repo = _FakeRepo()
+    monkeypatch.setattr(router_mod, "repo", fake_repo)
+    payload = RiskCheckRequest(
+        proposed_positions=[RebalancePosition(target="BTC", track="liquid", weight=0.1)],
+        current_positions=[],
+        realized_drawdown=0.0,
+    )
+    resp = asyncio.run(router_mod.risk_check(payload))
+    assert resp.approved is False
+    assert "kill_switch_triggered:liquid:global" in resp.violations
+
+
+def test_risk_check_runtime_limits_trigger_violation(monkeypatch):
+    class _FakeRepo:
+        def __init__(self):
+            self.last_upsert = {}
+
+        def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
+            return False
+
+        def upsert_kill_switch_state(self, *args, **kwargs):
+            self.last_upsert = kwargs
+            return {}
+
+        def save_risk_event(self, **kwargs):
+            return None
+
+    monkeypatch.setenv("RISK_MAX_DAILY_LOSS", "0.01")
+    monkeypatch.setenv("RISK_MAX_CONSECUTIVE_LOSSES", "2")
+    fake = _FakeRepo()
+    monkeypatch.setattr(router_mod, "repo", fake)
+    payload = RiskCheckRequest(
+        proposed_positions=[RebalancePosition(target="BTC", track="liquid", weight=0.1)],
+        current_positions=[],
+        realized_drawdown=0.0,
+        daily_loss=0.02,
+        consecutive_losses=3,
+    )
+    resp = asyncio.run(router_mod.risk_check(payload))
+    assert resp.approved is False
+    assert "daily_loss_exceeded" in resp.violations
+    assert "consecutive_loss_exceeded" in resp.violations
+    assert fake.last_upsert.get("reason") == "daily_loss_exceeded"
+    assert int(fake.last_upsert.get("duration_minutes") or 0) >= 1
+
+
+def test_infer_daily_loss_ratio_uses_notional_denominator(monkeypatch):
+    class _FakeRepo:
+        def build_pnl_attribution(self, track: str, lookback_hours: int):
+            return {"totals": {"net_pnl": -100.0, "gross_notional_signed": 10000.0}}
+
+    monkeypatch.setattr(router_mod, "repo", _FakeRepo())
+    ratio = _infer_daily_loss_ratio("liquid")
+    assert abs(ratio - 0.01) < 1e-9
+
+
+def test_run_execution_blocks_on_abnormal_volatility(monkeypatch):
+    class _FakeRepo:
+        def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
+            return False
+
+        def fetch_orders_for_decision(self, decision_id: str, limit: int = 100):
+            return [{"id": 1, "target": "BTC", "track": "liquid", "side": "buy", "quantity": 1.0, "metadata": {}}]
+
+        def get_model_rollout_state(self, track: str):
+            return {"stage_pct": 100}
+
+        def load_price_history(self, symbol: str, lookback_days: int = 90):
+            prices = [100.0 + i * 0.1 for i in range(40)]
+            prices[-1] = prices[-2] * 1.2
+            return [{"price": p} for p in prices]
+
+        def upsert_kill_switch_state(self, **kwargs):
+            return {}
+
+        def save_risk_event(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(router_mod, "repo", _FakeRepo())
+    monkeypatch.setenv("RISK_MAX_ABS_RETURN", "0.05")
+    req = ExecuteOrdersRequest(decision_id="d1", adapter="paper", time_in_force="IOC", max_slippage_bps=10.0, venue="coinbase")
+    try:
+        asyncio.run(router_mod.run_execution(req))
+        assert False, "expected HTTPException"
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
+        detail = getattr(exc, "detail", "")
+        assert status_code == 423
+        assert "risk_blocked:abnormal_volatility_circuit_breaker:BTC" in str(detail)
+
+
+def test_normalize_execution_payload_has_fixed_lifecycle_shape():
+    raw = {
+        "status": "filled",
+        "filled_qty": 1.0,
+        "lifecycle": [
+            {"event": "limit_submit", "status": "accepted", "filled_qty": 0.4, "http_code": 200},
+            {"event": "market_submit", "status": "filled", "filled_qty": 0.6, "retry": 1},
+        ],
+    }
+    out = _normalize_execution_payload(raw)
+    assert out["status"] == "filled"
+    assert isinstance(out["lifecycle"], list)
+    assert out["lifecycle"][0]["event"] == "limit_submit"
+    assert out["lifecycle"][0]["status"] == "accepted"
+    assert "time" in out["lifecycle"][0]
+    assert isinstance(out["lifecycle"][0]["metrics"], dict)
+
+
+def test_run_execution_blocks_on_strategy_consecutive_losses(monkeypatch):
+    class _FakeRepo:
+        def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
+            return False
+
+        def fetch_orders_for_decision(self, decision_id: str, limit: int = 100):
+            return [{"id": 1, "target": "BTC", "track": "liquid", "side": "buy", "quantity": 1.0, "strategy_id": "strat-a", "metadata": {}}]
+
+        def get_model_rollout_state(self, track: str):
+            return {"stage_pct": 100}
+
+        def load_price_history(self, symbol: str, lookback_days: int = 90):
+            return [{"price": 100.0 + i * 0.01} for i in range(60)]
+
+        def get_execution_consecutive_losses(self, track: str, lookback_hours: int = 24, limit: int = 200, strategy_id: str | None = None):
+            return 3 if strategy_id == "strat-a" else 0
+
+        def upsert_kill_switch_state(self, **kwargs):
+            return {}
+
+        def save_risk_event(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(router_mod, "repo", _FakeRepo())
+    monkeypatch.setenv("RISK_MAX_CONSECUTIVE_LOSSES", "2")
+    req = ExecuteOrdersRequest(decision_id="d1", adapter="paper", time_in_force="IOC", max_slippage_bps=10.0, venue="coinbase")
+    try:
+        asyncio.run(router_mod.run_execution(req))
+        assert False, "expected HTTPException"
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 423
+        assert "risk_blocked:consecutive_loss_exceeded:strat-a" in str(getattr(exc, "detail", ""))
+
+
+def test_opening_status_returns_remaining_seconds(monkeypatch):
+    now = datetime.now(timezone.utc)
+
+    class _FakeRepo:
+        def get_kill_switch_state(self, track: str, strategy_id: str):
+            return {"state": "triggered", "reason": "x", "updated_at": now, "expires_at": now + timedelta(seconds=30)}
+
+        def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
+            return True
+
+    monkeypatch.setattr(router_mod, "repo", _FakeRepo())
+    resp = asyncio.run(router_mod.get_opening_status(track="liquid", strategy_id="strat-a"))
+    assert resp.can_open_new_positions is False
+    assert resp.remaining_seconds > 0
+
+
+def test_execution_volatility_uses_symbol_threshold_override(monkeypatch):
+    class _FakeRepo:
+        def load_price_history(self, symbol: str, lookback_days: int = 2):
+            prices = [100.0 + i * 0.1 for i in range(40)]
+            prices[-1] = prices[-2] * 1.12
+            return [{"price": p} for p in prices]
+
+    monkeypatch.setattr(router_mod, "repo", _FakeRepo())
+    monkeypatch.setenv("RISK_MAX_ABS_RETURN", "0.05")
+    monkeypatch.setenv("RISK_MAX_ABS_RETURN_SYMBOLS", "BTC=0.20")
+    out = _execution_volatility_violations([{"target": "BTC"}])
+    assert out == []

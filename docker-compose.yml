@@ -71,11 +71,12 @@ services:
   # 模型推理服务（GPU 0 - 实时推理）
   inference:
     build: ./inference
+    profiles: ["gpu"]
     environment:
       - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=0
-      - LIQUID_SYMBOLS=BTC,ETH,AAPL,TSLA,NVDA,SPY
+      - LIQUID_SYMBOLS=BTC,ETH,SOL
       - INFER_INTERVAL_SEC=60
     depends_on:
       - redis
@@ -100,11 +101,12 @@ services:
   # 训练服务（GPU 1 - 离线任务 + NIM特征提取）
   training:
     build: ./training
+    profiles: ["gpu"]
     environment:
       - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=1
-      - LIQUID_SYMBOLS=BTC,ETH,AAPL,TSLA,NVDA,SPY
+      - LIQUID_SYMBOLS=BTC,ETH,SOL
       - TRAIN_INTERVAL_SEC=21600
     depends_on:
       - postgres
@@ -177,6 +179,45 @@ services:
       retries: 3
 
   # Grafana 监控
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - backend
+      - alertmanager
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+
   grafana:
     image: grafana/grafana:latest
     ports:
@@ -191,6 +232,8 @@ services:
           memory: 512M
     volumes:
       - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
 
   # Model Ops 自动治理调度
   model_ops:
@@ -200,13 +243,62 @@ services:
       - API_BASE=http://backend:8000
       - MODEL_OPS_TRACKS=liquid
       - DRIFT_INTERVAL_SEC=900
+      - DRIFT_LOOKBACK_HOURS=24
+      - DRIFT_REFERENCE_HOURS=72
+      - DRIFT_PSI_THRESHOLD=0.25
+      - DRIFT_KS_THRESHOLD=0.20
       - GATE_INTERVAL_SEC=3600
+      - GATE_WINDOWS=3
+      - GATE_MIN_IC=0.0
+      - GATE_MIN_PNL_AFTER_COST=0.0
+      - GATE_MAX_DRAWDOWN=0.2
+      - WEEKLY_GATE_MODE=1
+      - GATE_WEEKDAY=1
+      - GATE_HOUR_UTC=2
       - ROLLBACK_INTERVAL_SEC=900
+      - ROLLBACK_MAX_RECENT_LOSSES=5
+      - ROLLBACK_MIN_HIT_RATE=0.4
+      - ROLLBACK_MAX_DRAWDOWN=0.25
+      - ROLLOUT_AUTO_ADVANCE=1
+      - ROLLOUT_WINDOWS=3
+      - ROLLOUT_MIN_HIT_RATE=0.45
+      - ROLLOUT_MIN_PNL_AFTER_COST=0.0
+      - ROLLOUT_MAX_DRAWDOWN=0.25
     volumes:
       - ./monitoring:/app/monitoring:ro
     depends_on:
       - backend
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f model_ops_scheduler.py >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  task_worker:
+    build: ./backend
+    command: python /app/monitoring/task_worker.py
+    environment:
+      - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
+      - REDIS_URL=redis://redis:6379
+      - TASK_WORKER_POLL_TIMEOUT_SEC=5
+    volumes:
+      - ./monitoring:/app/monitoring:ro
+    depends_on:
+      - backend
+      - redis
+      - postgres
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f task_worker.py >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     deploy:
       resources:
         limits:
@@ -220,7 +312,7 @@ services:
       - "3001:3000"
     environment:
       - VITE_API_URL=http://localhost:8000
-      - VITE_WS_URL=ws://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000/stream/signals
     restart: unless-stopped
     deploy:
       resources:
@@ -244,4 +336,5 @@ volumes:
   redis_data:
   postgres_data:
   clickhouse_data:
+  prometheus_data:
   grafana_data:

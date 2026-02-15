@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
 from torch import nn
+
+try:
+    import lightgbm as lgb  # type: ignore
+
+    HAS_LGB = True
+except Exception:
+    HAS_LGB = False
 
 MODEL_DIR = "/app/models"
 
@@ -27,26 +34,59 @@ class TinyVCModel(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-class TinyLiquidModel(nn.Module):
-    def __init__(self, in_dim: int):
+class MixerBlock(nn.Module):
+    def __init__(self, n_tokens: int, n_channels: int, hidden_dim: int = 64):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 32),
+        self.token_mlp = nn.Sequential(
+            nn.Linear(n_tokens, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(32, 16),
+            nn.Linear(hidden_dim, n_tokens),
+        )
+        self.channel_mlp = nn.Sequential(
+            nn.Linear(n_channels, hidden_dim),
             nn.GELU(),
-            nn.Linear(16, 1),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, n_channels),
+        )
+        self.ln1 = nn.LayerNorm(n_channels)
+        self.ln2 = nn.LayerNorm(n_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.ln1(x)
+        y = y.transpose(1, 2)
+        y = self.token_mlp(y)
+        y = y.transpose(1, 2)
+        x = x + y
+        z = self.ln2(x)
+        z = self.channel_mlp(z)
+        return x + z
+
+
+class TSMixerLiquidModel(nn.Module):
+    def __init__(self, n_tokens: int, n_channels: int, n_blocks: int = 2):
+        super().__init__()
+        self.blocks = nn.ModuleList([MixerBlock(n_tokens=n_tokens, n_channels=n_channels) for _ in range(n_blocks)])
+        self.head = nn.Sequential(
+            nn.LayerNorm(n_channels),
+            nn.Flatten(),
+            nn.Linear(n_tokens * n_channels, 64),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1),
         )
 
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for blk in self.blocks:
+            x = blk(x)
+        return self.head(x).squeeze(-1)
 
 
 class ModelRouter:
     def __init__(self):
         self.cache: Dict[str, Dict] = {}
-        self.torch_cache: Dict[str, Dict[str, object]] = {}
+        self.torch_cache: Dict[str, Dict[str, Any]] = {}
+        self.tabular_cache: Dict[str, Dict[str, Any]] = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @staticmethod
@@ -71,6 +111,23 @@ class ModelRouter:
         x_std = np.clip(ModelRouter._align_features(x_std, features.shape[0]), 1e-6, None)
         return (features - x_mean) / x_std
 
+    @staticmethod
+    def _to_sequence(features: np.ndarray) -> np.ndarray:
+        x = np.array(features, dtype=np.float32).reshape(-1)
+        if x.shape[0] < 15:
+            return x[None, None, :]
+        seq = np.stack(
+            [
+                np.stack([x[0], x[4], x[10]], axis=0),
+                np.stack([x[1], x[5], x[9]], axis=0),
+                np.stack([x[2], x[6], x[11]], axis=0),
+                np.stack([x[3], x[7], x[12]], axis=0),
+                np.stack([x[13], x[14], x[8]], axis=0),
+            ],
+            axis=0,
+        )
+        return seq[None, :, :].astype(np.float32)
+
     def _load_json_model(self, name: str) -> Dict:
         if name in self.cache:
             return self.cache[name]
@@ -90,21 +147,88 @@ class ModelRouter:
             return None
         ckpt = torch.load(path, map_location=self.device)
         state = ckpt.get("state_dict", {})
-        in_dim = int(ckpt.get("in_dim", in_dim))
+        model_name = str(ckpt.get("type") or "")
+
         if model_type == "vc":
-            model = TinyVCModel(in_dim)
+            resolved_in_dim = int(ckpt.get("in_dim", in_dim))
+            model = TinyVCModel(resolved_in_dim)
+            model.load_state_dict(state)
+            payload: Dict[str, Any] = {
+                "model": model,
+                "in_dim": resolved_in_dim,
+                "normalization": ckpt.get("normalization"),
+            }
+        elif model_name == "tsmixer_liquid":
+            n_tokens = int(ckpt.get("n_tokens", 5))
+            n_channels = int(ckpt.get("n_channels", 3))
+            model = TSMixerLiquidModel(n_tokens=n_tokens, n_channels=n_channels, n_blocks=2)
+            model.load_state_dict(state)
+            payload = {
+                "model": model,
+                "normalization": ckpt.get("normalization"),
+                "ensemble_alpha": float(ckpt.get("ensemble_alpha", 0.7) or 0.7),
+                "n_tokens": n_tokens,
+                "n_channels": n_channels,
+            }
         else:
-            model = TinyLiquidModel(in_dim)
-        model.load_state_dict(state)
+            return None
+
         model.to(self.device)
         model.eval()
-        payload: Dict[str, object] = {
-            "model": model,
-            "in_dim": in_dim,
-            "normalization": ckpt.get("normalization"),
-        }
         self.torch_cache[key] = payload
         return payload
+
+    def _load_liquid_tabular_model(self, symbol: str) -> Optional[Dict[str, Any]]:
+        key = symbol.lower()
+        if key in self.tabular_cache:
+            return self.tabular_cache[key]
+
+        model = self._load_json_model(f"liquid_{symbol.lower()}_lgbm_baseline_v2.json")
+        if not model:
+            return None
+        loaded: Dict[str, Any] = {
+            "name": str(model.get("model") or "unknown"),
+            "x_mean": np.array(model.get("x_mean", []), dtype=np.float32),
+            "x_std": np.array(model.get("x_std", []), dtype=np.float32),
+            "feature_dim": int(model.get("feature_dim", 15) or 15),
+        }
+        if model.get("model") == "lightgbm" and HAS_LGB and isinstance(model.get("booster_model"), str):
+            try:
+                booster = lgb.Booster(model_str=str(model["booster_model"]))
+                loaded["booster"] = booster
+            except Exception:
+                pass
+        if isinstance(model.get("weights"), list):
+            loaded["weights"] = np.array(model.get("weights", []), dtype=np.float32)
+
+        self.tabular_cache[key] = loaded
+        return loaded
+
+    def _predict_liquid_tabular(self, symbol: str, features: np.ndarray) -> float:
+        bundle = self._load_liquid_tabular_model(symbol)
+        if not bundle:
+            return 0.0
+
+        feature_dim = int(bundle.get("feature_dim", features.shape[0]))
+        aligned = self._align_features(features, feature_dim)
+        x_mean = np.array(bundle.get("x_mean", []), dtype=np.float32).reshape(-1)
+        x_std = np.array(bundle.get("x_std", []), dtype=np.float32).reshape(-1)
+        if x_mean.size > 0 and x_std.size > 0:
+            x_mean = self._align_features(x_mean, feature_dim)
+            x_std = np.clip(self._align_features(x_std, feature_dim), 1e-6, None)
+            aligned = (aligned - x_mean) / x_std
+
+        booster = bundle.get("booster")
+        if booster is not None:
+            pred = booster.predict(aligned.reshape(1, -1))
+            return float(np.array(pred, dtype=np.float32).reshape(-1)[0])
+
+        weights = bundle.get("weights")
+        if isinstance(weights, np.ndarray) and weights.size > 0:
+            ww = self._align_features(weights, feature_dim)
+            return float(aligned @ ww)
+
+        return 0.0
 
     def predict_vc(self, features: np.ndarray, model_name: str = "vc_survival_baseline") -> Dict:
         if model_name in {"vc_survival_ttm", "vc_survival_model"}:
@@ -120,6 +244,7 @@ class ModelRouter:
                 prob = 0.5
         else:
             prob = 0.5
+
         model = self._load_json_model("vc_survival_baseline_v2.json")
         if model:
             w = np.array(model.get("weights", []), dtype=np.float32)
@@ -129,6 +254,7 @@ class ModelRouter:
                 prob = 0.7 * prob + 0.3 * base_prob
             else:
                 prob = base_prob
+
         return {
             "p_next_round_6m": max(0.01, min(0.99, prob + 0.06)),
             "p_next_round_12m": max(0.01, min(0.99, prob)),
@@ -141,36 +267,45 @@ class ModelRouter:
         }
 
     def predict_liquid(self, symbol: str, features: np.ndarray, model_name: str = "liquid_baseline") -> Dict:
-        expected_return = 0.0
+        expected_return_nn = 0.0
+        expected_return_tabular = self._predict_liquid_tabular(symbol, features)
+        ensemble_alpha = 0.0
+
         if model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
-            pt_path = os.path.join(MODEL_DIR, f"liquid_{symbol.lower()}_ttm_v2.pt")
+            pt_path = os.path.join(MODEL_DIR, f"liquid_{symbol.lower()}_tsmixer_v2.pt")
             pt_bundle = self._load_torch_model(pt_path, "liquid", features.shape[0])
             if pt_bundle is not None:
                 with torch.no_grad():
-                    in_dim = int(pt_bundle.get("in_dim", features.shape[0]))
-                    aligned = self._align_features(features, in_dim)
-                    aligned = self._normalize_features(aligned, pt_bundle.get("normalization"))
-                    fx = torch.tensor(aligned, dtype=torch.float32, device=self.device).unsqueeze(0)
-                    expected_return = float(pt_bundle["model"](fx).item())
-        model = self._load_json_model(f"liquid_{symbol.lower()}_baseline_v2.json")
-        if model:
-            w = np.array(model.get("weights", []), dtype=np.float32)
-            aligned = self._align_features(features, int(w.shape[0]))
-            x_mean = np.array(model.get("x_mean", []), dtype=np.float32)
-            x_std = np.array(model.get("x_std", []), dtype=np.float32)
-            if x_mean.size == w.shape[0] and x_std.size == w.shape[0]:
-                aligned = (aligned - x_mean) / np.clip(x_std, 1e-6, None)
-            baseline_return = float(aligned @ w)
-            if model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
-                expected_return = 0.7 * expected_return + 0.3 * baseline_return
-            elif expected_return == 0.0:
-                expected_return = baseline_return
+                    fx = np.array(features, dtype=np.float32).reshape(-1)
+                    fx = self._normalize_features(fx, pt_bundle.get("normalization"))
+                    seq = self._to_sequence(fx)
+                    xt = torch.tensor(seq, dtype=torch.float32, device=self.device)
+                    expected_return_nn = float(pt_bundle["model"](xt).item())
+                    ensemble_alpha = float(pt_bundle.get("ensemble_alpha", 0.7) or 0.7)
+
+        if model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
+            if abs(expected_return_nn) <= 1e-12 and abs(expected_return_tabular) <= 1e-12:
+                expected_return = 0.0
+            elif abs(expected_return_nn) <= 1e-12:
+                expected_return = expected_return_tabular
+            elif abs(expected_return_tabular) <= 1e-12:
+                expected_return = expected_return_nn
+            else:
+                alpha = max(0.0, min(1.0, ensemble_alpha))
+                expected_return = alpha * expected_return_nn + (1.0 - alpha) * expected_return_tabular
+        else:
+            expected_return = expected_return_tabular
 
         vol_forecast = float(max(0.01, 0.02 + abs(expected_return) * 4))
         confidence = float(max(0.35, min(0.95, 0.75 - vol_forecast * 4)))
 
         return {
-            "expected_return": expected_return,
+            "expected_return": float(expected_return),
             "vol_forecast": vol_forecast,
             "signal_confidence": confidence,
+            "stack": {
+                "nn": float(expected_return_nn),
+                "tabular": float(expected_return_tabular),
+                "alpha": float(ensemble_alpha),
+            },
         }

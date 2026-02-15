@@ -10,7 +10,10 @@ from typing import Any, Dict, List
 
 
 def _run(cmd: List[str]) -> str:
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return ""
     if p.returncode != 0:
         return ""
     return p.stdout.strip()

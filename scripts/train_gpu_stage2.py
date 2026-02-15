@@ -20,6 +20,20 @@ def _run(cmd: List[str], env: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
+def _check_module(module_name: str, env: Dict[str, str]) -> Dict[str, Any]:
+    p = subprocess.run(
+        ["python3", "-c", f"import {module_name}"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "module": module_name,
+        "ok": bool(p.returncode == 0),
+        "stderr": (p.stderr or "").strip()[-1000:],
+    }
+
+
 def _estimate_cost_cny(hours: float, compute_tier: str, a100_hourly_cny: float, billing_discount: float) -> float:
     if compute_tier == "a100x2":
         return round(float(hours) * float(a100_hourly_cny) * 2.0 * float(max(0.0, billing_discount)), 2)
@@ -75,7 +89,18 @@ def main() -> int:
             )
         )
 
-    steps.append(_run(["python3", "training/main.py"], env=env))
+    dep = _check_module("torch", env=env)
+    if not dep["ok"]:
+        steps.append(
+            {
+                "cmd": ["python3", "-c", "import torch"],
+                "returncode": 1,
+                "stdout": "",
+                "stderr": f"missing_dependency:torch {dep['stderr']}",
+            }
+        )
+    else:
+        steps.append(_run(["python3", "training/main.py"], env=env))
 
     ok = all(int(s.get("returncode", 1)) == 0 for s in steps)
     finished = datetime.now(timezone.utc)

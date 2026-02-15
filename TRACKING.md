@@ -75,6 +75,9 @@
   - `backend`：`uvicorn` 无 Docker 启动，`/health` 返回 healthy；
   - `collector`：事件采集已持续入库（可见 `POST /api/v2/ingest/events 200`）；
   - `trainer`：双卡训练循环已启动，当前因 `market_bars` 样本不足被数据质量门阻断（符合预期保护逻辑）。
+- 新增“本地有代理抓行情 -> 服务器导入”链路脚本：
+  - `scripts/ingest_bitget_market_bars.py`（支持 Bitget + CoinGecko fallback + 代理 + CSV 导出 + 可跳过 DB）；
+  - `scripts/import_market_bars_csv.py`（服务器侧 CSV upsert 到 `market_bars`）。
 
 ## ✅ 2026-02-15 15:10 UTC 执行层风控与服务器部署准备（本轮）
 

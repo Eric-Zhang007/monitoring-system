@@ -19,6 +19,8 @@
 - `scripts/server_bootstrap.sh`
 - `scripts/server_verify_runtime.sh`
 - `scripts/train_gpu_stage2.py`
+- `scripts/ingest_bitget_market_bars.py`
+- `scripts/import_market_bars_csv.py`
 
 ## 4. 标准执行流程
 
@@ -96,6 +98,25 @@ export TRAIN_ENABLE_VC=1
 export TRAIN_ENABLE_LIQUID=1
 export LIQUID_SYMBOLS=BTC,ETH,SOL
 python3 scripts/train_gpu_stage2.py --compute-tier a100x2 --nproc-per-node 2 --enable-vc --enable-liquid
+```
+
+### Step N2.5: 服务器无法直连交易所时（本地拉数据再导入）
+本地（有 Clash）执行：
+```bash
+HTTPS_PROXY=http://127.0.0.1:7890 ALL_PROXY=socks5://127.0.0.1:7890 \
+python3 scripts/ingest_bitget_market_bars.py \
+  --days 180 \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+  --symbol-map BTCUSDT:BTC,ETHUSDT:ETH,SOLUSDT:SOL \
+  --out-csv artifacts/server_bundle/market_bars_1h.csv \
+  --skip-db
+```
+
+上传到服务器后执行：
+```bash
+python3 scripts/import_market_bars_csv.py \
+  --csv artifacts/server_bundle/market_bars_1h.csv \
+  --database-url postgresql://monitor:change_me_please@localhost:5432/monitor
 ```
 
 ### Step N3: 后台状态查看

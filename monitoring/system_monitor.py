@@ -49,7 +49,7 @@ def get_gpu_status() -> dict:
                     'memory_total_mb': parts[3],
                     'utilization_percent': parts[4]
                 })
-            return gpus = {'gpus': gpu_data, 'status': 'ok'}
+            return {'gpus': gpu_data, 'status': 'ok'}
         return {'gpus': [], 'status': 'not_available'}
     except Exception as e:
         logger.warning(f"GPU monitoring failed: {e}")

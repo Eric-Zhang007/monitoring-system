@@ -14,10 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py .
-COPY gpu_manager.py .
-COPY nim_integration.py .
-COPY redis_streams.py .
+COPY . .
 
 # Create models directory
 RUN mkdir -p models

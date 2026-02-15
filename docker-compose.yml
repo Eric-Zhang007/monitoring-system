@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Nginx 反向代理
   nginx:
@@ -32,6 +30,8 @@ services:
       - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=0
+      - FEATURE_VERSION=feature-store-v2.0
+      - MODEL_VERSION=v2.0
     depends_on:
       - redis
       - postgres
@@ -57,6 +57,8 @@ services:
     build: ./collector
     environment:
       - REDIS_URL=redis://redis:6379
+      - EVENT_STREAM=event_stream
+      - COLLECT_INTERVAL=300
     depends_on:
       - redis
     restart: unless-stopped
@@ -73,6 +75,8 @@ services:
       - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=0
+      - LIQUID_SYMBOLS=BTC,ETH,AAPL,TSLA,NVDA,SPY
+      - INFER_INTERVAL_SEC=60
     depends_on:
       - redis
       - postgres
@@ -100,6 +104,8 @@ services:
       - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=1
+      - LIQUID_SYMBOLS=BTC,ETH,AAPL,TSLA,NVDA,SPY
+      - TRAIN_INTERVAL_SEC=21600
     depends_on:
       - postgres
       - redis
@@ -186,6 +192,27 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
 
+  # Model Ops 自动治理调度
+  model_ops:
+    build: ./backend
+    command: python /app/monitoring/model_ops_scheduler.py
+    environment:
+      - API_BASE=http://backend:8000
+      - MODEL_OPS_TRACKS=liquid
+      - DRIFT_INTERVAL_SEC=900
+      - GATE_INTERVAL_SEC=3600
+      - ROLLBACK_INTERVAL_SEC=900
+    volumes:
+      - ./monitoring:/app/monitoring:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
   # React 前端
   frontend:
     build: ./frontend
@@ -200,6 +227,18 @@ services:
         limits:
           cpus: '0.5'
           memory: 512M
+
+  # Schema migration / orchestration bootstrap (V2)
+  orchestrator:
+    build: ./backend
+    command: >
+      bash -lc "alembic -c alembic.ini upgrade head &&
+      python -c 'print(\"v2 migrations applied\")'"
+    environment:
+      - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
+    depends_on:
+      - postgres
+    restart: "no"
 
 volumes:
   redis_data:

@@ -81,10 +81,10 @@ def check_postgres() -> Tuple[bool, Dict]:
         version = cursor.fetchone()
         
         # Check recent records
-        cursor.execute("SELECT COUNT(*) FROM predictions WHERE created_at > NOW() - make_interval(hours => 1);")
+        cursor.execute("SELECT COUNT(*) FROM predictions_v2 WHERE created_at > NOW() - make_interval(hours => 1);")
         recent_predictions = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM nim_features WHERE created_at > NOW() - make_interval(hours => 1);")
+
+        cursor.execute("SELECT COUNT(*) FROM semantic_features WHERE timestamp > NOW() - make_interval(hours => 6);")
         recent_features = cursor.fetchone()[0]
         
         conn.close()

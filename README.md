@@ -1,7 +1,72 @@
-# 全网信息监测系统 - MVP 完成报告
+# 全网信息监测系统 - V2 双轨升级版（VC + Liquid）
 
 **完成日期：** 2026-02-14
-**项目状态：** ✅ MVP 已完成并通过测试
+**项目状态：** ✅ 已完成 V2 核心重构（保留 V1 兼容接口）
+
+---
+
+## V2 升级摘要（本次实现）
+
+### 2026-02-15 Phase1 加密中频基础落地（新增）
+- 冻结旧口径 API：`/api/predictions*`、`/api/prices*`、`/api/news*`、`/api/indicators*`、`/ws` 返回 `410`，统一到 `/api/v2/*`。
+- 新增执行 API：
+  - `POST /api/v2/execution/orders`（提交订单）
+  - `GET /api/v2/execution/orders/{order_id}`（查询订单）
+  - `POST /api/v2/execution/run`（统一执行入口，支持 `paper|coinbase_live` + `time_in_force|max_slippage_bps|venue`）
+- 新增模型治理与监控 API：
+  - `POST /api/v2/models/drift/evaluate`
+  - `POST /api/v2/models/gate/auto-evaluate`
+  - `GET /api/v2/metrics/pnl-attribution`
+- 新增 Alembic 迁移：`20260215_0005_crypto_phase1_foundation.py`
+  - 加密数据表：`market_bars`、`orderbook_l2`、`trades_ticks`、`funding_rates`、`onchain_signals`
+  - `feature_snapshots` 增强字段：`as_of_ts`、`event_time`、`data_version`、`lineage_id`
+  - `orders_sim` 扩展字段：`adapter`、`venue`、`time_in_force`、`max_slippage_bps`、`strategy_id`
+- 训练链路增强：数据质量 gate、固定随机种子、时序验证、early stopping、lr scheduler、checkpoint resume、OOM 降级重试、特征标准化参数持久化。
+- 推理链路增强：批量拉取价格/事件上下文，按 8 维特征（含多窗口收益/波动）推理，兼容模型维度自动对齐。
+
+- 新增 `backend /api/v2/*`：
+  - `POST /api/v2/ingest/events`
+  - `GET /api/v2/entities/{entity_id}`
+  - `POST /api/v2/predict/vc`
+  - `POST /api/v2/predict/liquid`
+  - `POST /api/v2/portfolio/score`
+  - `GET /api/v2/predictions/{id}/explanation`
+  - `POST /api/v2/backtest/run`
+  - `GET /api/v2/backtest/{run_id}`
+  - `POST /api/v2/signals/generate`
+  - `POST /api/v2/portfolio/rebalance`
+  - `GET /api/v2/risk/limits`
+  - `POST /api/v2/risk/check`
+  - `POST /api/v2/models/gate/evaluate`
+  - `POST /api/v2/models/rollback/check`
+  - `POST /api/v2/execution/run`
+  - `POST /api/v2/data-quality/sample`
+  - `POST /api/v2/data-quality/audit`
+  - `GET /api/v2/data-quality/stats`
+- 新增 WebSocket 主题：
+  - `/stream/events`
+  - `/stream/signals`
+  - `/stream/risk`
+- 新增 Canonical Schema 与审计表：
+  - `entities`, `events`, `event_links`, `feature_snapshots`
+  - `model_registry`, `predictions_v2`, `prediction_explanations`, `backtest_runs`
+  - `signal_candidates`, `orders_sim`, `positions_snapshots`
+  - `risk_events`, `model_promotions`, `data_quality_audit`
+- 采集器升级为插件化连接器：
+  - `GDELT`, `RSS`, `SEC EDGAR`（真实信源接入路径）
+- 训练与推理改为双轨模块：
+  - `training/feature_pipeline.py`
+  - `training/vc_model_trainer.py`
+  - `training/liquid_model_trainer.py`
+  - `inference/model_router.py`
+  - `inference/explainer.py`
+- 数据库迁移升级为 Alembic：
+  - `backend/alembic.ini`
+  - `backend/alembic/env.py`
+  - `backend/alembic/versions/20260214_0001_v2_canonical_schema.py`
+  - `backend/alembic/versions/20260215_0002_eval_execution_risk.py`
+  - `backend/alembic/versions/20260215_0003_model_state_and_gate.py`
+  - `backend/alembic/versions/20260215_0004_data_quality_review_fields.py`
 
 ---
 
@@ -172,6 +237,9 @@ cd /home/admin/.openclaw/workspace/monitoring-system
 # 查看服务状态
 docker compose ps
 
+# 执行数据库迁移
+docker compose run --rm orchestrator
+
 # 查看日志
 docker compose logs -f backend
 
@@ -180,6 +248,15 @@ docker compose down
 
 # 重启服务
 docker compose restart [service_name]
+
+# 运行扩展版 V2 API 冒烟测试（17项）
+API_BASE=http://localhost:8000 ./scripts/test_v2_api.sh
+
+# 本地一键安装依赖并运行 backend 单元测试
+./scripts/dev_test.sh
+
+# 每周数据质量抽样（默认200条）并导出审计清单
+python3 scripts/data_quality_weekly_audit.py --api-base http://localhost:8000 --limit 200
 ```
 
 ---

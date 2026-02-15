@@ -1,554 +1,318 @@
 """
-Inference Service - GPU 0 (修复版)
-真正的实时推理服务
+Inference Service V2
+- Dual-track prediction routing
+- Prediction explanation persistence
 """
-import os
-import logging
+from __future__ import annotations
+
 import asyncio
-import torch
-import torch.nn as nn
-import numpy as np
-from typing import Dict, List, Optional
+import json
+import logging
+import os
 from datetime import datetime
+from typing import Dict, List, Optional
+import time
+
+import numpy as np
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from redis import Redis
-import json
+import redis
 
-# Configure logging
+from explainer import build_explanation
+from model_router import ModelRouter
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-GPU_DEVICE = int(os.getenv("GPU_DEVICE", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
-MODEL_DIR = "/app/models"
+LIQUID_SYMBOLS = [s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,AAPL,TSLA,NVDA,SPY").split(",") if s.strip()]
+INFER_INTERVAL_SEC = int(os.getenv("INFER_INTERVAL_SEC", "60"))
 
 
-class ImprovedModel(nn.Module):
-    """改进的LSTM模型（与训练服务一致）"""
-
-    def __init__(self, input_dim: int = 128, hidden_dim: int = 256, num_classes: int = 3, dropout: float = 0.3):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # LSTM层
-        self.lstm = nn.LSTM(
-            input_dim,
-            hidden_dim,
-            num_layers=2,
-            batch_first=True,
-            dropout=dropout,
-            bidirectional=False
-        )
-
-        # 分类头
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.fc2 = nn.Linear(hidden_dim // 2, num_classes)
-        self.dropout = nn.Dropout(dropout)
-        self.relu = nn.ReLU()
-        self.batchnorm = nn.BatchNorm1d(hidden_dim)
-
-    def forward(self, x):
-        """
-        Args:
-            x: (batch, seq_len, input_dim)
-        """
-        lstm_out, (h_n, c_n) = self.lstm(x)
-        last_hidden = lstm_out[:, -1, :]
-        last_hidden = self.batchnorm(last_hidden)
-        out = self.relu(self.fc1(last_hidden))
-        out = self.dropout(out)
-        out = self.fc2(out)
-        return out
-
-
-class PricePredictor:
-    """价格预测模型（修复版：加载真实训练好的模型）"""
-
-    def __init__(self, gpu_device: int = 0):
-        self.device = torch.device(f"cuda:{gpu_device}" if torch.cuda.is_available() else "cpu")
-        self.model = None
-        self.model_config = None
-        self.scenario_names = ["上涨", "盘整", "下跌"]
-        self.scenario_map = {0: "up", 1: "neutral", 2: "down"}
-        logger.info(f"🎮 Predictor initialized on device: {self.device}")
-
-    def load_model(self, symbol: str):
-        """
-        加载训练好的模型（修复版：真正从磁盘加载）
-
-        Args:
-            symbol: 要加载的模型对应的交易对/股票符号
-        """
-        model_path = os.path.join(MODEL_DIR, f"{symbol.lower()}_model.pth")
-
-        if not os.path.exists(model_path):
-            logger.warning(f"⚠️ Model file not found: {model_path}")
-            # 如果没有训练好的模型，使用初始化的模型
-            self.model_config = {
-                'input_dim': 128,
-                'hidden_dim': 256,
-                'num_classes': 3
-            }
-            self.model = ImprovedModel(**self.model_config).to(self.device)
-            self.model.eval()
-            return False
-
-        try:
-            checkpoint = torch.load(model_path, map_location=self.device)
-
-            # 加载配置
-            self.model_config = checkpoint.get('model_config', {
-                'input_dim': 128,
-                'hidden_dim': 256,
-                'num_classes': 3
-            })
-
-            # 创建模型
-            self.model = ImprovedModel(**self.model_config).to(self.device)
-
-            # 加载权重（修复：真正加载训练的权重）
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.model.eval()
-
-            epoch = checkpoint.get('epoch', 'unknown')
-            loss = checkpoint.get('loss', 'unknown')
-
-            logger.info(f"✅ Loaded model for {symbol} from {model_path}")
-            logger.info(f"   Epoch: {epoch}, Loss: {loss}")
-            logger.info(f"   Config: {self.model_config}")
-
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Failed to load model: {e}")
-            import traceback
-            traceback.print_exc()
-
-            # 失败时使用初始化模型
-            self.model_config = {
-                'input_dim': 128,
-                'hidden_dim': 256,
-                'num_classes': 3
-            }
-            self.model = ImprovedModel(**self.model_config).to(self.device)
-            self.model.eval()
-
-            return False
-
-    def predict(
-        self,
-        features: np.ndarray,
-        current_price: float,
-        symbol: str
-    ) -> Optional[Dict]:
-        """
-        生成预测（修复版：使用真实模型推理）
-
-        Args:
-            features: 特征向量（来自NIM embedding）
-            current_price: 当前价格
-            symbol: 交易对/股票符号
-
-        Returns:
-            预测结果字典
-        """
-        try:
-            # 确保模型已加载
-            if self.model is None:
-                logger.error(f"❌ Model not loaded for {symbol}")
-                return None
-
-            # 转换为张量
-            if features.ndim == 1:
-                features = features.reshape(1, 1, -1)
-            elif features.ndim == 2:
-                # 已经是 (batch, seq_len, features)
-                pass
-            elif features.ndim == 0:
-                # 单个特征
-                features = features.reshape(1, 1, -1)
-
-            features_tensor = torch.FloatTensor(features).to(self.device)
-
-            # 模型推理（修复：使用真实模型）
-            with torch.no_grad():
-                # 获取模型输出
-                logits = self.model(features_tensor)
-
-                # Softmax得到概率
-                probabilities = torch.softmax(logits, dim=-1)
-
-                # 获取预测结果
-                predicted_class = torch.argmax(probabilities, dim=-1).item()
-                confidence = probabilities[0, predicted_class].item()
-
-                # 映射场景
-                scenario_idx = predicted_class
-                scenario = self.scenario_names[scenario_idx]
-                direction = self.scenario_map[scenario_idx]
-
-                # 提取各场景概率
-                probs = {
-                    "up": probabilities[0, 0].item(),
-                    "neutral": probabilities[0, 1].item(),
-                    "down": probabilities[0, 2].item()
-                }
-
-                # 基于场景计算预期价格变化
-                # 这些变化范围应该基于历史数据优化，这里使用默认值
-                if direction == "up":
-                    base_change = 0.005 + (probs["up"] - 0.33) * 0.02  # 0.5% ~ 3.5%
-                    expected_direction = "up"
-                elif direction == "down":
-                    base_change = -0.005 - (probs["down"] - 0.33) * 0.02  # -0.5% ~ -3.5%
-                    expected_direction = "down"
-                else:
-                    base_change = 0
-                    expected_direction = "neutral"
-
-                # 添加一些随机性（模拟真实市场的不可预测性）
-                variability = base_change * 0.1  # 10%的波动
-                np_rng = np.random.default_rng()
-                expected_change_pct = base_change + np_rng.uniform(-variability, variability)
-
-                expected_price = current_price * (1 + expected_change_pct)
-
-            # 构建结果
-            result = {
-                "symbol": symbol,
-                "scenario": scenario,
-                "direction": direction,
-                "confidence": confidence,
-                "confidence_level": self._get_confidence_level(confidence),
-                "expected_change_pct": expected_change_pct,
-                "expected_price": round(expected_price, 2),
-                "scenario_probabilities": probs,
-                "current_price": current_price,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-
-            return result
-
-        except Exception as e:
-            logger.error(f"❌ Prediction failed for {symbol}: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-    def _get_confidence_level(self, confidence: float) -> str:
-        """根据置信度返回级别"""
-        if confidence >= 0.75:
-            return "high"
-        elif confidence >= 0.60:
-            return "medium"
-        else:
-            return "low"
-
-
-class InferenceService:
-    """主推理服务（修复版）"""
-
-    def __init__(self, gpu_device: int = 0):
-        self.predictor = PricePredictor(gpu_device)
-        self.models_loaded = set()
+class InferenceServiceV2:
+    def __init__(self):
+        self.router = ModelRouter()
         self.redis_client = None
-        self.postgres_conn = None
-        self.is_running = False
+        self.conn = None
+        self.active_model_cache: Dict[str, Dict[str, object]] = {}
+        self.active_model_ttl_sec = int(os.getenv("ACTIVE_MODEL_TTL_SEC", "30"))
 
-    def connect_redis(self):
-        """Connect to Redis"""
-        try:
-            self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-            self.redis_client.ping()
-            logger.info("✅ Connected to Redis")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to connect to Redis: {e}")
-            return False
+    def connect(self):
+        self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        self.conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-    def connect_postgres(self):
-        """Connect to PostgreSQL"""
-        try:
-            self.postgres_conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-            logger.info("✅ Connected to PostgreSQL")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to connect to PostgreSQL: {e}")
-            return False
-
-    def get_latest_features(self, symbol: str) -> Optional[np.ndarray]:
-        """
-        获取最新的特征向量（修复版：更好的查询）
-
-        Args:
-            symbol: 交易对/股票符号
-
-        Returns:
-            Numpy数组 or None
-        """
-        try:
-            cursor = self.postgres_conn.cursor()
-
-            # 查询最近6小时内的新闻embedding，取最新的一个
-            query = """
-                SELECT embedding, created_at
-                FROM nim_features
-                WHERE symbol = %s
-                  AND created_at > NOW() - make_interval(hours => 6)
-                ORDER BY created_at DESC
-                LIMIT 1
-            """
-            cursor.execute(query, (symbol,))
-            row = cursor.fetchone()
-
-            if row:
-                embedding_data = row['embedding']
-
-                if isinstance(embedding_data, str):
-                    embedding = np.array(json.loads(embedding_data), dtype=np.float32)
-                else:
-                    embedding = np.array(embedding_data, dtype=np.float32)
-
-                logger.info(f"✅ Retrieved features for {symbol} from {row['created_at']}")
-                return embedding
-            else:
-                logger.warning(f"⚠️ No features found for {symbol} in last 6 hours")
-                return None
-
-        except Exception as e:
-            logger.error(f"❌ Failed to retrieve features: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-    def get_current_price(self, symbol: str) -> Optional[float]:
-        """
-        获取当前价格（修复版：从数据库查询真实价格）
-
-        Args:
-            symbol: 交易对/股票符号
-
-        Returns:
-            价格 or None
-        """
-        try:
-            # 优先从Redis获取缓存
-            key = f"price:{symbol}"
-            if self.redis_client:
-                price_str = self.redis_client.get(key)
-                if price_str:
-                    price_data = json.loads(price_str)
-                    return float(price_data.get("price", 0))
-
-            # 如果Redis没有，从数据库查询
-            cursor = self.postgres_conn.cursor()
-
-            query = """
-                SELECT price, timestamp
+    def get_latest_price(self, symbol: str) -> Optional[Dict]:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT symbol, price::float AS price, volume::float AS volume, timestamp
                 FROM prices
-                WHERE symbol = %s
+                WHERE symbol = UPPER(%s)
                 ORDER BY timestamp DESC
                 LIMIT 1
-            """
-            cursor.execute(query, (symbol,))
-            row = cursor.fetchone()
+                """,
+                (symbol,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
 
-            if row:
-                price = float(row['price'])
-                # 缓存到Redis
-                if self.redis_client:
-                    self.redis_client.setex(
-                        key,
-                        60 * 5,  # 5分钟过期
-                        json.dumps({"price": price, "timestamp": row['timestamp'].isoformat()})
-                    )
-                return price
-            else:
-                logger.warning(f"⚠️ No price found for {symbol}")
-                return None
+    def get_latest_prices(self, symbols: List[str]) -> Dict[str, Dict]:
+        if not symbols:
+            return {}
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        symbol,
+                        price::float AS price,
+                        volume::float AS volume,
+                        timestamp,
+                        ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY timestamp DESC) AS rn
+                    FROM prices
+                    WHERE symbol = ANY(%s)
+                )
+                SELECT symbol, price, volume, timestamp
+                FROM ranked
+                WHERE rn = 1
+                """,
+                ([s.upper() for s in symbols],),
+            )
+            return {str(r["symbol"]).upper(): dict(r) for r in cur.fetchall()}
 
-        except Exception as e:
-            logger.error(f"❌ Failed to get price: {e}")
-            return None
+    def get_recent_prices(self, symbol: str, limit: int = 64) -> List[Dict]:
+        with self.conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT symbol, close::float AS price, volume::float AS volume, ts AS timestamp
+                    FROM market_bars
+                    WHERE symbol = UPPER(%s) AND timeframe = '5m'
+                    ORDER BY ts DESC
+                    LIMIT %s
+                    """,
+                    (symbol, limit),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+            except Exception:
+                rows = []
+            if rows:
+                return sorted(rows, key=lambda x: x["timestamp"])
 
-    def save_prediction(self, symbol: str, prediction: Dict):
-        """
-        保存预测到数据库
+            cur.execute(
+                """
+                SELECT symbol, price::float AS price, volume::float AS volume, timestamp
+                FROM prices
+                WHERE symbol = UPPER(%s)
+                ORDER BY timestamp DESC
+                LIMIT %s
+                """,
+                (symbol, limit),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            return sorted(rows, key=lambda x: x["timestamp"])
 
-        Args:
-            symbol: 交易对/股票符号
-            prediction: 预测结果字典
-        """
-        try:
-            cursor = self.postgres_conn.cursor()
+    def get_event_context(self, target: str, limit: int = 5) -> List[Dict]:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.occurred_at
+                FROM events e
+                LEFT JOIN event_links el ON el.event_id = e.id
+                LEFT JOIN entities en ON en.id = el.entity_id
+                WHERE en.symbol = UPPER(%s) OR en.name = %s
+                ORDER BY e.occurred_at DESC
+                LIMIT %s
+                """,
+                (target, target, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
 
-            insert_query = """
-                INSERT INTO predictions (
-                    symbol, scenario, direction, confidence,
-                    expected_change_pct, expected_price,
-                    scenario_probabilities, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """
+    def get_event_contexts(self, targets: List[str], limit_per_target: int = 5) -> Dict[str, List[Dict]]:
+        if not targets:
+            return {}
+        upper_targets = [t.upper() for t in targets]
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH linked AS (
+                    SELECT
+                        COALESCE(UPPER(en.symbol), en.name) AS target_key,
+                        e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.occurred_at,
+                        ROW_NUMBER() OVER (PARTITION BY COALESCE(UPPER(en.symbol), en.name) ORDER BY e.occurred_at DESC) AS rn
+                    FROM events e
+                    LEFT JOIN event_links el ON el.event_id = e.id
+                    LEFT JOIN entities en ON en.id = el.entity_id
+                    WHERE UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s)
+                )
+                SELECT target_key, id, event_type, title, source_url, confidence_score, occurred_at
+                FROM linked
+                WHERE rn <= %s
+                ORDER BY target_key, occurred_at DESC
+                """,
+                (upper_targets, targets, limit_per_target),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        grouped: Dict[str, List[Dict]] = {t: [] for t in upper_targets}
+        for r in rows:
+            key = str(r.pop("target_key")).upper()
+            grouped.setdefault(key, []).append(r)
+        return grouped
 
-            cursor.execute(insert_query, (
-                symbol,
-                prediction['scenario'],
-                prediction['direction'],
-                prediction['confidence'],
-                prediction['expected_change_pct'],
-                prediction['expected_price'],
-                json.dumps(prediction['scenario_probabilities']),
-                prediction['timestamp']
-            ))
+    def get_active_model(self, track: str) -> Dict[str, str]:
+        now = time.time()
+        cached = self.active_model_cache.get(track)
+        if cached and now - float(cached["loaded_at"]) <= self.active_model_ttl_sec:
+            return {"name": str(cached["name"]), "version": str(cached["version"])}
 
-            self.postgres_conn.commit()
-            logger.info(f"✅ Saved prediction for {symbol}")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to save prediction: {e}")
-            self.postgres_conn.rollback()
-
-    def publish_prediction(self, symbol: str, prediction: Dict):
-        """发布预测到Redis Streams"""
-
-        try:
-            stream_name = "prediction_stream"
-
-            self.redis_client.xadd(
-                stream_name,
-                {
-                    "symbol": symbol,
-                    "scenario": prediction['scenario'],
-                    "direction": prediction['direction'],
-                    "confidence": str(prediction['confidence']),
-                    "expected_change_pct": str(prediction['expected_change_pct']),
-                    "expected_price": str(prediction['expected_price']),
-                    "scenario_probabilities": json.dumps(prediction['scenario_probabilities']),
-                    "timestamp": prediction['timestamp']
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT active_model_name, active_model_version
+                FROM active_model_state
+                WHERE track = %s
+                """,
+                (track,),
+            )
+            row = cur.fetchone()
+            if not row:
+                result = {
+                    "name": "liquid_ttm_ensemble" if track == "liquid" else "vc_survival_ttm",
+                    "version": "v2.1",
                 }
-            )
-
-            logger.info(f"✅ Published prediction for {symbol} to stream")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to publish prediction: {e}")
-
-    def load_models_for_symbols(self, symbols: List[str]):
-        """批量加载模型"""
-        logger.info(f"🔄 Loading models for {len(symbols)} symbols...")
-        for symbol in symbols:
-            if self.predictor.load_model(symbol):
-                self.models_loaded.add(symbol)
-                logger.info(f"   ✅ {symbol}")
             else:
-                logger.warning(f"   ⚠️ {symbol} (using initialized model)")
+                result = {"name": row["active_model_name"], "version": row["active_model_version"]}
 
-        logger.info(f"✅ Loaded {len(self.models_loaded)}/{len(symbols)} models")
+            self.active_model_cache[track] = {
+                "name": result["name"],
+                "version": result["version"],
+                "loaded_at": now,
+            }
+            return result
 
-    async def process_symbol(self, symbol: str):
-        """处理单个符号的预测"""
-        # 获取当前价格
-        current_price = self.get_current_price(symbol)
-        if not current_price:
-            logger.warning(f"⚠️ No price available for {symbol}, skipping")
-            return
-
-        # 获取特征
-        features = self.get_latest_features(symbol)
-        if features is None:
-            # 如果没有特征，使用随机特征作为fallback
-            logger.warning(f"⚠️ No features available for {symbol}, using random embedding")
-            features = np.random.randn(128).astype(np.float32)
-
-        # 生成预测
-        prediction = self.predictor.predict(features, current_price, symbol)
-        if prediction:
-            # 保存到数据库
-            self.save_prediction(symbol, prediction)
-
-            # 发布到stream
-            if self.redis_client:
-                self.publish_prediction(symbol, prediction)
-
-            logger.info(
-                f"🎯 {symbol:6} | {prediction['scenario']:6} | "
-                f"Conf: {prediction['confidence']:.3f} | "
-                f"Change: {prediction['expected_change_pct']:+.2f}% | "
-                f"Price: {prediction['expected_price']:,.2f}"
+    def save_prediction_v2(self, track: str, target: str, score: float, confidence: float, outputs: Dict, explanation: Dict):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO predictions_v2 (track, target, score, confidence, outputs, created_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                RETURNING id
+                """,
+                (track, target, score, confidence, json.dumps(outputs)),
             )
+            prediction_id = cur.fetchone()["id"]
+            cur.execute(
+                """
+                INSERT INTO prediction_explanations (
+                    prediction_id, top_event_contributors, top_feature_contributors,
+                    evidence_links, model_version, feature_version, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (
+                    prediction_id,
+                    json.dumps(explanation.get("top_event_contributors", [])),
+                    json.dumps(explanation.get("top_feature_contributors", [])),
+                    json.dumps(explanation.get("evidence_links", [])),
+                    explanation.get("model_version", "v2"),
+                    explanation.get("feature_version", "feature-store-v2.0"),
+                ),
+            )
+        self.conn.commit()
+        return prediction_id
 
-        return prediction
+    def publish_signal(self, track: str, target: str, outputs: Dict):
+        if not self.redis_client:
+            return
+        self.redis_client.xadd(
+            "signal_stream",
+            {
+                "track": track,
+                "target": target,
+                "outputs": json.dumps(outputs),
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+        )
+
+    def run_vc_once(self):
+        targets = ["OpenAI", "Anthropic", "Scale AI"]
+        active_model = self.get_active_model("vc")
+        for name in targets:
+            event_ctx = self.get_event_context(name)
+            feature = np.array([len(event_ctx), sum(float(e.get("confidence_score", 0.5)) for e in event_ctx), 1.0, 0.5, 0.2], dtype=np.float32)
+            out = self.router.predict_vc(feature, model_name=active_model["name"])
+            confidence = 0.55 + min(0.35, len(event_ctx) * 0.05)
+
+            feature_contribs = [
+                {"feature": "event_count", "value": len(event_ctx), "contribution": round(len(event_ctx) * 0.1, 4)},
+                {
+                    "feature": "mean_event_confidence",
+                    "value": round(float(np.mean([e.get("confidence_score", 0.5) for e in event_ctx])) if event_ctx else 0.5, 4),
+                    "contribution": 0.05,
+                },
+            ]
+            exp = build_explanation(f"{active_model['name']}-{active_model['version']}", "feature-store-v2.0", event_ctx, feature_contribs)
+            score = float(out["p_next_round_12m"])
+            prediction_id = self.save_prediction_v2("vc", name, score, float(confidence), out, exp)
+            self.publish_signal("vc", name, {"prediction_id": prediction_id, **out})
+
+    def run_liquid_once(self):
+        active_model = self.get_active_model("liquid")
+        latest_map = self.get_latest_prices(LIQUID_SYMBOLS)
+        event_map = self.get_event_contexts(LIQUID_SYMBOLS, limit_per_target=8)
+        for symbol in LIQUID_SYMBOLS:
+            row = latest_map.get(symbol)
+            if not row:
+                continue
+            event_ctx = event_map.get(symbol, [])
+            price = float(row["price"])
+            volume = float(row.get("volume") or 0.0)
+            history = self.get_recent_prices(symbol, limit=64)
+            if len(history) >= 20:
+                prices = np.array([float(h.get("price") or price) for h in history], dtype=np.float64)
+                vols = np.array([float(h.get("volume") or 0.0) for h in history], dtype=np.float64)
+                ret_1 = float((prices[-1] - prices[-2]) / max(prices[-2], 1e-12))
+                ret_3 = float((prices[-1] - prices[-4]) / max(prices[-4], 1e-12))
+                ret_12 = float((prices[-1] - prices[-13]) / max(prices[-13], 1e-12))
+                log_rets = np.diff(np.log(np.clip(prices[-13:], 1e-12, None)))
+                vol_12 = float(np.std(log_rets))
+                vol_hist = vols[-13:-1]
+                vol_z = float((vols[-1] - np.mean(vol_hist)) / max(np.std(vol_hist), 1e-6))
+            else:
+                ret_1 = ret_3 = ret_12 = vol_12 = vol_z = 0.0
+            event_decay = float(np.exp(-min(1.0, len(event_ctx) / 10.0)))
+            feature = np.array(
+                [ret_1, ret_3, ret_12, vol_12, np.log1p(max(volume, 0.0)), vol_z, 0.0, event_decay],
+                dtype=np.float32,
+            )
+            out = self.router.predict_liquid(symbol, feature, model_name=active_model["name"])
+
+            feature_contribs = [
+                {"feature": "log_price", "value": round(float(feature[2]), 6), "contribution": 0.0},
+                {"feature": "log_volume", "value": round(float(feature[1]), 6), "contribution": 0.0},
+            ]
+            exp = build_explanation(f"{active_model['name']}-{active_model['version']}", "feature-store-v2.0", event_ctx, feature_contribs)
+            score = float(out["expected_return"])
+            pred_id = self.save_prediction_v2("liquid", symbol, score, float(out["signal_confidence"]), {**out, "symbol": symbol}, exp)
+            self.publish_signal("liquid", symbol, {"prediction_id": pred_id, **out, "symbol": symbol})
 
     async def run(self):
-        """运行推理服务"""
-        # 连接数据库
-        if not self.connect_redis() or not self.connect_postgres():
-            logger.error("❌ Failed to connect to databases, exiting")
-            return
-
-        # 要监控的符号
-        symbols = ["BTC", "ETH", "AAPL", "TSLA", "NVDA"]
-
-        # 加载模型
-        self.load_models_for_symbols(symbols)
-
-        self.is_running = True
-        logger.info("🚀 Inference service started")
-
-        try:
-            while self.is_running:
-                start_time = asyncio.get_event_loop().time()
-
-                predictions = []
-
-                for symbol in symbols:
-                    try:
-                        pred = await self.process_symbol(symbol)
-                        if pred:
-                            predictions.append(pred)
-                        await asyncio.sleep(0.1)
-                    except Exception as e:
-                        logger.error(f"❌ Error processing {symbol}: {e}")
-
-                # 计算耗时
-                elapsed = asyncio.get_event_loop().time() - start_time
-                logger.info(f"📊 Processed {len(predictions)} symbols in {elapsed:.2f}s")
-
-                # 等待下一轮
-                wait_time = max(0, 60 - elapsed)  # 目标60秒一轮
-                logger.info(f"⏳ Waiting {wait_time:.1f}s for next batch...")
-                await asyncio.sleep(wait_time)
-
-        except KeyboardInterrupt:
-            logger.info("🛑 Service stopped by user")
-        except Exception as e:
-            logger.error(f"❌ Service error: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.cleanup()
-
-    def cleanup(self):
-        """清理资源"""
-        self.is_running = False
-        if self.postgres_conn:
-            self.postgres_conn.close()
-        if self.redis_client:
-            self.redis_client.close()
-        logger.info("✅ Service cleaned up")
-
-
-async def main():
-    """主入口"""
-    service = InferenceService(gpu_device=GPU_DEVICE)
-    await service.run()
+        self.connect()
+        logger.info("inference-v2 started interval=%ss symbols=%s", INFER_INTERVAL_SEC, LIQUID_SYMBOLS)
+        while True:
+            try:
+                self.run_vc_once()
+                self.run_liquid_once()
+                await asyncio.sleep(INFER_INTERVAL_SEC)
+            except KeyboardInterrupt:
+                break
+            except Exception as exc:
+                logger.error("inference-v2 cycle failed: %s", exc)
+                await asyncio.sleep(10)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(InferenceServiceV2().run())

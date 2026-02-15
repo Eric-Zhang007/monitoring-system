@@ -9,6 +9,9 @@ import psycopg2
 from pgvector.psycopg2 import register_vector
 import numpy as np
 import logging
+import os
+import requests
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,9 @@ class NIMFeatureCache:
 
     def __init__(self, db_url: str):
         self.conn = psycopg2.connect(db_url)
+        with self.conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            self.conn.commit()
         register_vector(self.conn)
         self._ensure_table()
 
@@ -139,15 +145,40 @@ Extract key investment insights and output structured analysis results."""
         Call NIM to generate embedding vector
         Cost estimate: ~¥0.01 per call
         """
-        # TODO: Actual implementation with NVIDIA NIM API
-        # from nvidia import nim_sdk
-        # response = await nim_sdk.embed(prompt, model="nv-embed-v1")
-        # return response.embedding
+        endpoint = os.getenv("NIM_EMBED_ENDPOINT")
+        api_key = os.getenv("NIM_API_KEY")
+        model = os.getenv("NIM_EMBED_MODEL", "nv-embed-v1")
+        if endpoint:
+            try:
+                headers = {"Content-Type": "application/json"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                payload = {"input": prompt, "model": model}
+                resp = await asyncio.to_thread(
+                    requests.post,
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, dict):
+                    emb = data.get("embedding")
+                    if emb is None and isinstance(data.get("data"), list) and data["data"]:
+                        emb = data["data"][0].get("embedding")
+                    if isinstance(emb, list) and emb:
+                        if len(emb) >= 384:
+                            return [float(x) for x in emb[:384]]
+                        return [float(x) for x in emb] + [0.0] * (384 - len(emb))
+            except Exception as e:
+                logger.warning(f"NIM endpoint failed, fallback to deterministic local embedding: {e}")
 
-        # Mock implementation for MVP
-        # In production, this would call NIM on GPU 1
-        await asyncio.sleep(0.01)  # Simulate API call
-        return np.random.randn(384).tolist()
+        # deterministic fallback instead of random for reproducibility
+        await asyncio.sleep(0.005)
+        seed = int(hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8], 16)
+        rs = np.random.default_rng(seed)
+        return rs.standard_normal(384).astype(np.float32).tolist()
 
     def close(self):
         """Close database connection"""

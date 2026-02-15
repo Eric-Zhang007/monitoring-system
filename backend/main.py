@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from gpu_manager import GPUManager
 from nim_integration import get_nim_cache
 from redis_streams import get_redis_consumer
+from v2_router import router as v2_router
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import redis
@@ -88,6 +89,13 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _legacy_api_frozen():
+    raise HTTPException(
+        status_code=410,
+        detail="Legacy v1 endpoints are frozen. Use /api/v2/* endpoints only.",
+    )
+
+
 # 数据库连接函数
 def get_postgres():
     """获取PostgreSQL连接"""
@@ -140,7 +148,7 @@ async def broadcast_predictions():
     while True:
         try:
             # 读取最新的预测消息
-            messages = r.xrev(stream_name, count=10)
+            messages = r.xrevrange(stream_name, count=10)
 
             for msg_id, msg_data in messages:
                 try:
@@ -217,6 +225,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(v2_router)
 
 
 # ======================================
@@ -256,10 +265,10 @@ async def get_system_status():
         cursor.execute("SELECT COUNT(DISTINCT symbol) FROM prices WHERE timestamp > NOW() - INTERVAL '24 hours'")
         active_symbols = cursor.fetchone()['count'] or 0
 
-        cursor.execute("SELECT COUNT(*) FROM news WHERE created_at > NOW() - INTERVAL '24 hours'")
+        cursor.execute("SELECT COUNT(*) FROM events WHERE created_at > NOW() - INTERVAL '24 hours'")
         recent_news = cursor.fetchone()['count'] or 0
 
-        cursor.execute("SELECT COUNT(*) FROM predictions WHERE created_at > NOW() - INTERVAL '1 hour'")
+        cursor.execute("SELECT COUNT(*) FROM predictions_v2 WHERE created_at > NOW() - INTERVAL '1 hour'")
         recent_predictions = cursor.fetchone()['count'] or 0
 
         cursor.close()
@@ -296,6 +305,7 @@ async def get_predictions(
     symbol: str,
     hours: int = Query(default=24, ge=1, le=168, description="过去多少小时的预测")
 ):
+    _legacy_api_frozen()
     """
     获取预测数据（修复版：从数据库查询真实预测）
 
@@ -349,6 +359,7 @@ async def get_predictions(
 
 @app.get("/api/predictions/latest")
 async def get_latest_predictions():
+    _legacy_api_frozen()
     """获取所有符号的最新预测"""
     try:
         conn = get_postgres()
@@ -406,6 +417,7 @@ async def get_prices(
     symbol: str,
     hours: int = Query(default=24, ge=1, le=168, description="过去多少小时的价格")
 ):
+    _legacy_api_frozen()
     """
     获取价格历史（修复版：从数据库查询真实价格）
 
@@ -463,6 +475,7 @@ async def get_prices(
 
 @app.get("/api/prices/{symbol}/latest")
 async def get_latest_price(symbol: str):
+    _legacy_api_frozen()
     """获取最新价格"""
     try:
         r = get_redis()
@@ -515,6 +528,7 @@ async def get_news(
     symbol: Optional[str] = None,
     limit: int = Query(default=20, ge=1, le=100, description="返回数量")
 ):
+    _legacy_api_frozen()
     """
     获取新闻（修复版：从数据库查询真实新闻）
 
@@ -584,6 +598,7 @@ async def get_symbol_sentiment(
     symbol: str,
     hours: int = Query(default=24, ge=1, le=168)
 ):
+    _legacy_api_frozen()
     """
     获取符号的情感分析（修复版：从数据库查询真实情感）
 
@@ -656,6 +671,7 @@ async def get_symbol_sentiment(
 
 @app.get("/api/indicators/{symbol}")
 async def get_technical_indicators(symbol: str):
+    _legacy_api_frozen()
     """获取技术指标"""
     try:
         conn = get_postgres()
@@ -691,6 +707,16 @@ async def get_technical_indicators(symbol: str):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    await websocket.send_json(
+        {
+            "type": "error",
+            "status": 410,
+            "detail": "Legacy /ws endpoint is frozen. Use /stream/events|signals|risk.",
+        }
+    )
+    await websocket.close(code=1008)
+    return
     """WebSocket端点（修复版：真实数据推送）"""
     await manager.connect(websocket)
 
@@ -751,6 +777,60 @@ async def websocket_endpoint(websocket: WebSocket):
             elif data.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
 
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
+@app.websocket("/stream/events")
+async def websocket_events(websocket: WebSocket):
+    """V2 events stream channel."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            _ = await websocket.receive_text()
+            await websocket.send_json(
+                {
+                    "type": "events",
+                    "status": "subscribed",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            )
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
+@app.websocket("/stream/signals")
+async def websocket_signals(websocket: WebSocket):
+    """V2 signals stream channel."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            _ = await websocket.receive_text()
+            await websocket.send_json(
+                {
+                    "type": "signals",
+                    "status": "subscribed",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            )
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
+@app.websocket("/stream/risk")
+async def websocket_risk(websocket: WebSocket):
+    """V2 risk stream channel."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            _ = await websocket.receive_text()
+            await websocket.send_json(
+                {
+                    "type": "risk",
+                    "status": "subscribed",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            )
     except WebSocketDisconnect:
         manager.disconnect(websocket)
     except Exception as e:

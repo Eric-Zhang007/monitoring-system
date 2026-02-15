@@ -1,169 +1,148 @@
 """
-Data Collector - Collects news, prices, and market data
-Sends data to Redis Streams
+V2 Data Collector
+- Plugin-based connectors (GDELT / RSS / SEC)
+- Canonical event schema
+- Redis Streams as real-time buffer
 """
-import redis
+from __future__ import annotations
+
+import hashlib
 import json
-import time
 import logging
+import os
+import time
 from datetime import datetime
-import random
+from typing import Dict, List
+
+import redis
+
+from connectors import (
+    EarningsAlphaVantageConnector,
+    GDELTConnector,
+    MacroFREDConnector,
+    OnChainCoinGeckoConnector,
+    RSSConnector,
+    SECSubmissionsConnector,
+)
+from entity_linking import extract_entities
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
-class DataCollector:
-    """Data collector for news, prices, and other market data"""
-
+class DataCollectorV2:
     def __init__(self, redis_url: str = "redis://localhost:6379"):
         self.redis = redis.from_url(redis_url, decode_responses=True)
-        self.stream_names = {
-            'news': 'news_stream',
-            'price': 'price_stream'
-        }
+        self.event_stream = os.getenv("EVENT_STREAM", "event_stream")
+        self.news_stream = os.getenv("NEWS_STREAM", "news_stream")
 
-    def produce_news(self, news_data: dict):
-        """Send news to Redis Streams"""
-        try:
-            message_id = self.redis.xadd(self.stream_names['news'], news_data)
-            logger.info(f"📰 News sent: {message_id} - {news_data.get('title', 'N/A')}")
-            return message_id
-        except Exception as e:
-            logger.error(f"❌ Failed to send news: {e}")
-            return None
-
-    def produce_price(self, price_data: dict):
-        """Send price data to Redis Streams"""
-        try:
-            message_id = self.redis.xadd(self.stream_names['price'], price_data)
-            logger.info(f"💹 Price sent: {message_id} - {price_data.get('symbol', 'N/A')} = {price_data.get('price', 'N/A')}")
-            return message_id
-        except Exception as e:
-            logger.error(f"❌ Failed to send price: {e}")
-            return None
-
-    def collect_mock_news(self, count: int = 5):
-        """Collect mock news data (for MVP testing)"""
-        news_templates = [
-            {
-                "priority": "high",
-                "sentiment": "positive",
-                "title": "美联储暗示降息可能性增加"
-            },
-            {
-                "priority": "high",
-                "sentiment": "positive",
-                "title": "BTC 持续突破 $68,000"
-            },
-            {
-                "priority": "medium",
-                "sentiment": "negative",
-                "title": "某科技公司财报不及预期"
-            },
-            {
-                "priority": "low",
-                "sentiment": "neutral",
-                "title": "市场成交量温和上涨"
-            },
-            {
-                "priority": "high",
-                "sentiment": "negative",
-                "title": "欧盟通过新的加密货币监管法案"
-            }
+        rss_feeds = [
+            "https://feeds.finance.yahoo.com/rss/2.0/headline",
+            "https://www.prnewswire.com/rss/financial-services-latest-news/financial-services-latest-news-list.rss",
+        ]
+        sec_ciks = ["320193", "1045810", "789019"]  # Apple/NVDA/MSFT
+        alpha_key = os.getenv("ALPHAVANTAGE_API_KEY", "")
+        coingecko_ids = [
+            s.strip().lower()
+            for s in os.getenv("ONCHAIN_IDS", "bitcoin,ethereum,solana").split(",")
+            if s.strip()
         ]
 
-        symbols = ["BTC", "ETH", "AAPL", "TSLA", "SPY"]
-        collected = []
+        self.connectors = [
+            GDELTConnector(query="venture capital startup funding OR IPO", max_records=25),
+            RSSConnector(feeds=rss_feeds),
+            SECSubmissionsConnector(cik_list=sec_ciks),
+            MacroFREDConnector(),
+            OnChainCoinGeckoConnector(ids=coingecko_ids),
+        ]
+        if alpha_key:
+            self.connectors.append(EarningsAlphaVantageConnector(api_key=alpha_key, horizon=os.getenv("EARNINGS_HORIZON", "3month")))
 
-        for i in range(count):
-            template = random.choice(news_templates)
-            news = {
-                "title": template["title"],
-                "symbol": random.choice(symbols),
-                "priority": template["priority"],
-                "sentiment": template["sentiment"],
-                "time": datetime.utcnow().isoformat() + "Z",
-                "url": f"https://example.com/news/{i}",
-                "summary": template["title"]  # Using title as summary for MVP
-            }
+    def publish_event(self, event: Dict):
+        occurred_at = event["occurred_at"]
+        dedup_key = f"{event.get('source_name', '')}|{event.get('title', '').strip().lower()}|{event.get('source_url', '')}"
+        dedup_cluster_id = hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()[:24]
+        latency_ms = None
+        try:
+            latency_ms = int((datetime.utcnow() - datetime.fromisoformat(occurred_at.replace("Z", "+00:00")).replace(tzinfo=None)).total_seconds() * 1000)
+            if latency_ms < 0:
+                latency_ms = 0
+        except Exception:
+            latency_ms = None
 
-            self.produce_news(news)
-            collected.append(news)
+        enriched_entities = event.get("entities", []) or extract_entities(
+            event.get("title", ""),
+            str(event.get("payload", {}).get("summary", "")),
+        )
 
-        return collected
-
-    def collect_mock_price(self, symbols: list = None, count: int = 10):
-        """Collect mock price data (for MVP testing)"""
-        if not symbols:
-            symbols = ["BTC", "ETH", "AAPL", "TSLA", "SPY"]
-
-        base_prices = {
-            "BTC": 67890.0,
-            "ETH": 3450.0,
-            "AAPL": 185.0,
-            "TSLA": 235.0,
-            "SPY": 478.0
+        payload = {
+            "event_type": event["event_type"],
+            "title": event["title"],
+            "occurred_at": occurred_at,
+            "source_url": event.get("source_url") or "",
+            "source_name": event.get("source_name") or "",
+            "source_timezone": event.get("source_timezone", "UTC"),
+            "source_tier": str(event.get("source_tier", 3)),
+            "confidence_score": str(event.get("confidence_score", 0.5)),
+            "event_importance": str(event.get("event_importance", event.get("confidence_score", 0.5))),
+            "novelty_score": str(event.get("novelty_score", 0.5)),
+            "entity_confidence": str(event.get("entity_confidence", 0.5)),
+            "latency_ms": str(latency_ms or 0),
+            "dedup_cluster_id": event.get("dedup_cluster_id") or dedup_cluster_id,
+            "payload": json.dumps(event.get("payload", {}), ensure_ascii=False),
+            "entities": json.dumps(enriched_entities, ensure_ascii=False),
+            "ingested_at": datetime.utcnow().isoformat() + "Z",
         }
 
-        collected = []
+        self.redis.xadd(self.event_stream, payload)
 
-        for i in range(count):
-            symbol = random.choice(symbols)
-            base_price = base_prices[symbol]
-            price = base_price + random.uniform(-500, 500) if symbol in ["BTC", "ETH"] else base_price + random.uniform(-10, 10)
+        # Backward compatibility path for existing news consumers.
+        self.redis.xadd(
+            self.news_stream,
+            {
+                "title": event["title"],
+                "url": event.get("source_url") or "",
+                "symbol": "OTHER",
+                "priority": "medium",
+                "sentiment": "neutral",
+                "time": datetime.utcnow().isoformat() + "Z",
+                "summary": str(event.get("payload", {}))[:500],
+            },
+        )
 
-            price_data = {
-                "symbol": symbol,
-                "price": round(price, 2),
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "volume": random.randint(1000, 100000)
-            }
+    def run_once(self) -> int:
+        total = 0
+        for connector in self.connectors:
+            try:
+                raw_rows = connector.fetch()
+                logger.info("connector=%s fetched=%d", connector.name, len(raw_rows))
+                for raw in raw_rows:
+                    event = connector.normalize(raw)
+                    self.publish_event(event)
+                    total += 1
+            except Exception as exc:
+                logger.error("connector=%s failed: %s", connector.name, exc)
+        return total
 
-            self.produce_price(price_data)
-            collected.append(price_data)
-
-        return collected
-
-    def run(self, interval: int = 60):
-        """Run collector continuously"""
-        logger.info(f"🚀 Starting data collector (interval: {interval}s)")
-
+    def run(self, interval: int = 300):
+        logger.info("collector-v2 started interval=%ss", interval)
         while True:
             try:
-                logger.info("📥 Collecting data...")
-
-                # Collect news
-                news = self.collect_mock_news(count=5)
-                logger.info(f"✅ Collected {len(news)} news items")
-
-                # Collect prices
-                prices = self.collect_mock_price(count=10)
-                logger.info(f"✅ Collected {len(prices)} price items")
-
-                logger.info(f"⏳ Waiting {interval} seconds...")
+                sent = self.run_once()
+                logger.info("cycle published=%d", sent)
                 time.sleep(interval)
-
             except KeyboardInterrupt:
-                logger.info("🛑 Collector stopped by user")
+                logger.info("collector-v2 stopped")
                 break
-            except Exception as e:
-                logger.error(f"❌ Collector error: {e}")
-                time.sleep(10)  # Retry after 10 seconds
-
-    def close(self):
-        """Close Redis connection"""
-        if self.redis:
-            self.redis.close()
-            logger.info("✅ Collector connection closed")
+            except Exception as exc:
+                logger.error("collector-v2 cycle error: %s", exc)
+                time.sleep(30)
 
 
 if __name__ == "__main__":
-    collector = DataCollector()
-    try:
-        collector.run(interval=30)
-    except KeyboardInterrupt:
-        collector.close()
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+    interval = int(os.getenv("COLLECT_INTERVAL", "300"))
+    DataCollectorV2(redis_url=redis_url).run(interval=interval)

@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY collector.py .
+COPY . .
 
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python -c "import redis; r = redis.Redis('redis', 6379); r.ping()" || exit 1

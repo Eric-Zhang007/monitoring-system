@@ -6,6 +6,7 @@ import Dashboard from './components/Dashboard'
 import NewsSection from './components/NewsSection'
 import PredictionsSection from './components/PredictionsSection'
 import MonitorPanel from './components/MonitorPanel'
+import V2Lab from './components/V2Lab'
 import MobileNav from './components/MobileNav'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useColorScheme } from './contexts/ColorSchemeContext'
@@ -41,6 +42,7 @@ function App() {
   const navigationItems = [
     { id: 'dashboard', label: '仪表盘', icon: '📊' },
     { id: 'predictions', label: '预测分析', icon: '📈' },
+    { id: 'v2lab', label: 'V2实验台', icon: '🧪' },
     { id: 'news', label: '新闻资讯', icon: '📰' },
     { id: 'monitor', label: '系统监控', icon: '🔍' },
   ]
@@ -51,6 +53,8 @@ function App() {
         return <Dashboard activeSymbol={activeSymbol} onSymbolChange={setActiveSymbol} />
       case 'predictions':
         return <PredictionsSection symbol={activeSymbol} />
+      case 'v2lab':
+        return <V2Lab />
       case 'news':
         return <NewsSection />
       case 'monitor':

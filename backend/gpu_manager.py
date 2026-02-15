@@ -4,7 +4,10 @@ GPU Resource Manager (v3 - Fixed)
 - GPU 1: Training + Offline tasks (NIM feature extraction)
 - Includes system memory monitoring
 """
-import torch
+try:
+    import torch
+except Exception:
+    torch = None
 import pynvml
 import psutil
 from typing import Literal
@@ -76,6 +79,9 @@ class GPUManager:
 
     def clear_cache(self, device_id: int):
         """Clear GPU cache for specified device"""
+        if torch is None or not torch.cuda.is_available():
+            logger.info("Torch/CUDA unavailable, skip cache clear")
+            return
         try:
             with torch.cuda.device(device_id):
                 torch.cuda.empty_cache()

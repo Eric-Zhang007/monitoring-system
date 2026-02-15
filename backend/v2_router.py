@@ -122,6 +122,9 @@ def _risk_runtime_limits() -> Dict[str, float]:
     return {
         "max_daily_loss": float(os.getenv("RISK_MAX_DAILY_LOSS", "0.03")),
         "max_consecutive_losses": float(os.getenv("RISK_MAX_CONSECUTIVE_LOSSES", "5")),
+        "single_trade_stop_loss_pct": float(os.getenv("RISK_SINGLE_STOP_LOSS_PCT", "0.018")),
+        "single_trade_take_profit_pct": float(os.getenv("RISK_SINGLE_TAKE_PROFIT_PCT", "0.036")),
+        "intraday_drawdown_halt_pct": float(os.getenv("RISK_INTRADAY_DRAWDOWN_HALT_PCT", "0.05")),
     }
 
 
@@ -139,6 +142,45 @@ def _infer_daily_loss_ratio(track: str) -> float:
         if net_pnl >= 0 or gross_notional <= 1e-9:
             return 0.0
         return float(max(0.0, min(5.0, (-net_pnl) / gross_notional)))
+
+
+def _infer_latest_trade_edge_ratio(track: str, strategy_id: Optional[str] = None) -> float:
+    rows = repo.get_execution_edge_pnls(track=track, lookback_hours=24, limit=1, strategy_id=strategy_id)
+    if not rows:
+        return 0.0
+    edge = float(rows[0].get("edge_pnl") or 0.0)
+    notional = float(rows[0].get("notional") or 0.0)
+    if notional <= 1e-9:
+        return 0.0
+    return float(max(-5.0, min(5.0, edge / notional)))
+
+
+def _infer_intraday_drawdown_ratio(track: str, strategy_id: Optional[str] = None) -> float:
+    rows = repo.get_execution_edge_pnls(track=track, lookback_hours=24, limit=5000, strategy_id=strategy_id)
+    if not rows:
+        return 0.0
+
+    def _ts(row: Dict[str, Any]) -> float:
+        dt = row.get("created_at")
+        if isinstance(dt, datetime):
+            return float(dt.timestamp())
+        return 0.0
+
+    ordered = sorted(rows, key=_ts)
+    cumulative = 0.0
+    peak = 0.0
+    max_drawdown_amt = 0.0
+    gross_notional = 0.0
+    for row in ordered:
+        edge = float(row.get("edge_pnl") or 0.0)
+        notional = max(0.0, float(row.get("notional") or 0.0))
+        cumulative += edge
+        gross_notional += notional
+        peak = max(peak, cumulative)
+        max_drawdown_amt = max(max_drawdown_amt, peak - cumulative)
+    if gross_notional <= 1e-9:
+        return 0.0
+    return float(max(0.0, min(5.0, max_drawdown_amt / gross_notional)))
 
 
 def _execution_volatility_violations(orders: List[Dict[str, Any]]) -> List[str]:
@@ -2388,7 +2430,7 @@ async def check_backtest_paper_parity(payload: ParityCheckRequest):
 
 @router.get("/risk/limits", response_model=RiskLimitsResponse)
 async def get_risk_limits() -> RiskLimitsResponse:
-    limits = _risk_limits()
+    limits = {**_risk_limits(), **_risk_runtime_limits()}
     return RiskLimitsResponse(updated_at=datetime.utcnow(), **limits)
 
 
@@ -2407,13 +2449,32 @@ async def risk_check(payload: RiskCheckRequest) -> RiskCheckResponse:
     strategy_id = payload.strategy_id or "global"
     runtime_limits = _risk_runtime_limits()
     if payload.daily_loss > runtime_limits["max_daily_loss"]:
-        violations.append("daily_loss_exceeded")
+        if "daily_loss_exceeded" not in violations:
+            violations.append("daily_loss_exceeded")
         hard_block = True
     if payload.consecutive_losses > int(runtime_limits["max_consecutive_losses"]):
-        violations.append("consecutive_loss_exceeded")
+        if "consecutive_loss_exceeded" not in violations:
+            violations.append("consecutive_loss_exceeded")
+        hard_block = True
+    if payload.latest_trade_edge_ratio is not None:
+        latest_trade_edge = float(payload.latest_trade_edge_ratio)
+        if latest_trade_edge <= -float(runtime_limits["single_trade_stop_loss_pct"]):
+            if "single_trade_stop_loss_triggered" not in violations:
+                violations.append("single_trade_stop_loss_triggered")
+            hard_block = True
+        if latest_trade_edge >= float(runtime_limits["single_trade_take_profit_pct"]):
+            if "single_trade_take_profit_reached" not in violations:
+                violations.append("single_trade_take_profit_reached")
+    if payload.intraday_drawdown is not None and float(payload.intraday_drawdown) > float(runtime_limits["intraday_drawdown_halt_pct"]):
+        if "intraday_drawdown_halt" not in violations:
+            violations.append("intraday_drawdown_halt")
         hard_block = True
     if hard_block:
-        hard_reasons = [v for v in violations if v in {"drawdown_exceeded", "daily_loss_exceeded", "consecutive_loss_exceeded"}]
+        hard_reasons = [
+            v
+            for v in violations
+            if v in {"drawdown_exceeded", "daily_loss_exceeded", "consecutive_loss_exceeded", "single_trade_stop_loss_triggered", "intraday_drawdown_halt"}
+        ]
         hard_reason = hard_reasons[0] if hard_reasons else "risk_hard_block"
         scope_strategy = strategy_id if "consecutive_loss_exceeded" in violations else "global"
         repo.upsert_kill_switch_state(
@@ -2793,6 +2854,9 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
             )
         raise HTTPException(status_code=423, detail=f"risk_blocked:{','.join(precheck_violations)}")
     runtime_limits = _risk_runtime_limits()
+    max_strategy_streak = 0
+    pair_latest_edges: List[Tuple[str, str, float]] = []
+    pair_intraday_drawdowns: List[Tuple[str, str, float]] = []
     strategy_pairs = sorted(
         {
             (str(o.get("track") or "liquid"), str(o.get("strategy_id") or "default-liquid-v1"))
@@ -2805,6 +2869,9 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
             streak = int(repo.get_execution_consecutive_losses(track=pair_track, lookback_hours=24, limit=200, strategy_id=pair_strategy))
         except Exception:
             streak = 0
+        max_strategy_streak = max(max_strategy_streak, streak)
+        pair_latest_edges.append((pair_track, pair_strategy, _infer_latest_trade_edge_ratio(track=pair_track, strategy_id=pair_strategy)))
+        pair_intraday_drawdowns.append((pair_track, pair_strategy, _infer_intraday_drawdown_ratio(track=pair_track, strategy_id=pair_strategy)))
         if streak > int(runtime_limits["max_consecutive_losses"]):
             code = f"consecutive_loss_exceeded:{pair_strategy}"
             repo.upsert_kill_switch_state(
@@ -2823,6 +2890,18 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
                 payload={"decision_id": payload.decision_id, "streak": streak},
             )
             raise HTTPException(status_code=423, detail=f"risk_blocked:{code}")
+    if pair_latest_edges:
+        tp_track, tp_strategy, best_edge_ratio = max(pair_latest_edges, key=lambda x: x[2])
+        if best_edge_ratio >= float(runtime_limits["single_trade_take_profit_pct"]):
+            code = f"single_trade_take_profit_reached:{tp_strategy}"
+            repo.save_risk_event(
+                decision_id=f"risk-precheck-{uuid.uuid4().hex[:12]}",
+                severity="warning",
+                code=code,
+                message="execution take-profit precheck blocked",
+                payload={"decision_id": payload.decision_id, "edge_ratio": best_edge_ratio, "track": tp_track},
+            )
+            raise HTTPException(status_code=423, detail=f"risk_blocked:{code}")
     # enforce risk check before execution; execution is blocked if risk fails.
     inferred_positions = []
     for o in scaled_orders:
@@ -2834,13 +2913,17 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
         inferred_positions.append(RebalancePosition(target=str(o.get("target") or "").upper(), track=str(o.get("track") or "liquid"), weight=w))
     track = str(scaled_orders[0].get("track") or "liquid")
     realized_daily_loss = _infer_daily_loss_ratio(track=track)
+    worst_latest_edge_ratio = min((x[2] for x in pair_latest_edges), default=0.0)
+    max_intraday_drawdown = max((x[2] for x in pair_intraday_drawdowns), default=0.0)
     risk_resp = await risk_check(
         RiskCheckRequest(
             proposed_positions=inferred_positions,
             current_positions=[],
             realized_drawdown=0.0,
             daily_loss=realized_daily_loss,
-            consecutive_losses=0,
+            consecutive_losses=max_strategy_streak,
+            latest_trade_edge_ratio=worst_latest_edge_ratio,
+            intraday_drawdown=max_intraday_drawdown,
             strategy_id=str(scaled_orders[0].get("strategy_id") or "global"),
         )
     )

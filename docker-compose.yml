@@ -24,6 +24,8 @@ services:
   # FastAPI 后端服务
   backend:
     build: ./backend
+    command: >
+      sh -lc "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${BACKEND_UVICORN_WORKERS:-8}"
     ports:
       - "8000:8000"
     environment:
@@ -43,6 +45,9 @@ services:
       - RISK_MAX_DRAWDOWN=0.12
       - RISK_DRAWDOWN_WARN_THRESHOLD=0.08
       - RISK_DRAWDOWN_NEAR_LIMIT=0.10
+      - RISK_SINGLE_STOP_LOSS_PCT=0.018
+      - RISK_SINGLE_TAKE_PROFIT_PCT=0.036
+      - RISK_INTRADAY_DRAWDOWN_HALT_PCT=0.05
       - PARITY_RETURN_FLOOR=0.02
       - BACKTEST_GATE_INCLUDE_SOURCES=prod
       - BACKTEST_GATE_EXCLUDE_SOURCES=smoke,async_test,maintenance
@@ -58,6 +63,7 @@ services:
       - BITGET_API_KEY=
       - BITGET_API_SECRET=
       - BITGET_API_PASSPHRASE=
+      - BACKEND_UVICORN_WORKERS=8
     depends_on:
       - redis
       - postgres

@@ -177,6 +177,39 @@ def test_risk_check_runtime_limits_trigger_violation(monkeypatch):
     assert int(fake.last_upsert.get("duration_minutes") or 0) >= 1
 
 
+def test_risk_check_stop_loss_and_intraday_halt(monkeypatch):
+    class _FakeRepo:
+        def __init__(self):
+            self.last_upsert = {}
+
+        def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
+            return False
+
+        def upsert_kill_switch_state(self, *args, **kwargs):
+            self.last_upsert = kwargs
+            return {}
+
+        def save_risk_event(self, **kwargs):
+            return None
+
+    monkeypatch.setenv("RISK_SINGLE_STOP_LOSS_PCT", "0.01")
+    monkeypatch.setenv("RISK_INTRADAY_DRAWDOWN_HALT_PCT", "0.03")
+    fake = _FakeRepo()
+    monkeypatch.setattr(router_mod, "repo", fake)
+    payload = RiskCheckRequest(
+        proposed_positions=[RebalancePosition(target="BTC", track="liquid", weight=0.02)],
+        current_positions=[],
+        realized_drawdown=0.0,
+        latest_trade_edge_ratio=-0.02,
+        intraday_drawdown=0.05,
+    )
+    resp = asyncio.run(router_mod.risk_check(payload))
+    assert resp.approved is False
+    assert "single_trade_stop_loss_triggered" in resp.violations
+    assert "intraday_drawdown_halt" in resp.violations
+    assert fake.last_upsert.get("reason") == "single_trade_stop_loss_triggered"
+
+
 def test_risk_check_drawdown_near_limit_enforces_reduce_only(monkeypatch):
     class _FakeRepo:
         def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
@@ -235,6 +268,9 @@ def test_run_execution_blocks_on_abnormal_volatility(monkeypatch):
         def save_risk_event(self, **kwargs):
             return None
 
+        def get_execution_edge_pnls(self, track: str, lookback_hours: int, limit: int = 500, strategy_id: str | None = None):
+            return []
+
     monkeypatch.setattr(router_mod, "repo", _FakeRepo())
     monkeypatch.setenv("RISK_MAX_ABS_RETURN", "0.05")
     req = ExecuteOrdersRequest(decision_id="d1", adapter="paper", time_in_force="IOC", max_slippage_bps=10.0, venue="coinbase")
@@ -283,6 +319,9 @@ def test_run_execution_blocks_on_strategy_consecutive_losses(monkeypatch):
         def get_execution_consecutive_losses(self, track: str, lookback_hours: int = 24, limit: int = 200, strategy_id: str | None = None):
             return 3 if strategy_id == "strat-a" else 0
 
+        def get_execution_edge_pnls(self, track: str, lookback_hours: int, limit: int = 500, strategy_id: str | None = None):
+            return []
+
         def upsert_kill_switch_state(self, **kwargs):
             return {}
 
@@ -298,6 +337,43 @@ def test_run_execution_blocks_on_strategy_consecutive_losses(monkeypatch):
     except Exception as exc:
         assert getattr(exc, "status_code", None) == 423
         assert "risk_blocked:consecutive_loss_exceeded:strat-a" in str(getattr(exc, "detail", ""))
+
+
+def test_run_execution_blocks_on_take_profit_precheck(monkeypatch):
+    class _FakeRepo:
+        def is_kill_switch_triggered(self, track: str, strategy_id: str) -> bool:
+            return False
+
+        def fetch_orders_for_decision(self, decision_id: str, limit: int = 100):
+            return [{"id": 1, "target": "BTC", "track": "liquid", "side": "buy", "quantity": 1.0, "strategy_id": "strat-a", "metadata": {}}]
+
+        def get_model_rollout_state(self, track: str):
+            return {"stage_pct": 100}
+
+        def load_price_history(self, symbol: str, lookback_days: int = 90):
+            return [{"price": 100.0 + i * 0.01} for i in range(80)]
+
+        def get_execution_consecutive_losses(self, track: str, lookback_hours: int = 24, limit: int = 200, strategy_id: str | None = None):
+            return 0
+
+        def get_execution_edge_pnls(self, track: str, lookback_hours: int, limit: int = 500, strategy_id: str | None = None):
+            return [{"created_at": datetime.now(timezone.utc), "edge_pnl": 5.0, "notional": 100.0}]
+
+        def upsert_kill_switch_state(self, **kwargs):
+            return {}
+
+        def save_risk_event(self, **kwargs):
+            return None
+
+    monkeypatch.setenv("RISK_SINGLE_TAKE_PROFIT_PCT", "0.03")
+    monkeypatch.setattr(router_mod, "repo", _FakeRepo())
+    req = ExecuteOrdersRequest(decision_id="d1", adapter="paper", time_in_force="IOC", max_slippage_bps=10.0, venue="coinbase")
+    try:
+        asyncio.run(router_mod.run_execution(req))
+        assert False, "expected HTTPException"
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 423
+        assert "risk_blocked:single_trade_take_profit_reached:strat-a" in str(getattr(exc, "detail", ""))
 
 
 def test_opening_status_returns_remaining_seconds(monkeypatch):

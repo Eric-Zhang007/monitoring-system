@@ -248,6 +248,11 @@ class RiskLimitsResponse(BaseModel):
     max_realized_drawdown: float
     max_sector_exposure: float
     max_style_exposure: float
+    max_daily_loss: float
+    max_consecutive_losses: float
+    single_trade_stop_loss_pct: float
+    single_trade_take_profit_pct: float
+    intraday_drawdown_halt_pct: float
     updated_at: datetime
 
 
@@ -257,6 +262,8 @@ class RiskCheckRequest(BaseModel):
     realized_drawdown: float = Field(default=0.0, ge=0.0)
     daily_loss: float = Field(default=0.0, ge=0.0)
     consecutive_losses: int = Field(default=0, ge=0)
+    latest_trade_edge_ratio: Optional[float] = None
+    intraday_drawdown: Optional[float] = Field(default=None, ge=0.0)
     strategy_id: str = Field(default="global", min_length=1, max_length=64)
     max_sector_exposure_override: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     max_style_exposure_override: Optional[float] = Field(default=None, gt=0.0, le=1.0)

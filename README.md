@@ -1,28 +1,77 @@
 # 全网信息监测系统 - V2 双轨升级版（VC + Liquid）
 
 **完成日期：** 2026-02-14
-**项目状态：** ✅ 已完成 V2 核心重构，`liquid` 严格门禁当前已达标（可进入 2×A100 服务器阶段）
+**项目状态：** ⚠️ 已完成 V2 核心重构，但 `liquid` 在严格门禁（`Sharpe_daily >= 1.5`）下尚未达标（暂不进入 2×A100 切换）
 
 ---
 
-## 当前门禁快照（2026-02-15 11:26 UTC）
+## 当前门禁快照（2026-02-15 14:18 UTC）
 - 数据来源（strict, 生产口径过滤）：
   - `python3 scripts/evaluate_hard_metrics.py --track liquid --lookback-days 180 --score-source model --include-sources prod --exclude-sources smoke,async_test,maintenance --data-regimes prod_live`
   - `python3 scripts/check_backtest_paper_parity.py --track liquid --max-deviation 0.10 --min-completed-runs 5 --score-source model --include-sources prod --exclude-sources smoke,async_test,maintenance --data-regimes prod_live`
   - `python3 scripts/check_gpu_cutover_readiness.py`
 - 当前值：
-  - `Sharpe=1.694592`（通过阈值 `>1.5`）
-  - `MaxDD=0.000067`（通过阈值 `<0.12`）
+  - `Sharpe=0.45629`（未通过阈值 `>=1.5`）
+  - `MaxDD=0.000178`（通过阈值 `<0.12`）
   - `execution_reject_rate=0.00244`（通过阈值 `<1%`）
-  - `hard_passed=true`
-  - `parity_30d=passed`（`relative_deviation=0.014652`）
-  - `ready_for_gpu_cutover=true`
+  - `hard_passed=false`
+  - `parity_30d=passed`（`relative_deviation=0.017046`）
+  - `ready_for_gpu_cutover=false`（blocker: `hard_metrics_passed`）
 - 结论：
-  - 当前可启动 2×A100 服务器阶段（建议先维持 1-3 天低风险灰度观察）。
+  - 当前不应启动 2×A100 生产切换，仅建议继续 `paper + maintenance/prod_live` 校准迭代。
 
 ---
 
 ## V2 升级摘要（本次实现）
+
+### 2026-02-15 15:10 UTC 执行层风控规则化 + 服务器离线部署脚本（本轮）
+- 执行层风控新增硬规则（`backend/v2_router.py` + `backend/schemas_v2.py`）：
+  - `RISK_SINGLE_STOP_LOSS_PCT`（默认 `0.018`）
+  - `RISK_SINGLE_TAKE_PROFIT_PCT`（默认 `0.036`）
+  - `RISK_INTRADAY_DRAWDOWN_HALT_PCT`（默认 `0.05`）
+- `POST /api/v2/risk/check` 新增输入：
+  - `latest_trade_edge_ratio`
+  - `intraday_drawdown`
+- `POST /api/v2/execution/run` 现在在执行前会进行：
+  - 策略级连亏检查（既有）
+  - 单笔止损触发检查（新增）
+  - 单笔止盈触发检查（新增）
+  - 日内回撤熔断检查（新增）
+- `GET /api/v2/risk/limits` 返回项新增：
+  - `max_daily_loss`
+  - `max_consecutive_losses`
+  - `single_trade_stop_loss_pct`
+  - `single_trade_take_profit_pct`
+  - `intraday_drawdown_halt_pct`
+- 新增服务器离线部署脚本：
+  - `scripts/server_preflight.sh`
+  - `scripts/server_package_images.sh`
+  - `scripts/server_upload_bundle.sh`
+  - `scripts/server_seed_db.sh`
+  - `scripts/server_bootstrap.sh`
+  - `scripts/server_verify_runtime.sh`
+- 服务器准备详细步骤见：`SERVER_PREP_PLAN_ZH.md`。
+
+### 2026-02-15 14:18 UTC 并发重测与门禁纠偏（本轮）
+- 并发执行链路修复：
+  - `docker-compose.yml` 中 backend 改为 `uvicorn --workers ${BACKEND_UVICORN_WORKERS:-8}`。
+  - 新增 `scripts/restart_backend_high_cpu.sh`，可按 worker 数重启 backend 压满 CPU。
+  - `scripts/tune_liquid_strategy_grid.py` 新增并发与重试参数：
+    - `--parallelism`
+    - `--max-retries`
+    - `--retry-backoff-sec`
+- 一键验证脚本升级：
+  - `scripts/run_2025_2026_validation_bundle.sh` 改为 `perp/spot` 回测并行 + `perp/spot` 调参并行；
+  - 统一使用 `MIN_SHARPE_DAILY` 参数（默认 `1.5`）。
+- readiness 门禁纠偏：
+  - `scripts/check_gpu_cutover_readiness.py` 默认 `GPU_CUTOVER_MIN_SHARPE_DAILY` 上调至 `1.5`，避免低阈值误判绿灯。
+- 2025 全年结果（Bitget 实盘历史）：
+  - `perp`: `sharpe=-1.659584`, `pnl_after_cost=-0.022665`
+  - `spot`: `sharpe=-4.682518`, `pnl_after_cost=-0.040771`
+- 2025 至今严格门禁结果：
+  - `no_leakage=passed`
+  - `hard_metrics_420d=failed`（`sharpe_daily=-2.154071`）
+  - `gpu_cutover_readiness_180d=false`（严格阈值下 blocker 为 `hard_metrics_passed`）
 
 ### 2026-02-15 P0 稳定化（本轮完善）
 - 默认资产域收敛为加密中频：`LIQUID_SYMBOLS` 默认改为 `BTC,ETH,SOL`（`docker-compose` / `inference` / `training` / `backtest` 默认目标）。
@@ -585,17 +634,17 @@ python3 scripts/optuna_liquid_hpo.py \
 ---
 
 **报告生成时间：** 2026-02-15（持续更新）
-**状态：** 主链路可用但 `liquid` 门禁未达标；当前建议仅 `paper` 运行，待 hard-metrics 与 parity 连续窗口转绿后再灰度实盘。
+**状态：** 主链路可用但 `liquid` 严格门禁未达标；当前建议仅 `paper` 运行，待 `Sharpe_daily >= 1.5` 连续窗口转绿后再灰度实盘。
 
 <!-- AUTO_STATUS_SNAPSHOT:BEGIN -->
-### Auto Snapshot (2026-02-15 11:26 UTC)
+### Auto Snapshot (2026-02-15 14:18 UTC)
 - track: `liquid`
 - score_source: `model`
-- sharpe: `-18.582877`
-- max_drawdown: `0.002762`
+- sharpe: `0.45629`
+- max_drawdown: `0.000178`
 - execution_reject_rate: `0.00244`
 - hard_passed: `false`
-- parity_status: `insufficient_observation`
-- parity_matched_targets: `0`
-- parity_paper_filled_orders: `0`
+- parity_status: `passed`
+- parity_matched_targets: `3`
+- parity_paper_filled_orders: `1373`
 <!-- AUTO_STATUS_SNAPSHOT:END -->

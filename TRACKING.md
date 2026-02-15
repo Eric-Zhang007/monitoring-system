@@ -1,22 +1,101 @@
 # 代码追踪与问题清单
 
-## 📌 当前总览（截至 2026-02-15 11:26 UTC）
+## 📌 当前总览（截至 2026-02-15 15:10 UTC）
 
 1. **已完成**
 - V2 主链路、执行/风控/治理/监控闭环已具备；
-- `run_source` 样本隔离已落地，smoke/async 样本不再污染门禁；
+- `run_source` 样本隔离已落地（`prod/maintenance/smoke/async_test`）；
 - supersede 治理已落地，历史 artifact 失败样本可审计排除；
-- 拒单率已压到 `<1%`（当前评估窗口约 `0.0%`）。
+- 并发回测链路已打通：`backend` 改为多 `uvicorn workers` + 调参脚本并发重试；
+- 执行层规则化风控已扩展：单笔止损/止盈 + 日内回撤熔断；
+- 服务器离线部署脚本链路已补齐（预检/打包/上传/DB恢复/启动验收）。
 
 2. **门禁状态**
-- `hard_metrics=passed`（`sharpe_daily=1.694592`, `max_drawdown=0.000067`, `execution_reject_rate=0.00244`）；
-- `parity_30d=passed`（`relative_deviation=0.014652`）；
-- `strict_contract_passed=true`（`valid_contract_rows=102`）；
-- `ready_for_gpu_cutover=true`。
+- 严格口径（`prod + model + prod_live + lookback 180d`）：
+  - `hard_metrics=failed`（`sharpe_daily=0.45629 < 1.5`）；
+  - `max_drawdown=0.000178`（通过）；
+  - `execution_reject_rate=0.00244`（通过）；
+  - `parity_30d=passed`（`relative_deviation=0.017046`）；
+  - `strict_contract_passed=true`；
+  - `ready_for_gpu_cutover=false`（blocker: `hard_metrics_passed`）。
+- 2025 全年实盘历史回测（Bitget）：
+  - `perp`: `sharpe=-1.659584`, `pnl_after_cost=-0.022665`；
+  - `spot`: `sharpe=-4.682518`, `pnl_after_cost=-0.040771`。
 
 3. **上线判定**
-- 可进入 AutoDL `2×A100` 阶段；
-- 建议先进行 1-3 天低风险灰度（保持 gate 与 supersede 清理节奏）。
+- 当前不满足“严格 Sharpe≥1.5”硬门禁，暂不进入 AutoDL `2×A100` 生产切换；
+- 仅建议继续 `paper + maintenance/prod_live` 校准与训练迭代。
+
+## ✅ 2026-02-15 15:10 UTC 执行层风控与服务器部署准备（本轮）
+
+1. **执行层规则化风控落地**
+- `backend/v2_router.py`：
+  - `_risk_runtime_limits` 新增 `single_stop_loss / single_take_profit / intraday_drawdown_halt` 三项阈值；
+  - 新增 `_infer_latest_trade_edge_ratio` 与 `_infer_intraday_drawdown_ratio`；
+  - `risk_check` 支持并执行：
+    - `single_trade_stop_loss_triggered`（硬阻断）
+    - `single_trade_take_profit_reached`（执行阻断）
+    - `intraday_drawdown_halt`（硬阻断）
+  - `execution/run` 在执行前接入上述检查并在触发时返回 `423 risk_blocked:*`。
+- `backend/schemas_v2.py`：
+  - `RiskCheckRequest` 新增 `latest_trade_edge_ratio`、`intraday_drawdown`；
+  - `RiskLimitsResponse` 新增 runtime 风控阈值字段。
+- `docker-compose.yml`：
+  - backend 默认新增：
+    - `RISK_SINGLE_STOP_LOSS_PCT=0.018`
+    - `RISK_SINGLE_TAKE_PROFIT_PCT=0.036`
+    - `RISK_INTRADAY_DRAWDOWN_HALT_PCT=0.05`
+
+2. **测试结果**
+- `docker compose exec -T backend pytest -q tests/test_v2_router_core.py tests/test_strategy_position_sizing.py`
+  - 结果：`19 passed, 2 warnings`
+- 新增/扩展测试覆盖：
+  - `test_risk_check_stop_loss_and_intraday_halt`
+  - `test_run_execution_blocks_on_take_profit_precheck`
+  - 原有 `run_execution` 相关 fake repo 已兼容新增查询逻辑。
+
+3. **服务器离线部署链路脚本新增**
+- `scripts/server_preflight.sh`：部署前资源与依赖检查（docker/compose/磁盘/内存/GPU可选）。
+- `scripts/server_package_images.sh`：构建并导出镜像包 + 运行配置打包。
+- `scripts/server_upload_bundle.sh`：通过 SSH/SCP 上传 bundle（可附带 DB dump）。
+- `scripts/server_seed_db.sh`：`pg_dump` 导出与 `pg_restore` 导入。
+- `scripts/server_bootstrap.sh`：服务器侧解包、`docker load`、`compose up`、`alembic upgrade`、可选 DB 导入。
+- `scripts/server_verify_runtime.sh`：服务健康与核心 API 可用性验收。
+- 所有新增脚本已通过：`bash -n` 语法检查。
+
+## ✅ 2026-02-15 14:18 UTC 并发重测与门禁纠偏（本轮）
+
+1. **并发执行链路修复**
+- `docker-compose.yml`：
+  - backend 启动改为 `uvicorn --workers ${BACKEND_UVICORN_WORKERS:-8}`；
+  - 新增环境变量 `BACKEND_UVICORN_WORKERS`（默认 `8`）。
+- 新增 `scripts/restart_backend_high_cpu.sh`：
+  - 一键按指定 worker 数重启 backend（用于压满本地 CPU）。
+- `scripts/tune_liquid_strategy_grid.py`：
+  - 新增 `--parallelism`；
+  - 新增 `--max-retries`、`--retry-backoff-sec`，减少高并发 ReadTimeout 对结果污染。
+
+2. **批量验证脚本升级**
+- `scripts/run_2025_2026_validation_bundle.sh`：
+  - 2025 回测改为 `perp/spot` 并行执行；
+  - 2025 调参改为 `perp/spot` 并行执行；
+  - 门禁阈值参数化：`MIN_SHARPE_DAILY`（默认 `1.5`）。
+
+3. **readiness 假绿灯纠偏**
+- `scripts/check_gpu_cutover_readiness.py`：
+  - 默认 `GPU_CUTOVER_MIN_SHARPE_DAILY` 从 `0.4` 上调到 `1.5`；
+  - 与“2025至今硬门禁”口径一致，避免低阈值导致误判可上线。
+
+4. **本轮结果归档（用户手动执行）**
+- 结果目录：`artifacts/manual_runs/run_20260215`
+- 关键文件：
+  - `01a_bitget_2025_perp.jsonl`
+  - `01b_bitget_2025_spot.jsonl`
+  - `02a_tune_2025_perp.json`
+  - `02b_tune_2025_spot.json`
+  - `03_no_leakage_420d.json`
+  - `04_hard_metrics_420d.json`
+  - `05_gpu_cutover_readiness_180d.json`
 
 ## ✅ 2026-02-15 11:26 UTC 达标收敛（本轮）
 
@@ -762,14 +841,14 @@ CREATE OR REPLACE FUNCTION generate_training_samples(...);
 - 当前是否可上实盘，统一以本文件顶部“当前总览”和 `README.md` 顶部“当前门禁快照”为准。
 
 <!-- AUTO_STATUS_SNAPSHOT:BEGIN -->
-### Auto Snapshot (2026-02-15 11:26 UTC)
+### Auto Snapshot (2026-02-15 14:18 UTC)
 - track: `liquid`
 - score_source: `model`
-- sharpe: `-18.582877`
-- max_drawdown: `0.002762`
+- sharpe: `0.45629`
+- max_drawdown: `0.000178`
 - execution_reject_rate: `0.00244`
-- hard_passed: `false`
-- parity_status: `insufficient_observation`
-- parity_matched_targets: `0`
-- parity_paper_filled_orders: `0`
+- hard_passed: `false` (threshold `min_sharpe_daily=1.5`)
+- parity_status: `passed`
+- parity_matched_targets: `3`
+- parity_paper_filled_orders: `1373`
 <!-- AUTO_STATUS_SNAPSHOT:END -->

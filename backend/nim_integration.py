@@ -6,12 +6,16 @@ NIM Integration - Offline Feature Extraction + Online Cache (Fixed v3)
 """
 import asyncio
 import psycopg2
-from pgvector.psycopg2 import register_vector
 import numpy as np
 import logging
 import os
 import requests
 import hashlib
+
+try:
+    from pgvector.psycopg2 import register_vector  # type: ignore
+except Exception:  # pragma: no cover - optional dependency in non-pgvector environments
+    register_vector = None
 
 logger = logging.getLogger(__name__)
 
@@ -26,25 +30,47 @@ class NIMFeatureCache:
 
     def __init__(self, db_url: str):
         self.conn = psycopg2.connect(db_url)
+        self.vector_enabled = False
+        self.vector_adapter_ready = False
+        self.vector_column_type = "double precision[]"
         with self.conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            self.conn.commit()
-        register_vector(self.conn)
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                self.conn.commit()
+                self.vector_enabled = True
+                self.vector_column_type = "vector(384)"
+            except Exception as exc:
+                self.conn.rollback()
+                logger.warning("pgvector extension unavailable, fallback to float8[]: %s", exc)
+        if self.vector_enabled and register_vector is not None:
+            try:
+                register_vector(self.conn)
+                self.vector_adapter_ready = True
+            except Exception as exc:
+                logger.warning("pgvector adapter register failed, use text cast fallback: %s", exc)
         self._ensure_table()
 
     def _ensure_table(self):
         """Ensure PGVector table exists (FIXED: added last_news_time)"""
         with self.conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS semantic_features (
                     symbol VARCHAR(20) PRIMARY KEY,
-                    feature_vector vector(384),
+                    feature_vector {self.vector_column_type},
                     timestamp TIMESTAMP DEFAULT NOW(),
                     last_news_time TIMESTAMP,  -- ✅ NEW: Last news timestamp
                     news_count INTEGER
                 )
             """)
             self.conn.commit()
+
+    def _adapt_feature_vector(self, feature_vector: list):
+        vals = [float(x) for x in feature_vector]
+        if not self.vector_enabled:
+            return vals
+        if self.vector_adapter_ready:
+            return vals
+        return "[" + ",".join(f"{x:.8f}" for x in vals) + "]"
 
     async def offline_extraction(self, symbol: str, news_items: list):
         """
@@ -80,7 +106,7 @@ class NIMFeatureCache:
                         news_count = EXCLUDED.news_count
                 """, (
                     symbol,
-                    feature_vector,
+                    self._adapt_feature_vector(feature_vector),
                     filtered_news[0].get('time'),
                     len(filtered_news)
                 ))

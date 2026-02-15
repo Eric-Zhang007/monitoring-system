@@ -70,6 +70,11 @@
 - `torchrun --standalone --nproc_per_node=2 training/main.py`（`TRAIN_ENABLE_VC=0 TRAIN_ENABLE_LIQUID=0`）通过；
 - `python3 scripts/train_gpu_stage2.py --compute-tier a100x2 --nproc-per-node 2 --enable-vc --enable-liquid` 返回 `status=ok`；
 - `training/feature_pipeline.py` 已修复 `prices` 表缺失兼容：fallback 不再抛异常，改为安全返回 `source_used='none'` 并触发数据质量阻断。
+- `backend/nim_integration.py` 已改为 pgvector 可选：缺失扩展时自动降级 `feature_vector` 到 `double precision[]`，避免 backend 启动失败。
+- 服务器已启三条 `screen`：
+  - `backend`：`uvicorn` 无 Docker 启动，`/health` 返回 healthy；
+  - `collector`：事件采集已持续入库（可见 `POST /api/v2/ingest/events 200`）；
+  - `trainer`：双卡训练循环已启动，当前因 `market_bars` 样本不足被数据质量门阻断（符合预期保护逻辑）。
 
 ## ✅ 2026-02-15 15:10 UTC 执行层风控与服务器部署准备（本轮）
 

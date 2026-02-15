@@ -113,6 +113,8 @@ def test_extended_request_models():
     assert run_bitget.adapter == "bitget_live"
     bt = BacktestRunRequest(track="liquid", targets=["BTC"])
     assert bt.run_source == "prod"
+    assert bt.alignment_mode == "strict_asof"
+    assert bt.alignment_version == "strict_asof_v1"
 
 
 def test_risk_check_kill_switch_violation_code_is_consistent(monkeypatch):

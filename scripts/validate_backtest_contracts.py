@@ -74,6 +74,8 @@ def _validate_metrics(metrics: Dict[str, Any]) -> List[str]:
         "per_target",
         "cost_breakdown",
         "lineage_coverage",
+        "alignment_audit",
+        "leakage_checks",
     ]
     missing = [k for k in required if k not in (metrics or {})]
     if str((metrics or {}).get("status") or "").lower() != "completed":
@@ -84,6 +86,14 @@ def _validate_metrics(metrics: Dict[str, Any]) -> List[str]:
                 missing.append("observation_days_positive")
         except Exception:
             missing.append("observation_days_positive")
+    lck = (metrics or {}).get("leakage_checks") if isinstance(metrics, dict) else None
+    if not isinstance(lck, dict):
+        missing.append("leakage_checks_dict")
+    else:
+        if int(lck.get("leakage_violations", 0) or 0) > 0:
+            missing.append("leakage_violations_zero")
+        if not bool(lck.get("passed", False)):
+            missing.append("leakage_checks_passed")
     return missing
 
 
@@ -96,6 +106,8 @@ def main() -> int:
     ap.add_argument("--include-sources", default="prod")
     ap.add_argument("--exclude-sources", default="smoke,async_test,maintenance")
     ap.add_argument("--data-regimes", default="prod_live")
+    ap.add_argument("--include-superseded", action="store_true")
+    ap.add_argument("--include-noncompleted", action="store_true")
     ap.add_argument("--enforce", action="store_true")
     ap.add_argument("--min-valid", type=int, default=20)
     args = ap.parse_args()
@@ -103,6 +115,9 @@ def main() -> int:
     include_sources = _parse_sources(args.include_sources)
     exclude_sources = _parse_sources(args.exclude_sources)
     data_regimes = _parse_regimes(args.data_regimes)
+
+    supersede_filter = "" if args.include_superseded else " AND superseded_by_run_id IS NULL "
+    completed_filter = "" if args.include_noncompleted else " AND COALESCE(metrics->>'status','')='completed' "
 
     sql = (
         "SELECT id::text, COALESCE(run_source,'prod'), "
@@ -114,6 +129,8 @@ def main() -> int:
         f"AND created_at > NOW() - make_interval(days => {int(args.lookback_days)}) "
         + _sql_source_filters(include_sources, exclude_sources)
         + _sql_regime_filter(data_regimes)
+        + supersede_filter
+        + completed_filter
         + f" AND COALESCE(config->>'score_source','heuristic')='{args.score_source}' "
         "ORDER BY created_at DESC "
         f"LIMIT {max(1, int(args.limit))};"
@@ -125,7 +142,8 @@ def main() -> int:
         f"WHERE track='{str(args.track).strip().lower()}' "
         f"AND created_at > NOW() - make_interval(days => {int(args.lookback_days)}) "
         "AND COALESCE(run_source,'prod')='prod' "
-        f"AND COALESCE(config->>'score_source','heuristic')='{args.score_source}' "
+        + supersede_filter
+        + f"AND COALESCE(config->>'score_source','heuristic')='{args.score_source}' "
         "AND COALESCE(NULLIF(config->>'data_regime',''),'missing')='missing';"
     )
     raw_shadow = _run_psql(sql_shadow)

@@ -73,7 +73,7 @@ class InferenceServiceV2:
             conf = float(e.get("confidence_score") or 0.0)
             if tier > max_tier or conf < min_conf:
                 continue
-            ts = e.get("occurred_at")
+            ts = e.get("available_at") or e.get("occurred_at")
             if isinstance(ts, datetime):
                 ts_utc = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
             else:
@@ -255,18 +255,33 @@ class InferenceServiceV2:
 
     def get_event_context(self, target: str, limit: int = 5) -> List[Dict]:
         with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at
-                FROM events e
-                LEFT JOIN event_links el ON el.event_id = e.id
-                LEFT JOIN entities en ON en.id = el.entity_id
-                WHERE en.symbol = UPPER(%s) OR en.name = %s
-                ORDER BY e.occurred_at DESC
-                LIMIT %s
-                """,
-                (target, target, limit),
-            )
+            try:
+                cur.execute(
+                    """
+                    SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier,
+                           e.occurred_at, e.available_at, e.market_scope
+                    FROM events e
+                    LEFT JOIN event_links el ON el.event_id = e.id
+                    LEFT JOIN entities en ON en.id = el.entity_id
+                    WHERE en.symbol = UPPER(%s) OR en.name = %s
+                    ORDER BY COALESCE(e.available_at, e.occurred_at) DESC
+                    LIMIT %s
+                    """,
+                    (target, target, limit),
+                )
+            except Exception:
+                cur.execute(
+                    """
+                    SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at
+                    FROM events e
+                    LEFT JOIN event_links el ON el.event_id = e.id
+                    LEFT JOIN entities en ON en.id = el.entity_id
+                    WHERE en.symbol = UPPER(%s) OR en.name = %s
+                    ORDER BY e.occurred_at DESC
+                    LIMIT %s
+                    """,
+                    (target, target, limit),
+                )
             return [dict(r) for r in cur.fetchall()]
 
     def get_event_contexts(self, targets: List[str], limit_per_target: int = 5) -> Dict[str, List[Dict]]:
@@ -274,30 +289,93 @@ class InferenceServiceV2:
             return {}
         upper_targets = [t.upper() for t in targets]
         with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH linked AS (
-                    SELECT
-                        COALESCE(UPPER(en.symbol), en.name) AS target_key,
-                        e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at,
-                        ROW_NUMBER() OVER (PARTITION BY COALESCE(UPPER(en.symbol), en.name) ORDER BY e.occurred_at DESC) AS rn
-                    FROM events e
-                    LEFT JOIN event_links el ON el.event_id = e.id
-                    LEFT JOIN entities en ON en.id = el.entity_id
-                    WHERE UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s)
+            try:
+                cur.execute(
+                    """
+                    WITH linked AS (
+                        SELECT
+                            COALESCE(UPPER(en.symbol), en.name) AS target_key,
+                            e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier,
+                            e.occurred_at, e.available_at, e.market_scope,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY COALESCE(UPPER(en.symbol), en.name)
+                                ORDER BY COALESCE(e.available_at, e.occurred_at) DESC
+                            ) AS rn
+                        FROM events e
+                        LEFT JOIN event_links el ON el.event_id = e.id
+                        LEFT JOIN entities en ON en.id = el.entity_id
+                        WHERE UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s)
+                    )
+                    SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at, available_at, market_scope
+                    FROM linked
+                    WHERE rn <= %s
+                    ORDER BY target_key, COALESCE(available_at, occurred_at) DESC
+                    """,
+                    (upper_targets, targets, limit_per_target),
                 )
-                SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at
-                FROM linked
-                WHERE rn <= %s
-                ORDER BY target_key, occurred_at DESC
-                """,
-                (upper_targets, targets, limit_per_target),
-            )
-            rows = [dict(r) for r in cur.fetchall()]
+                rows = [dict(r) for r in cur.fetchall()]
+            except Exception:
+                cur.execute(
+                    """
+                    WITH linked AS (
+                        SELECT
+                            COALESCE(UPPER(en.symbol), en.name) AS target_key,
+                            e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY COALESCE(UPPER(en.symbol), en.name)
+                                ORDER BY e.occurred_at DESC
+                            ) AS rn
+                        FROM events e
+                        LEFT JOIN event_links el ON el.event_id = e.id
+                        LEFT JOIN entities en ON en.id = el.entity_id
+                        WHERE UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s)
+                    )
+                    SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at
+                    FROM linked
+                    WHERE rn <= %s
+                    ORDER BY target_key, occurred_at DESC
+                    """,
+                    (upper_targets, targets, limit_per_target),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
         grouped: Dict[str, List[Dict]] = {t: [] for t in upper_targets}
         for r in rows:
             key = str(r.pop("target_key")).upper()
             grouped.setdefault(key, []).append(r)
+        # Fan-out global macro/policy events to all liquid targets so the model sees
+        # centralized shocks even when no direct symbol entity link exists.
+        with self.conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT id, event_type, title, source_url, confidence_score, source_tier, occurred_at, available_at, market_scope
+                    FROM events
+                    WHERE market_scope = 'macro'
+                       OR COALESCE(payload->>'global_impact', 'false') = 'true'
+                    ORDER BY COALESCE(available_at, occurred_at) DESC
+                    LIMIT %s
+                    """,
+                    (max(1, limit_per_target),),
+                )
+                global_rows = [dict(r) for r in cur.fetchall()]
+            except Exception:
+                global_rows = []
+        if global_rows:
+            for tgt in upper_targets:
+                seen = {int(x.get("id") or 0) for x in grouped.get(tgt, []) if x.get("id") is not None}
+                merged = list(grouped.get(tgt, []))
+                for gr in global_rows:
+                    gid = int(gr.get("id") or 0)
+                    if gid in seen:
+                        continue
+                    merged.append(dict(gr))
+                merged.sort(
+                    key=lambda x: (
+                        x.get("available_at") or x.get("occurred_at") or datetime.fromtimestamp(0, tz=timezone.utc),
+                    ),
+                    reverse=True,
+                )
+                grouped[tgt] = merged[: max(1, limit_per_target)]
         return grouped
 
     def get_active_model(self, track: str) -> Dict[str, str]:
@@ -341,26 +419,49 @@ class InferenceServiceV2:
     ) -> None:
         ts = datetime.now(timezone.utc)
         with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO feature_snapshots (
-                    target, track, as_of, as_of_ts, event_time, feature_version,
-                    feature_payload, data_version, lineage_id, created_at
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO feature_snapshots (
+                        target, track, as_of, as_of_ts, event_time, feature_available_at, feature_version,
+                        feature_payload, data_version, lineage_id, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (
+                        target,
+                        track,
+                        ts,
+                        ts,
+                        event_time or ts,
+                        ts,
+                        self.feature_version,
+                        json.dumps(features),
+                        self.data_version,
+                        lineage_id,
+                    ),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                """,
-                (
-                    target,
-                    track,
-                    ts,
-                    ts,
-                    event_time or ts,
-                    self.feature_version,
-                    json.dumps(features),
-                    self.data_version,
-                    lineage_id,
-                ),
-            )
+            except Exception:
+                cur.execute(
+                    """
+                    INSERT INTO feature_snapshots (
+                        target, track, as_of, as_of_ts, event_time, feature_version,
+                        feature_payload, data_version, lineage_id, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (
+                        target,
+                        track,
+                        ts,
+                        ts,
+                        event_time or ts,
+                        self.feature_version,
+                        json.dumps(features),
+                        self.data_version,
+                        lineage_id,
+                    ),
+                )
 
     def save_prediction_v2(
         self,

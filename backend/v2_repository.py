@@ -98,36 +98,85 @@ class V2Repository:
             with conn.cursor() as cur:
                 for event in events:
                     fp = self._fingerprint(event)
-                    cur.execute(
-                        """
-                        INSERT INTO events (
-                            event_type, title, occurred_at, source_url, source_name,
-                            source_timezone, source_tier, confidence_score, event_importance,
-                            novelty_score, entity_confidence, latency_ms, dedup_cluster_id,
-                            payload, fingerprint, created_at
+                    published_at = event.published_at or event.occurred_at
+                    ingested_at = event.ingested_at or datetime.utcnow()
+                    latency_ms = int(event.latency_ms or event.source_latency_ms or 0)
+                    available_at = event.available_at or (published_at + timedelta(milliseconds=max(0, latency_ms)))
+                    effective_at = event.effective_at or available_at
+                    payload = dict(event.payload or {})
+                    if "source_confidence" not in payload:
+                        payload["source_confidence"] = float(event.confidence_score)
+                    if "source_tier_weight" not in payload:
+                        payload["source_tier_weight"] = max(0.1, min(1.0, (6.0 - float(event.source_tier)) / 5.0))
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO events (
+                                event_type, title, occurred_at, published_at, ingested_at, available_at, effective_at,
+                                source_url, source_name, source_timezone, source_tier, confidence_score, event_importance,
+                                novelty_score, entity_confidence, latency_ms, source_latency_ms, dedup_cluster_id,
+                                market_scope, payload, fingerprint, created_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                            ON CONFLICT (fingerprint) DO NOTHING
+                            RETURNING id
+                            """,
+                            (
+                                event.event_type,
+                                event.title,
+                                event.occurred_at,
+                                published_at,
+                                ingested_at,
+                                available_at,
+                                effective_at,
+                                event.source_url,
+                                event.source_name,
+                                event.source_timezone,
+                                event.source_tier,
+                                event.confidence_score,
+                                event.event_importance,
+                                event.novelty_score,
+                                event.entity_confidence,
+                                event.latency_ms,
+                                event.source_latency_ms,
+                                event.dedup_cluster_id,
+                                event.market_scope,
+                                json.dumps(payload),
+                                fp,
+                            ),
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                        ON CONFLICT (fingerprint) DO NOTHING
-                        RETURNING id
-                        """,
-                        (
-                            event.event_type,
-                            event.title,
-                            event.occurred_at,
-                            event.source_url,
-                            event.source_name,
-                            event.source_timezone,
-                            event.source_tier,
-                            event.confidence_score,
-                            event.event_importance,
-                            event.novelty_score,
-                            event.entity_confidence,
-                            event.latency_ms,
-                            event.dedup_cluster_id,
-                            json.dumps(event.payload),
-                            fp,
-                        ),
-                    )
+                    except Exception:
+                        conn.rollback()
+                        cur.execute(
+                            """
+                            INSERT INTO events (
+                                event_type, title, occurred_at, source_url, source_name,
+                                source_timezone, source_tier, confidence_score, event_importance,
+                                novelty_score, entity_confidence, latency_ms, dedup_cluster_id,
+                                payload, fingerprint, created_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                            ON CONFLICT (fingerprint) DO NOTHING
+                            RETURNING id
+                            """,
+                            (
+                                event.event_type,
+                                event.title,
+                                event.occurred_at,
+                                event.source_url,
+                                event.source_name,
+                                event.source_timezone,
+                                event.source_tier,
+                                event.confidence_score,
+                                event.event_importance,
+                                event.novelty_score,
+                                event.entity_confidence,
+                                event.latency_ms,
+                                event.dedup_cluster_id,
+                                json.dumps(payload),
+                                fp,
+                            ),
+                        )
                     row = cur.fetchone()
                     if row:
                         event_id = row["id"]
@@ -292,18 +341,35 @@ class V2Repository:
     def recent_event_context(self, target: str, limit: int = 5) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT e.id, e.event_type, e.title, e.source_url, e.occurred_at, e.confidence_score
-                    FROM events e
-                    LEFT JOIN event_links el ON el.event_id = e.id
-                    LEFT JOIN entities en ON en.id = el.entity_id
-                    WHERE en.name = %s OR en.symbol = UPPER(%s)
-                    ORDER BY e.occurred_at DESC
-                    LIMIT %s
-                    """,
-                    (target, target, limit),
-                )
+                try:
+                    cur.execute(
+                        """
+                        SELECT
+                            e.id, e.event_type, e.title, e.source_url, e.occurred_at, e.confidence_score,
+                            e.available_at, e.effective_at, e.market_scope
+                        FROM events e
+                        LEFT JOIN event_links el ON el.event_id = e.id
+                        LEFT JOIN entities en ON en.id = el.entity_id
+                        WHERE en.name = %s OR en.symbol = UPPER(%s)
+                        ORDER BY COALESCE(e.available_at, e.occurred_at) DESC
+                        LIMIT %s
+                        """,
+                        (target, target, limit),
+                    )
+                except Exception:
+                    conn.rollback()
+                    cur.execute(
+                        """
+                        SELECT e.id, e.event_type, e.title, e.source_url, e.occurred_at, e.confidence_score
+                        FROM events e
+                        LEFT JOIN event_links el ON el.event_id = e.id
+                        LEFT JOIN entities en ON en.id = el.entity_id
+                        WHERE en.name = %s OR en.symbol = UPPER(%s)
+                        ORDER BY e.occurred_at DESC
+                        LIMIT %s
+                        """,
+                        (target, target, limit),
+                    )
                 return [dict(r) for r in cur.fetchall()]
 
     def latest_price_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -1303,31 +1369,73 @@ class V2Repository:
     ) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             with conn.cursor() as cur:
-                if data_version:
-                    cur.execute(
-                        """
-                        SELECT target, track, as_of_ts, data_version, lineage_id, feature_payload
-                        FROM feature_snapshots
-                        WHERE target = %s AND track = %s
-                          AND data_version = %s
-                          AND as_of_ts > NOW() - make_interval(days => %s)
-                        ORDER BY as_of_ts ASC
-                        LIMIT %s
-                        """,
-                        (target, track, data_version, lookback_days, limit),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT target, track, as_of_ts, data_version, lineage_id, feature_payload
-                        FROM feature_snapshots
-                        WHERE target = %s AND track = %s
-                          AND as_of_ts > NOW() - make_interval(days => %s)
-                        ORDER BY as_of_ts ASC
-                        LIMIT %s
-                        """,
-                        (target, track, lookback_days, limit),
-                    )
+                try:
+                    if data_version:
+                        cur.execute(
+                            """
+                            SELECT
+                                target,
+                                track,
+                                COALESCE(as_of_ts, as_of) AS as_of_ts,
+                                data_version,
+                                lineage_id,
+                                feature_payload,
+                                COALESCE(feature_available_at, as_of_ts, as_of) AS feature_available_at
+                            FROM feature_snapshots
+                            WHERE target = %s AND track = %s
+                              AND data_version = %s
+                              AND COALESCE(as_of_ts, as_of) > NOW() - make_interval(days => %s)
+                            ORDER BY COALESCE(as_of_ts, as_of) ASC
+                            LIMIT %s
+                            """,
+                            (target, track, data_version, lookback_days, limit),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT
+                                target,
+                                track,
+                                COALESCE(as_of_ts, as_of) AS as_of_ts,
+                                data_version,
+                                lineage_id,
+                                feature_payload,
+                                COALESCE(feature_available_at, as_of_ts, as_of) AS feature_available_at
+                            FROM feature_snapshots
+                            WHERE target = %s AND track = %s
+                              AND COALESCE(as_of_ts, as_of) > NOW() - make_interval(days => %s)
+                            ORDER BY COALESCE(as_of_ts, as_of) ASC
+                            LIMIT %s
+                            """,
+                            (target, track, lookback_days, limit),
+                        )
+                except Exception:
+                    conn.rollback()
+                    if data_version:
+                        cur.execute(
+                            """
+                            SELECT target, track, as_of_ts, data_version, lineage_id, feature_payload
+                            FROM feature_snapshots
+                            WHERE target = %s AND track = %s
+                              AND data_version = %s
+                              AND as_of_ts > NOW() - make_interval(days => %s)
+                            ORDER BY as_of_ts ASC
+                            LIMIT %s
+                            """,
+                            (target, track, data_version, lookback_days, limit),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT target, track, as_of_ts, data_version, lineage_id, feature_payload
+                            FROM feature_snapshots
+                            WHERE target = %s AND track = %s
+                              AND as_of_ts > NOW() - make_interval(days => %s)
+                            ORDER BY as_of_ts ASC
+                            LIMIT %s
+                            """,
+                            (target, track, lookback_days, limit),
+                        )
                 return [dict(r) for r in cur.fetchall()]
 
     def get_active_model_state(self, track: str) -> Optional[Dict[str, Any]]:

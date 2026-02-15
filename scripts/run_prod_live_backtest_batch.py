@@ -27,6 +27,8 @@ def _required_metric_contract(metrics: Dict[str, Any]) -> List[str]:
         "per_target",
         "cost_breakdown",
         "lineage_coverage",
+        "alignment_audit",
+        "leakage_checks",
     ]
     missing = [k for k in required if k not in (metrics or {})]
     if str((metrics or {}).get("status") or "").lower() != "completed":
@@ -61,6 +63,9 @@ def _payload_from_args(args: argparse.Namespace, targets: List[str]) -> Dict[str
         ),
         "cost_penalty_lambda": float(args.cost_penalty_lambda) if args.cost_penalty_lambda is not None else None,
         "signal_polarity_mode": args.signal_polarity_mode,
+        "alignment_mode": args.alignment_mode,
+        "alignment_version": args.alignment_version,
+        "max_feature_staleness_hours": int(args.max_feature_staleness_hours),
     }
 
 
@@ -91,6 +96,9 @@ def main() -> int:
         default=os.getenv("BACKTEST_SIGNAL_POLARITY_MODE", "auto_train_ic"),
         choices=["normal", "auto_train_ic", "auto_train_pnl"],
     )
+    ap.add_argument("--alignment-mode", default=os.getenv("BACKTEST_ALIGNMENT_MODE", "strict_asof"), choices=["strict_asof", "legacy_index"])
+    ap.add_argument("--alignment-version", default=os.getenv("BACKTEST_ALIGNMENT_VERSION", "strict_asof_v1"))
+    ap.add_argument("--max-feature-staleness-hours", type=int, default=int(os.getenv("BACKTEST_MAX_FEATURE_STALENESS_HOURS", str(24 * 14))))
     ap.add_argument("--require-model-artifact", action="store_true", default=True)
     ap.add_argument("--jsonl", default="")
     args = ap.parse_args()

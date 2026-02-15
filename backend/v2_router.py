@@ -4,6 +4,7 @@ import os
 import json
 import time
 import uuid
+from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -757,6 +758,249 @@ def _feature_signal_score(payload: Dict[str, Any]) -> float:
     return float(-score)
 
 
+def _to_utc_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(raw)
+        except Exception:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            ts = float(value)
+            if ts > 1e12:
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def _extract_feature_time(row: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("feature_available_at", "as_of_ts", "as_of", "event_time"):
+        dt = _to_utc_datetime(row.get(key))
+        if dt is not None:
+            return dt.astimezone(timezone.utc)
+    return None
+
+
+def _extract_price_time(row: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("timestamp", "ts", "as_of"):
+        dt = _to_utc_datetime(row.get(key))
+        if dt is not None:
+            return dt.astimezone(timezone.utc)
+    return None
+
+
+def _align_feature_price_rows(
+    feature_rows: List[Dict[str, Any]],
+    price_rows: List[Dict[str, Any]],
+    alignment_mode: str,
+    max_feature_staleness_hours: int,
+    alignment_version: str,
+) -> Dict[str, Any]:
+    prices = np.array([float(r.get("price") or 0.0) for r in price_rows], dtype=np.float64)
+    vols = np.array([float(r.get("volume") or 0.0) for r in price_rows], dtype=np.float64)
+    rets = np.diff(prices) / np.clip(prices[:-1], 1e-12, None) if prices.size >= 2 else np.array([], dtype=np.float64)
+    mode = str(alignment_mode or "strict_asof").strip().lower()
+    if mode not in {"strict_asof", "legacy_index"}:
+        mode = "strict_asof"
+    if mode == "legacy_index":
+        n = min(len(feature_rows), len(rets))
+        step_vols = [float(vols[i + 1] if i + 1 < len(vols) else vols[-1]) for i in range(n)] if n > 0 else []
+        step_ts = [_extract_price_time(price_rows[i + 1]) if i + 1 < len(price_rows) else None for i in range(n)]
+        return {
+            "feature_rows": list(feature_rows[:n]),
+            "feature_indices": list(range(n)),
+            "rets": np.array(rets[:n], dtype=np.float64),
+            "vols": np.array(step_vols, dtype=np.float64),
+            "step_timestamps": step_ts,
+            "audit": {
+                "alignment_mode_requested": mode,
+                "alignment_mode_applied": "legacy_index",
+                "alignment_version": alignment_version,
+                "total_price_steps": int(len(rets)),
+                "aligned_steps": int(n),
+                "dropped_missing_feature": int(max(0, len(rets) - n)),
+                "dropped_stale_feature": 0,
+                "dropped_missing_timestamps": 0,
+                "leakage_violations": 0,
+                "max_feature_age_hours": None,
+                "min_feature_age_hours": None,
+            },
+        }
+
+    price_points: List[Tuple[datetime, int, float, float]] = []
+    dropped_price_ts = 0
+    for idx, row in enumerate(price_rows):
+        ts = _extract_price_time(row)
+        px = float(row.get("price") or 0.0)
+        vol = float(row.get("volume") or 0.0)
+        if ts is None or px <= 0.0:
+            dropped_price_ts += 1
+            continue
+        price_points.append((ts, idx, px, vol))
+    price_points.sort(key=lambda x: x[0])
+    if len(price_points) < 3:
+        if len(rets) >= 2 and len(feature_rows) >= 2:
+            n = min(len(feature_rows), len(rets))
+            step_vols = [float(vols[i + 1] if i + 1 < len(vols) else vols[-1]) for i in range(n)] if n > 0 else []
+            return {
+                "feature_rows": list(feature_rows[:n]),
+                "feature_indices": list(range(n)),
+                "rets": np.array(rets[:n], dtype=np.float64),
+                "vols": np.array(step_vols, dtype=np.float64),
+                "step_timestamps": [None] * n,
+                "audit": {
+                    "alignment_mode_requested": mode,
+                    "alignment_mode_applied": "strict_asof_fallback_legacy",
+                    "alignment_version": alignment_version,
+                    "total_price_steps": int(len(rets)),
+                    "aligned_steps": int(n),
+                    "dropped_missing_feature": int(max(0, len(rets) - n)),
+                    "dropped_stale_feature": 0,
+                    "dropped_missing_timestamps": int(dropped_price_ts + len(feature_rows)),
+                    "leakage_violations": 0,
+                    "max_feature_age_hours": None,
+                    "min_feature_age_hours": None,
+                },
+            }
+        return {
+            "feature_rows": [],
+            "feature_indices": [],
+            "rets": np.array([], dtype=np.float64),
+            "vols": np.array([], dtype=np.float64),
+            "step_timestamps": [],
+            "audit": {
+                "alignment_mode_requested": mode,
+                "alignment_mode_applied": "strict_asof",
+                "alignment_version": alignment_version,
+                "total_price_steps": int(max(0, len(price_points) - 1)),
+                "aligned_steps": 0,
+                "dropped_missing_feature": 0,
+                "dropped_stale_feature": 0,
+                "dropped_missing_timestamps": int(dropped_price_ts + len(feature_rows)),
+                "leakage_violations": 0,
+                "max_feature_age_hours": None,
+                "min_feature_age_hours": None,
+            },
+        }
+
+    ft_candidates: List[Tuple[datetime, int]] = []
+    for idx, row in enumerate(feature_rows):
+        ts = _extract_feature_time(row)
+        if ts is None:
+            continue
+        ft_candidates.append((ts, idx))
+    ft_candidates.sort(key=lambda x: x[0])
+    if not ft_candidates:
+        if len(rets) >= 2 and len(feature_rows) >= 2:
+            n = min(len(feature_rows), len(rets))
+            step_vols = [float(vols[i + 1] if i + 1 < len(vols) else vols[-1]) for i in range(n)] if n > 0 else []
+            return {
+                "feature_rows": list(feature_rows[:n]),
+                "feature_indices": list(range(n)),
+                "rets": np.array(rets[:n], dtype=np.float64),
+                "vols": np.array(step_vols, dtype=np.float64),
+                "step_timestamps": [None] * n,
+                "audit": {
+                    "alignment_mode_requested": mode,
+                    "alignment_mode_applied": "strict_asof_fallback_legacy",
+                    "alignment_version": alignment_version,
+                    "total_price_steps": int(len(rets)),
+                    "aligned_steps": int(n),
+                    "dropped_missing_feature": int(max(0, len(rets) - n)),
+                    "dropped_stale_feature": 0,
+                    "dropped_missing_timestamps": int(dropped_price_ts + len(feature_rows)),
+                    "leakage_violations": 0,
+                    "max_feature_age_hours": None,
+                    "min_feature_age_hours": None,
+                },
+            }
+        return {
+            "feature_rows": [],
+            "feature_indices": [],
+            "rets": np.array([], dtype=np.float64),
+            "vols": np.array([], dtype=np.float64),
+            "step_timestamps": [],
+            "audit": {
+                "alignment_mode_requested": mode,
+                "alignment_mode_applied": "strict_asof",
+                "alignment_version": alignment_version,
+                "total_price_steps": int(max(0, len(price_points) - 1)),
+                "aligned_steps": 0,
+                "dropped_missing_feature": int(max(0, len(price_points) - 1)),
+                "dropped_stale_feature": 0,
+                "dropped_missing_timestamps": int(dropped_price_ts + len(feature_rows)),
+                "leakage_violations": 0,
+                "max_feature_age_hours": None,
+                "min_feature_age_hours": None,
+            },
+        }
+
+    ft_times = [x[0] for x in ft_candidates]
+    aligned_features: List[Dict[str, Any]] = []
+    aligned_feature_indices: List[int] = []
+    aligned_rets: List[float] = []
+    aligned_vols: List[float] = []
+    aligned_step_ts: List[Optional[datetime]] = []
+    stale_drops = 0
+    missing_feature_drops = 0
+    leakage_violations = 0
+    feature_ages: List[float] = []
+    staleness_hours = float(max(1, max_feature_staleness_hours))
+
+    for i in range(len(price_points) - 1):
+        decision_ts, _, px0, _ = price_points[i]
+        step_ts, _, px1, vol1 = price_points[i + 1]
+        idx = bisect_right(ft_times, decision_ts) - 1
+        if idx < 0:
+            missing_feature_drops += 1
+            continue
+        feat_ts, feat_idx = ft_candidates[idx]
+        age_hours = max(0.0, (decision_ts - feat_ts).total_seconds() / 3600.0)
+        if feat_ts > decision_ts:
+            leakage_violations += 1
+            continue
+        if age_hours > staleness_hours:
+            stale_drops += 1
+            continue
+        feature_ages.append(age_hours)
+        aligned_features.append(feature_rows[feat_idx])
+        aligned_feature_indices.append(int(feat_idx))
+        aligned_rets.append(float((px1 - px0) / max(px0, 1e-12)))
+        aligned_vols.append(float(max(1.0, vol1)))
+        aligned_step_ts.append(step_ts)
+
+    return {
+        "feature_rows": aligned_features,
+        "feature_indices": aligned_feature_indices,
+        "rets": np.array(aligned_rets, dtype=np.float64),
+        "vols": np.array(aligned_vols, dtype=np.float64),
+        "step_timestamps": aligned_step_ts,
+        "audit": {
+            "alignment_mode_requested": mode,
+            "alignment_mode_applied": "strict_asof",
+            "alignment_version": alignment_version,
+            "total_price_steps": int(max(0, len(price_points) - 1)),
+            "aligned_steps": int(len(aligned_rets)),
+            "dropped_missing_feature": int(missing_feature_drops),
+            "dropped_stale_feature": int(stale_drops),
+            "dropped_missing_timestamps": int(dropped_price_ts + (len(feature_rows) - len(ft_candidates))),
+            "leakage_violations": int(leakage_violations),
+            "max_feature_age_hours": round(float(max(feature_ages)), 6) if feature_ages else None,
+            "min_feature_age_hours": round(float(min(feature_ages)), 6) if feature_ages else None,
+        },
+    }
+
+
 def _run_model_replay_backtest(
     feature_rows: List[Dict[str, Any]],
     price_rows: List[Dict[str, Any]],
@@ -766,6 +1010,10 @@ def _run_model_replay_backtest(
     raw_series_override: Optional[np.ndarray] = None,
     signal_polarity_mode: str = "normal",
     calibration_ratio: float = 0.5,
+    alignment_mode: str = "strict_asof",
+    max_feature_staleness_hours: int = 24 * 14,
+    alignment_version: str = "strict_asof_v1",
+    aligned_bundle: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     cfg = _cost_model_settings()
     sizing = _position_sizing_settings()
@@ -802,14 +1050,26 @@ def _run_model_replay_backtest(
             "lineage_coverage": 0.0,
             "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
         }
-    prices = np.array([float(r.get("price") or 0.0) for r in price_rows], dtype=np.float64)
-    vols = np.array([float(r.get("volume") or 0.0) for r in price_rows], dtype=np.float64)
-    rets = np.diff(prices) / np.clip(prices[:-1], 1e-12, None)
-    n = min(len(feature_rows), len(rets))
+    alignment = aligned_bundle or _align_feature_price_rows(
+        feature_rows=feature_rows,
+        price_rows=price_rows,
+        alignment_mode=alignment_mode,
+        max_feature_staleness_hours=max_feature_staleness_hours,
+        alignment_version=alignment_version,
+    )
+    aligned_features: List[Dict[str, Any]] = list(alignment.get("feature_rows") or [])
+    rets_obj = alignment.get("rets")
+    vols_obj = alignment.get("vols")
+    aligned_rets = np.array(rets_obj if rets_obj is not None else [], dtype=np.float64).reshape(-1)
+    aligned_vols = np.array(vols_obj if vols_obj is not None else [], dtype=np.float64).reshape(-1)
+    aligned_idx = [int(x) for x in (alignment.get("feature_indices") or [])]
+    aligned_step_ts = list(alignment.get("step_timestamps") or [])
+    alignment_audit = dict(alignment.get("audit") or {})
+    n = int(min(len(aligned_features), aligned_rets.shape[0], aligned_vols.shape[0]))
     if n < 8:
         return {
             "status": "failed",
-            "reason": "insufficient_features",
+            "reason": "insufficient_aligned_samples",
             "samples": 0,
             "ic": 0.0,
             "hit_rate": 0.0,
@@ -817,6 +1077,13 @@ def _run_model_replay_backtest(
             "pnl_after_cost": 0.0,
             "max_drawdown": 0.0,
             "lineage_coverage": 0.0,
+            "alignment_audit": alignment_audit,
+            "leakage_checks": {
+                "passed": False,
+                "leakage_violations": int(alignment_audit.get("leakage_violations", 0) or 0),
+                "alignment_mode": str(alignment_audit.get("alignment_mode_applied") or alignment_mode),
+                "alignment_version": str(alignment_audit.get("alignment_version") or alignment_version),
+            },
             "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
         }
 
@@ -844,13 +1111,15 @@ def _run_model_replay_backtest(
     }
     if raw_series_override is not None:
         raw_series = np.array(raw_series_override, dtype=np.float64).reshape(-1)
+        if raw_series.shape[0] == len(feature_rows) and aligned_idx:
+            raw_series = raw_series[np.array(aligned_idx, dtype=np.int64)]
         if raw_series.shape[0] < n:
             raw_series = np.pad(raw_series, (0, n - raw_series.shape[0]), mode="constant")
         elif raw_series.shape[0] > n:
             raw_series = raw_series[:n]
     else:
         raw_series = np.array(
-            [polarity * _feature_signal_score((feature_rows[i].get("feature_payload") or {})) for i in range(n)],
+            [polarity * _feature_signal_score((aligned_features[i].get("feature_payload") or {})) for i in range(n)],
             dtype=np.float64,
         )
     polarity_mode = str(signal_polarity_mode or "normal").strip().lower()
@@ -862,12 +1131,16 @@ def _run_model_replay_backtest(
         ratio = float(min(0.9, max(0.2, calibration_ratio)))
         cal_n = int(min(n - 1, max(16, round(n * ratio))))
         raw_cal = raw_series[:cal_n]
-        ret_cal = rets[:cal_n]
+        ret_cal = aligned_rets[:cal_n]
         if raw_cal.size >= 8 and ret_cal.size >= 8 and float(np.std(raw_cal)) > 1e-12 and float(np.std(ret_cal)) > 1e-12:
             polarity_train_ic = float(np.corrcoef(raw_cal, ret_cal)[0, 1])
             polarity_train_edge = float(np.mean(raw_cal * ret_cal))
             ic_threshold = float(os.getenv("BACKTEST_POLARITY_IC_THRESHOLD", "0.005"))
-            use_auto = abs(polarity_train_ic) >= max(0.0, ic_threshold)
+            edge_threshold = float(os.getenv("BACKTEST_POLARITY_EDGE_THRESHOLD", "0.0"))
+            if polarity_mode == "auto_train_pnl":
+                use_auto = abs(polarity_train_edge) >= max(0.0, edge_threshold)
+            else:
+                use_auto = abs(polarity_train_ic) >= max(0.0, ic_threshold)
             if use_auto:
                 if polarity_mode == "auto_train_pnl":
                     polarity = 1.0 if polarity_train_edge >= 0.0 else -1.0
@@ -893,7 +1166,7 @@ def _run_model_replay_backtest(
 
     def _regime_label(idx: int) -> str:
         st = max(0, idx - 96)
-        window = rets[st:idx] if idx > st else np.array([], dtype=np.float64)
+        window = aligned_rets[st:idx] if idx > st else np.array([], dtype=np.float64)
         if window.size < 12:
             return "sideways"
         mu = float(np.mean(window))
@@ -906,12 +1179,12 @@ def _run_model_replay_backtest(
         return "sideways"
 
     for i in range(n):
-        f = feature_rows[i].get("feature_payload") or {}
-        unique_lineages.add(str(feature_rows[i].get("lineage_id") or ""))
+        f = aligned_features[i].get("feature_payload") or {}
+        unique_lineages.add(str(aligned_features[i].get("lineage_id") or ""))
         raw = float(dynamic_scale * raw_series[i])
         vol_proxy = abs(float(f.get("vol_12", 0.0) or 0.0)) + abs(float(f.get("vol_48", 0.0) or 0.0))
         vol_bucket = "high" if vol_proxy > 0.015 else "normal"
-        vol = float(max(1.0, vols[i + 1] if i + 1 < len(vols) else vols[-1]))
+        vol = float(max(1.0, aligned_vols[i]))
         impact_bps = min(30.0, impact_coeff / np.sqrt(vol))
         est_cost_bps = float(fee_bps + slippage_bps + impact_bps)
         edge_floor = max(backtest_entry_z, cost_edge_mult * est_cost_bps / 10000.0)
@@ -930,7 +1203,7 @@ def _run_model_replay_backtest(
             desired = prev_signal + max_step_turnover
         elif step < -max_step_turnover:
             desired = prev_signal - max_step_turnover
-        nxt = float(rets[i])
+        nxt = float(aligned_rets[i])
         trade_amt = abs(desired - prev_signal)
         est_cost = (fee_bps + slippage_bps + impact_bps) / 10000.0 * trade_amt
         penalty = min(0.7, float(sizing["cost_lambda"]) * est_cost * 80.0)
@@ -974,9 +1247,7 @@ def _run_model_replay_backtest(
             sharpe_step_raw = float((float(np.mean(p)) / p_std) * np.sqrt(24.0 * 365.0))
     daily_map: Dict[str, float] = {}
     for i, pnl in enumerate(step_pnls):
-        ts = None
-        if i + 1 < len(price_rows):
-            ts = price_rows[i + 1].get("timestamp")
+        ts = aligned_step_ts[i] if i < len(aligned_step_ts) else None
         if isinstance(ts, datetime):
             ts_utc = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
             day_key = ts_utc.astimezone(timezone.utc).strftime("%Y-%m-%d")
@@ -1027,6 +1298,16 @@ def _run_model_replay_backtest(
         "pnl_after_cost": round(float(active_curve[-1] - 1.0), 6),
         "max_drawdown": round(float(max_dd), 6),
         "lineage_coverage": round(float(len(unique_lineages) / max(1, len(scores))), 6),
+        "alignment_audit": alignment_audit,
+        "leakage_checks": {
+            "passed": bool(
+                int(alignment_audit.get("leakage_violations", 0) or 0) == 0
+                and "fallback" not in str(alignment_audit.get("alignment_mode_applied") or "").lower()
+            ),
+            "leakage_violations": int(alignment_audit.get("leakage_violations", 0) or 0),
+            "alignment_mode": str(alignment_audit.get("alignment_mode_applied") or alignment_mode),
+            "alignment_version": str(alignment_audit.get("alignment_version") or alignment_version),
+        },
         "signal_polarity": "inverted" if polarity < 0 else "normal",
         "polarity_selection": polarity_selection,
         "polarity_mode_requested": polarity_mode,
@@ -1125,8 +1406,19 @@ def _run_model_inference_backtest(
     sizing_override: Optional[Dict[str, float]] = None,
     signal_polarity_mode: str = "normal",
     calibration_ratio: float = 0.5,
+    alignment_mode: str = "strict_asof",
+    max_feature_staleness_hours: int = 24 * 14,
+    alignment_version: str = "strict_asof_v1",
 ) -> Dict[str, Any]:
-    n = min(len(feature_rows), max(0, len(price_rows) - 1))
+    alignment = _align_feature_price_rows(
+        feature_rows=feature_rows,
+        price_rows=price_rows,
+        alignment_mode=alignment_mode,
+        max_feature_staleness_hours=max_feature_staleness_hours,
+        alignment_version=alignment_version,
+    )
+    aligned_features = list(alignment.get("feature_rows") or [])
+    n = int(len(aligned_features))
     if n <= 1:
         replay = _run_model_replay_backtest(
             feature_rows=feature_rows,
@@ -1136,6 +1428,10 @@ def _run_model_inference_backtest(
             sizing_override=sizing_override,
             signal_polarity_mode=signal_polarity_mode,
             calibration_ratio=calibration_ratio,
+            alignment_mode=alignment_mode,
+            max_feature_staleness_hours=max_feature_staleness_hours,
+            alignment_version=alignment_version,
+            aligned_bundle=alignment,
         )
         replay["model_inference_coverage"] = 0.0
         replay["fallback_used"] = False
@@ -1145,7 +1441,7 @@ def _run_model_inference_backtest(
     model_raw: List[float] = []
     predicted = 0
     for i in range(n):
-        payload = feature_rows[i].get("feature_payload") or {}
+        payload = aligned_features[i].get("feature_payload") or {}
         exp = _predict_expected_return_tabular(target, payload)
         if exp is not None and np.isfinite(exp):
             predicted += 1
@@ -1162,6 +1458,10 @@ def _run_model_inference_backtest(
         raw_series_override=np.array(model_raw, dtype=np.float64),
         signal_polarity_mode=signal_polarity_mode,
         calibration_ratio=calibration_ratio,
+        alignment_mode=alignment_mode,
+        max_feature_staleness_hours=max_feature_staleness_hours,
+        alignment_version=alignment_version,
+        aligned_bundle=alignment,
     )
     replay["model_inference_coverage"] = round(float(predicted / max(1, n)), 6)
     replay["fallback_used"] = bool(predicted < n)
@@ -1654,6 +1954,9 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
                 sizing_override=sizing_override or None,
                 signal_polarity_mode=polarity_mode,
                 calibration_ratio=calibration_ratio,
+                alignment_mode=payload.alignment_mode,
+                max_feature_staleness_hours=payload.max_feature_staleness_hours,
+                alignment_version=payload.alignment_version,
             )
         else:
             m = _run_model_replay_backtest(
@@ -1664,6 +1967,9 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
                 sizing_override=sizing_override or None,
                 signal_polarity_mode=polarity_mode,
                 calibration_ratio=calibration_ratio,
+                alignment_mode=payload.alignment_mode,
+                max_feature_staleness_hours=payload.max_feature_staleness_hours,
+                alignment_version=payload.alignment_version,
             )
             m["score_source"] = "heuristic"
             m["model_inference_coverage"] = 0.0
@@ -1675,7 +1981,11 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
     if samples == 0:
         agg = {
             "status": "failed",
-            "reason": "insufficient_features" if any(m.get("reason") == "insufficient_features" for m in all_metrics) else "insufficient_prices",
+            "reason": (
+                "insufficient_aligned_samples"
+                if any(str(m.get("reason") or "") == "insufficient_aligned_samples" for m in all_metrics)
+                else ("insufficient_features" if any(str(m.get("reason") or "") == "insufficient_features" for m in all_metrics) else "insufficient_prices")
+            ),
             "run_source": payload.run_source,
             "data_regime": data_regime,
             "score_source": score_source,
@@ -1710,6 +2020,8 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
                 "observation_days": int(m.get("observation_days", 0) or 0),
                 "vol_floor_applied": bool(m.get("vol_floor_applied", False)),
                 "samples": int(m.get("samples", 0) or 0),
+                "leakage_violations": int(((m.get("leakage_checks") or {}).get("leakage_violations", 0) or 0)),
+                "alignment_mode": str(((m.get("leakage_checks") or {}).get("alignment_mode") or "")),
             }
             rb = m.get("regime_breakdown") or {}
             if isinstance(rb, dict):
@@ -1765,8 +2077,30 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
                 for name, vals in regime_agg.items()
                 if vals["samples"] > 0
             },
+            "alignment_audit": {
+                "alignment_mode_requested": payload.alignment_mode,
+                "alignment_mode_applied": "strict_asof" if payload.alignment_mode == "strict_asof" else payload.alignment_mode,
+                "alignment_version": payload.alignment_version,
+                "total_price_steps": int(sum(int((m.get("alignment_audit") or {}).get("total_price_steps", 0) or 0) for m in all_metrics)),
+                "aligned_steps": int(sum(int((m.get("alignment_audit") or {}).get("aligned_steps", 0) or 0) for m in all_metrics)),
+                "dropped_missing_feature": int(sum(int((m.get("alignment_audit") or {}).get("dropped_missing_feature", 0) or 0) for m in all_metrics)),
+                "dropped_stale_feature": int(sum(int((m.get("alignment_audit") or {}).get("dropped_stale_feature", 0) or 0) for m in all_metrics)),
+                "dropped_missing_timestamps": int(sum(int((m.get("alignment_audit") or {}).get("dropped_missing_timestamps", 0) or 0) for m in all_metrics)),
+                "leakage_violations": int(sum(int((m.get("alignment_audit") or {}).get("leakage_violations", 0) or 0) for m in all_metrics)),
+            },
+            "leakage_checks": {
+                "passed": bool(all(bool((m.get("leakage_checks") or {}).get("passed", False)) for m in all_metrics)),
+                "leakage_violations": int(sum(int((m.get("leakage_checks") or {}).get("leakage_violations", 0) or 0) for m in all_metrics)),
+                "alignment_mode": payload.alignment_mode,
+                "alignment_version": payload.alignment_version,
+            },
         }
-        agg["gate_passed"] = bool(agg["ic"] > 0 and agg["pnl_after_cost"] > 0 and agg["max_drawdown"] < 0.2)
+        agg["gate_passed"] = bool(
+            agg["ic"] > 0
+            and agg["pnl_after_cost"] > 0
+            and agg["max_drawdown"] < 0.2
+            and bool((agg.get("leakage_checks") or {}).get("passed", False))
+        )
 
     repo.finish_backtest_run(run_id, agg)
     if str(agg.get("status")) == "failed":

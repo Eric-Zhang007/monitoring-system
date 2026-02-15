@@ -232,6 +232,7 @@ class DataCollectorV2:
     def publish_event(self, event: Dict, connector_name: str, fetch_status: str):
         state = self._state(connector_name)
         occurred_at = event["occurred_at"]
+        now_iso = datetime.utcnow().isoformat() + "Z"
         dedup_key = f"{event.get('source_name', '')}|{event.get('title', '').strip().lower()}|{event.get('source_url', '')}"
         dedup_cluster_id = hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()[:24]
         latency_ms = None
@@ -272,6 +273,10 @@ class DataCollectorV2:
                     "event_type": event["event_type"],
                     "title": event["title"],
                     "occurred_at": occurred_at,
+                    "published_at": event.get("published_at") or occurred_at,
+                    "ingested_at": now_iso,
+                    "available_at": event.get("available_at") or now_iso,
+                    "effective_at": event.get("effective_at") or now_iso,
                     "source_url": event.get("source_url") or "",
                     "source_name": event.get("source_name") or "",
                     "source_timezone": event.get("source_timezone", "UTC"),
@@ -281,6 +286,7 @@ class DataCollectorV2:
                     "novelty_score": float(event.get("novelty_score", 0.5)),
                     "entity_confidence": float(event.get("entity_confidence", 0.5)),
                     "latency_ms": int(latency_ms or 0),
+                    "source_latency_ms": int(event.get("source_latency_ms", latency_ms or 0) or 0),
                     "dedup_cluster_id": event.get("dedup_cluster_id") or dedup_cluster_id,
                     "market_scope": market_scope if market_scope in {"crypto", "equity", "macro"} else "crypto",
                     "payload": event_payload,

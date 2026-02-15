@@ -149,16 +149,23 @@ CREATE TABLE IF NOT EXISTS events (
     event_type VARCHAR(32) NOT NULL,
     title TEXT NOT NULL,
     occurred_at TIMESTAMPTZ NOT NULL,
+    published_at TIMESTAMPTZ,
+    ingested_at TIMESTAMPTZ,
+    available_at TIMESTAMPTZ,
+    effective_at TIMESTAMPTZ,
     source_url TEXT,
     source_name TEXT,
     source_timezone VARCHAR(64) DEFAULT 'UTC',
     source_tier SMALLINT DEFAULT 3,
     confidence_score DOUBLE PRECISION DEFAULT 0.5,
+    source_latency_ms BIGINT,
+    market_scope VARCHAR(16) DEFAULT 'crypto',
     payload JSONB DEFAULT '{}'::jsonb,
     fingerprint VARCHAR(64) UNIQUE,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_events_occurred_at ON events(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_available_at ON events(available_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 
 CREATE TABLE IF NOT EXISTS event_links (
@@ -337,9 +344,18 @@ CREATE INDEX IF NOT EXISTS idx_onchain_signals_asset_ts ON onchain_signals(asset
 ALTER TABLE feature_snapshots
     ADD COLUMN IF NOT EXISTS as_of_ts TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS feature_available_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS data_version VARCHAR(64) DEFAULT 'v1',
     ADD COLUMN IF NOT EXISTS lineage_id VARCHAR(64);
 CREATE INDEX IF NOT EXISTS idx_feature_snapshots_lineage ON feature_snapshots(lineage_id);
+
+ALTER TABLE events
+    ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS ingested_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS effective_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS source_latency_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS market_scope VARCHAR(16) DEFAULT 'crypto';
 
 CREATE TABLE IF NOT EXISTS risk_control_state (
     id BIGSERIAL PRIMARY KEY,

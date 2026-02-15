@@ -134,8 +134,10 @@ def main() -> int:
     ap.add_argument("--exclude-sources", default=os.getenv("BACKTEST_GATE_EXCLUDE_SOURCES", "smoke,async_test,maintenance"))
     ap.add_argument("--data-regimes", default=os.getenv("BACKTEST_GATE_DATA_REGIMES", "prod_live"))
     ap.add_argument("--targets", default="", help="comma-separated targets filter")
+    ap.add_argument("--include-superseded", action="store_true")
     ap.add_argument("--min-completed-runs", type=int, default=5)
     ap.add_argument("--min-observation-days", type=int, default=int(os.getenv("BACKTEST_GATE_MIN_OBSERVATION_DAYS", "14")))
+    ap.add_argument("--min-sharpe-daily", type=float, default=float(os.getenv("BACKTEST_GATE_MIN_SHARPE_DAILY", "1.5")))
     args = ap.parse_args()
 
     track = str(args.track).strip().lower()
@@ -148,6 +150,7 @@ def main() -> int:
     data_regimes = _parse_regimes(args.data_regimes)
     source_cond = _sql_source_filters(include_sources, exclude_sources)
     regime_cond = _sql_regime_filters(data_regimes)
+    supersede_cond = "" if args.include_superseded else " AND superseded_by_run_id IS NULL "
     targets = [s.strip().upper() for s in str(args.targets).split(",") if s.strip()]
     target_cond = _sql_target_filter(targets)
     required_contract_keys = [
@@ -159,6 +162,8 @@ def main() -> int:
         "per_target",
         "cost_breakdown",
         "lineage_coverage",
+        "alignment_audit",
+        "leakage_checks",
     ]
 
     sql_runs = (
@@ -169,6 +174,8 @@ def main() -> int:
         "COALESCE(metrics->>'max_drawdown','0'), "
         "COALESCE(metrics->>'sharpe_daily', metrics->>'sharpe', '0'), "
         "COALESCE(metrics->>'observation_days','0'), "
+        "COALESCE(metrics->'leakage_checks'->>'passed','false'), "
+        "COALESCE(metrics->'leakage_checks'->>'leakage_violations','0'), "
         "CASE WHEN superseded_by_run_id IS NULL THEN '0' ELSE '1' END, "
         "COALESCE(config->>'lookback_days','0'), "
         "COALESCE(config->>'data_regime','missing') "
@@ -177,6 +184,7 @@ def main() -> int:
         f"AND created_at > NOW() - make_interval(days => {args.lookback_days}) "
         f"{source_cond} "
         f"{regime_cond} "
+        f"{supersede_cond} "
         f"{target_cond} "
         f"AND COALESCE(config->>'score_source','heuristic') = '{score_source}' "
         "AND metrics ? 'pnl_after_cost' "
@@ -192,8 +200,10 @@ def main() -> int:
         f"AND created_at > NOW() - make_interval(days => {args.lookback_days}) "
         f"{source_cond} "
         f"{regime_cond} "
+        f"{supersede_cond} "
         f"{target_cond} "
         f"AND COALESCE(config->>'score_source','heuristic') = '{score_source}' "
+        "AND COALESCE(metrics->>'status','')='completed' "
         f"AND ({missing_contract_expr});"
     )
     raw_missing_contract_count = _run_psql(sql_contract)
@@ -208,15 +218,28 @@ def main() -> int:
     artifact_failures = 0
     failed_effective_count = 0
     artifact_failures_effective = 0
+    leakage_fail_runs = 0
     superseded_runs_count = 0
     total_runs = len(rows)
     effective_total_runs = 0
     regime_counts: Dict[str, int] = {}
     for row in rows:
         parts = row.split("|")
-        if len(parts) != 9:
+        if len(parts) != 11:
             continue
-        status, reason, pnl_raw, dd_raw, sharpe_daily_raw, obs_days_raw, superseded_flag, lookback_raw, regime_raw = parts
+        (
+            status,
+            reason,
+            pnl_raw,
+            dd_raw,
+            sharpe_daily_raw,
+            obs_days_raw,
+            leak_pass_raw,
+            leak_viol_raw,
+            superseded_flag,
+            lookback_raw,
+            regime_raw,
+        ) = parts
         status = (status or "").strip().lower()
         reason = (reason or "").strip().lower()
         regime = (regime_raw or "missing").strip().lower() or "missing"
@@ -228,6 +251,10 @@ def main() -> int:
         effective_total_runs += 1
         if status == "completed":
             try:
+                leak_pass = str(leak_pass_raw or "").strip().lower() in {"1", "t", "true", "yes", "y"}
+                leak_viol = int(float(leak_viol_raw or 0))
+                if (not leak_pass) or leak_viol > 0:
+                    leakage_fail_runs += 1
                 completed_pnls.append(float(pnl_raw))
                 completed_dds.append(float(dd_raw))
                 completed_sharpe_daily.append(float(sharpe_daily_raw or 0.0))
@@ -277,11 +304,21 @@ def main() -> int:
     checks: Dict[str, Any] = {
         "min_completed_runs_ok": not insufficient_runs,
         "observation_days_ok": not insufficient_observation,
-        "oos_sharpe_daily_gt_1_5": sharpe_daily > 1.5 if not insufficient else False,
+        "oos_sharpe_daily_gt_threshold": sharpe_daily > float(args.min_sharpe_daily) if not insufficient else False,
+        "legacy_oos_sharpe_daily_gt_1_5": sharpe_daily > 1.5 if not insufficient else False,
         "maxdd_lt_0_12": maxdd < 0.12 if not insufficient else False,
         "reject_rate_lt_0_01": reject_rate < 0.01,
+        "leakage_checks_passed_all": leakage_fail_runs == 0,
     }
-    hard_passed = all(checks.values()) and (not insufficient)
+    gate_check_keys = [
+        "min_completed_runs_ok",
+        "observation_days_ok",
+        "oos_sharpe_daily_gt_threshold",
+        "maxdd_lt_0_12",
+        "reject_rate_lt_0_01",
+        "leakage_checks_passed_all",
+    ]
+    hard_passed = all(bool(checks.get(k, False)) for k in gate_check_keys) and (not insufficient)
     passed = True if monitor_only else hard_passed
 
     out: Dict[str, Any] = {
@@ -306,6 +343,7 @@ def main() -> int:
         "failed_runs_count": failed_runs_count,
         "failed_runs_effective_count": failed_effective_count,
         "artifact_missing_effective_count": artifact_failures_effective,
+        "leakage_fail_runs": int(leakage_fail_runs),
         "superseded_runs_count": superseded_runs_count,
         "status": "insufficient_observation" if insufficient else ("passed" if hard_passed else "failed"),
         "failed_ratio": round(failed_ratio, 6),
@@ -315,6 +353,7 @@ def main() -> int:
         "sharpe_method": "daily_agg_v1",
         "observation_days": int(observation_days),
         "min_observation_days": int(args.min_observation_days),
+        "min_sharpe_daily": float(args.min_sharpe_daily),
         "max_drawdown": round(maxdd, 6),
         "execution_reject_rate": round(reject_rate, 6),
         "pnl_direction_adjusted": True,

@@ -99,3 +99,29 @@ def test_model_replay_backtest_auto_train_ic_can_invert_polarity():
     assert out["status"] == "completed"
     assert out["signal_polarity"] == "inverted"
     assert out["polarity_selection"] == "auto_train_ic"
+
+
+def test_model_replay_backtest_auto_train_pnl_uses_edge_even_when_ic_threshold_high(monkeypatch):
+    monkeypatch.setenv("BACKTEST_POLARITY_IC_THRESHOLD", "1.1")
+    monkeypatch.setenv("BACKTEST_POLARITY_EDGE_THRESHOLD", "0.0")
+    n = 120
+    rets = np.array([0.002 if i % 2 == 0 else -0.0018 for i in range(n)], dtype=np.float64)
+    raw = -rets.copy()
+    features = _build_feature_rows(n)
+    price = 100.0
+    prices = [dict(price=price, volume=1000.0)]
+    for r in rets:
+        price *= (1.0 + float(r))
+        prices.append({"price": price, "volume": 1000.0})
+    out = _run_model_replay_backtest(
+        features,
+        prices,
+        fee_bps=5.0,
+        slippage_bps=3.0,
+        raw_series_override=raw,
+        signal_polarity_mode="auto_train_pnl",
+        calibration_ratio=0.6,
+    )
+    assert out["status"] == "completed"
+    assert out["signal_polarity"] == "inverted"
+    assert out["polarity_selection"] == "auto_train_pnl"

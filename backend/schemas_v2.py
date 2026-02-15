@@ -33,6 +33,10 @@ class Event(BaseModel):
     event_type: EventType
     title: str
     occurred_at: datetime
+    published_at: Optional[datetime] = None
+    ingested_at: Optional[datetime] = None
+    available_at: Optional[datetime] = None
+    effective_at: Optional[datetime] = None
     source_url: Optional[str] = None
     source_name: Optional[str] = None
     source_timezone: str = "UTC"
@@ -42,6 +46,7 @@ class Event(BaseModel):
     novelty_score: float = Field(default=0.5, ge=0.0, le=1.0)
     entity_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     latency_ms: Optional[int] = Field(default=None, ge=0)
+    source_latency_ms: Optional[int] = Field(default=None, ge=0)
     dedup_cluster_id: Optional[str] = None
     market_scope: Literal["crypto", "equity", "macro"] = "crypto"
     payload: Dict[str, Any] = Field(default_factory=dict)
@@ -139,6 +144,9 @@ class BacktestRunRequest(BaseModel):
     position_max_weight_high_vol_mult: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     cost_penalty_lambda: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     signal_polarity_mode: Literal["normal", "auto_train_ic", "auto_train_pnl"] = "normal"
+    alignment_mode: Literal["strict_asof", "legacy_index"] = "strict_asof"
+    alignment_version: str = Field(default="strict_asof_v1", min_length=1, max_length=64)
+    max_feature_staleness_hours: int = Field(default=24 * 14, ge=1, le=24 * 365)
 
 
 class PnLAttributionRequest(BaseModel):

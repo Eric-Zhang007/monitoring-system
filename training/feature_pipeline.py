@@ -160,6 +160,7 @@ class FeaturePipeline:
         funding_rows: List[Dict] = []
         onchain_rows: List[Dict] = []
         event_rows: List[Dict] = []
+        global_event_rows: List[Dict] = []
         with self._connect() as conn:
             with conn.cursor() as cur:
                 try:
@@ -209,20 +210,54 @@ class FeaturePipeline:
                         (symbol, limit * 2),
                     )
                     onchain_rows = [dict(r) for r in cur.fetchall()]
-                    cur.execute(
-                        """
-                        SELECT e.occurred_at AS timestamp, e.source_tier, e.confidence_score
-                        FROM events e
-                        JOIN event_links el ON el.event_id = e.id
-                        JOIN entities en ON en.id = el.entity_id
-                        WHERE UPPER(en.symbol) = UPPER(%s)
-                          AND COALESCE(en.metadata->>'synthetic_link', 'false') <> 'true'
-                        ORDER BY e.occurred_at ASC
-                        LIMIT %s
-                        """,
-                        (symbol, limit * 2),
-                    )
+                    try:
+                        cur.execute(
+                            """
+                            SELECT COALESCE(e.available_at, e.occurred_at) AS timestamp, e.source_tier, e.confidence_score, 1.0::double precision AS scope_weight
+                            FROM events e
+                            JOIN event_links el ON el.event_id = e.id
+                            JOIN entities en ON en.id = el.entity_id
+                            WHERE UPPER(en.symbol) = UPPER(%s)
+                              AND COALESCE(en.metadata->>'synthetic_link', 'false') <> 'true'
+                            ORDER BY COALESCE(e.available_at, e.occurred_at) ASC
+                            LIMIT %s
+                            """,
+                            (symbol, limit * 2),
+                        )
+                    except Exception:
+                        cur.execute(
+                            """
+                            SELECT e.occurred_at AS timestamp, e.source_tier, e.confidence_score, 1.0::double precision AS scope_weight
+                            FROM events e
+                            JOIN event_links el ON el.event_id = e.id
+                            JOIN entities en ON en.id = el.entity_id
+                            WHERE UPPER(en.symbol) = UPPER(%s)
+                              AND COALESCE(en.metadata->>'synthetic_link', 'false') <> 'true'
+                            ORDER BY e.occurred_at ASC
+                            LIMIT %s
+                            """,
+                            (symbol, limit * 2),
+                        )
                     event_rows = [dict(r) for r in cur.fetchall()]
+                    try:
+                        cur.execute(
+                            """
+                            SELECT
+                                COALESCE(e.available_at, e.occurred_at) AS timestamp,
+                                e.source_tier,
+                                e.confidence_score,
+                                0.7::double precision AS scope_weight
+                            FROM events e
+                            WHERE e.market_scope = 'macro'
+                               OR COALESCE(e.payload->>'global_impact', 'false') = 'true'
+                            ORDER BY COALESCE(e.available_at, e.occurred_at) ASC
+                            LIMIT %s
+                            """,
+                            (max(50, limit // 8),),
+                        )
+                        global_event_rows = [dict(r) for r in cur.fetchall()]
+                    except Exception:
+                        global_event_rows = []
                 except Exception:
                     rows = []
                 if not rows:
@@ -253,7 +288,7 @@ class FeaturePipeline:
         max_event_tier = int(os.getenv("EVENT_MAX_SOURCE_TIER", "5"))
         tier_weights = self._source_tier_weights()
         ev_rows = []
-        for r in event_rows:
+        for r in event_rows + global_event_rows:
             tier = int(r.get("source_tier") or 5)
             conf = float(r.get("confidence_score") or 0.0)
             if conf < min_event_conf or tier > max_event_tier:
@@ -262,7 +297,7 @@ class FeaturePipeline:
                 {
                     "timestamp": r["timestamp"],
                     "tier": tier,
-                    "confidence": conf,
+                    "confidence": conf * float(r.get("scope_weight") or 1.0),
                     "tier_weight": float(tier_weights.get(tier, 0.1)),
                 }
             )
@@ -388,12 +423,12 @@ class FeaturePipeline:
                 cur.execute(
                     """
                     INSERT INTO feature_snapshots (
-                        target, track, as_of, as_of_ts, event_time, feature_version,
+                        target, track, as_of, as_of_ts, event_time, feature_available_at, feature_version,
                         feature_payload, data_version, lineage_id, created_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     """,
-                    (target, track, now, now, event_time or now, version, json.dumps(features), data_version, lineage_id),
+                    (target, track, now, now, event_time or now, now, version, json.dumps(features), data_version, lineage_id),
                 )
         return lineage_id
 
@@ -418,6 +453,7 @@ class FeaturePipeline:
                 now,
                 now,
                 event_time or now,
+                now,
                 version,
                 json.dumps(f),
                 data_version,
@@ -427,15 +463,29 @@ class FeaturePipeline:
         ]
         with self._connect() as conn:
             with conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO feature_snapshots (
-                        target, track, as_of, as_of_ts, event_time, feature_version,
-                        feature_payload, data_version, lineage_id, created_at
-                    ) VALUES %s
-                    """,
-                    rows,
-                    template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())",
-                )
+                try:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO feature_snapshots (
+                            target, track, as_of, as_of_ts, event_time, feature_available_at, feature_version,
+                            feature_payload, data_version, lineage_id, created_at
+                        ) VALUES %s
+                        """,
+                        rows,
+                        template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())",
+                    )
+                except Exception:
+                    rows_old = [r[:5] + r[6:] for r in rows]
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO feature_snapshots (
+                            target, track, as_of, as_of_ts, event_time, feature_version,
+                            feature_payload, data_version, lineage_id, created_at
+                        ) VALUES %s
+                        """,
+                        rows_old,
+                        template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())",
+                    )
         return lineage_id

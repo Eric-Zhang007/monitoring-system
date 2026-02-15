@@ -24,6 +24,7 @@ def _json_cmd(cmd: list[str]) -> Dict[str, Any]:
 
 
 def main() -> int:
+    min_sharpe_daily = float(os.getenv("GPU_CUTOVER_MIN_SHARPE_DAILY", os.getenv("BACKTEST_GATE_MIN_SHARPE_DAILY", "0.4")))
     strict_common = [
         "--score-source",
         "model",
@@ -46,6 +47,8 @@ def main() -> int:
             "5",
             "--min-observation-days",
             "14",
+            "--min-sharpe-daily",
+            str(min_sharpe_daily),
             *strict_common,
         ]
     ) or {}
@@ -86,6 +89,24 @@ def main() -> int:
             "20",
         ]
     ) or {}
+    no_leakage = _json_cmd(
+        [
+            "python3",
+            "scripts/validate_no_leakage.py",
+            "--track",
+            "liquid",
+            "--lookback-days",
+            "180",
+            "--score-source",
+            "model",
+            "--include-sources",
+            "prod",
+            "--exclude-sources",
+            "smoke,async_test,maintenance",
+            "--data-regimes",
+            "prod_live",
+        ]
+    ) or {}
 
     reject_rate_raw = hard.get("execution_reject_rate")
     reject_rate = float(reject_rate_raw) if reject_rate_raw is not None else 1.0
@@ -95,11 +116,13 @@ def main() -> int:
     hard_passed = bool(hard.get("hard_passed"))
     parity_passed = bool(parity.get("passed")) and str(parity.get("status") or "") == "passed"
     contracts_passed = bool(contracts.get("passed"))
+    leakage_passed = bool(no_leakage.get("passed"))
 
     gates = {
         "strict_contract_passed": contracts_passed,
         "hard_metrics_passed": hard_passed,
         "parity_30d_passed": parity_passed,
+        "no_leakage_passed": leakage_passed,
         "artifact_failure_ratio_le_0_05": artifact_ratio <= 0.05,
         "samples_completed_ge_20": completed >= 20,
         "execution_reject_rate_lt_0_01": reject_rate < 0.01,
@@ -120,9 +143,15 @@ def main() -> int:
             "score_source": "model",
             "data_regime": "prod_live",
         },
+        "hard_gate_config": {
+            "min_sharpe_daily": float(min_sharpe_daily),
+            "min_completed_runs": 5,
+            "min_observation_days": 14,
+        },
         "contracts": contracts,
         "hard_metrics": hard,
         "parity": parity,
+        "no_leakage": no_leakage,
         "recommended_window": f"{suggested_start} to {suggested_end}" if ready else "defer_until_gates_green",
     }
     print(json.dumps(out, ensure_ascii=False))

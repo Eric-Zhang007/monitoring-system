@@ -90,6 +90,9 @@ def main() -> int:
     ap.add_argument("--data-regime", default="", help="prod_live|maintenance_replay|mixed; empty means infer from run-source")
     ap.add_argument("--score-source", default="model", choices=["model", "heuristic"])
     ap.add_argument("--signal-polarity-mode", default="auto_train_ic", choices=["normal", "auto_train_ic", "auto_train_pnl"])
+    ap.add_argument("--alignment-mode", default="strict_asof", choices=["strict_asof", "legacy_index"])
+    ap.add_argument("--alignment-version", default="strict_asof_v1")
+    ap.add_argument("--max-feature-staleness-hours", type=int, default=24 * 14)
     ap.add_argument("--targets", default="BTC,ETH,SOL", help="comma-separated targets")
     ap.add_argument("--data-version", default="v1")
     ap.add_argument("--fee-bps", type=float, default=0.5)
@@ -135,6 +138,9 @@ def main() -> int:
             "data_regime": inferred_data_regime,
             "score_source": args.score_source,
             "signal_polarity_mode": args.signal_polarity_mode,
+            "alignment_mode": args.alignment_mode,
+            "alignment_version": args.alignment_version,
+            "max_feature_staleness_hours": int(args.max_feature_staleness_hours),
             "require_model_artifact": True,
             "targets": targets,
             "horizon": "1d",
@@ -172,6 +178,9 @@ def main() -> int:
                     "fee_bps": float(args.fee_bps),
                     "slippage_bps": float(args.slippage_bps),
                     "signal_polarity_mode": args.signal_polarity_mode,
+                    "alignment_mode": args.alignment_mode,
+                    "alignment_version": args.alignment_version,
+                    "max_feature_staleness_hours": int(args.max_feature_staleness_hours),
                 },
                 "metric": metric,
                 "status": "ok",

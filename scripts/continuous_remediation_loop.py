@@ -390,6 +390,9 @@ def main() -> int:
     ap.add_argument("--batch-runs", type=int, default=6)
     ap.add_argument("--fee-bps", type=float, default=0.5)
     ap.add_argument("--slippage-bps", type=float, default=0.2)
+    ap.add_argument("--alignment-mode", default="strict_asof", choices=["strict_asof", "legacy_index"])
+    ap.add_argument("--alignment-version", default="strict_asof_v1")
+    ap.add_argument("--max-feature-staleness-hours", type=int, default=24 * 14)
     ap.add_argument("--out-dir", default="artifacts/remediation_loops")
     ap.add_argument("--strict-targets", default="BTC,ETH,SOL")
     ap.add_argument("--signal-polarity-mode", default="auto_train_ic", choices=["normal", "auto_train_ic", "auto_train_pnl"])
@@ -508,6 +511,12 @@ def main() -> int:
             str(float(args.slippage_bps)),
             "--signal-polarity-mode",
             str(args.signal_polarity_mode),
+            "--alignment-mode",
+            str(args.alignment_mode),
+            "--alignment-version",
+            str(args.alignment_version),
+            "--max-feature-staleness-hours",
+            str(int(args.max_feature_staleness_hours)),
         ]
         if selected_candidate:
             batch_cmd.extend(_candidate_cli_args(selected_candidate))
@@ -551,6 +560,25 @@ def main() -> int:
                     "--min-observation-days",
                     "14",
                     *strict_common,
+                ],
+            ),
+            (
+                "no_leakage",
+                [
+                    "python3",
+                    "scripts/validate_no_leakage.py",
+                    "--track",
+                    "liquid",
+                    "--lookback-days",
+                    "180",
+                    "--score-source",
+                    "model",
+                    "--include-sources",
+                    "prod",
+                    "--exclude-sources",
+                    "smoke,async_test,maintenance",
+                    "--data-regimes",
+                    "prod_live",
                 ],
             ),
             (
@@ -626,6 +654,7 @@ def main() -> int:
             "suspected_backend_runtime_outdated": stale_runtime,
             "auto_rebuild_backend_triggered": rebuild_triggered,
             "hard_status": str((((records.get("hard_metrics") or {}).get("json") or {}).get("status") or "unknown")),
+            "no_leakage_passed": bool((((records.get("no_leakage") or {}).get("json") or {}).get("passed"))),
             "parity_status": str((((records.get("parity") or {}).get("json") or {}).get("status") or "unknown")),
             "candidate_source_mode": str(args.candidate_source),
             "candidate_pool_size": len(candidate_pool),

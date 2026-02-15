@@ -90,7 +90,7 @@ class DataCollectorV2:
         self.fetch_failure_threshold = int(os.getenv("CONNECTOR_FAILURE_THRESHOLD", "3"))
         self.fetch_cooldown_sec = float(os.getenv("CONNECTOR_COOLDOWN_SEC", "120.0"))
         self.metrics_port = int(os.getenv("COLLECTOR_METRICS_PORT", "9101"))
-        self.liquid_symbols = {s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL").split(",") if s.strip()}
+        self.liquid_symbols = {s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK").split(",") if s.strip()}
         self.connector_state: Dict[str, Dict[str, float]] = {}
 
         rss_feeds = [
@@ -101,7 +101,10 @@ class DataCollectorV2:
         alpha_key = os.getenv("ALPHAVANTAGE_API_KEY", "")
         coingecko_ids = [
             s.strip().lower()
-            for s in os.getenv("ONCHAIN_IDS", "bitcoin,ethereum,solana").split(",")
+            for s in os.getenv(
+                "ONCHAIN_IDS",
+                "bitcoin,ethereum,solana,binancecoin,ripple,cardano,dogecoin,tron,avalanche-2,chainlink",
+            ).split(",")
             if s.strip()
         ]
 

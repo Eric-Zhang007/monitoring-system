@@ -425,6 +425,69 @@ class V2Repository:
                     }
                 return out
 
+    def resolve_asset_universe_asof(
+        self,
+        track: str,
+        as_of: datetime,
+        fallback_targets: List[str],
+    ) -> Dict[str, Any]:
+        fallback = []
+        seen = set()
+        for t in fallback_targets:
+            sym = str(t or "").strip().upper()
+            if sym and sym not in seen:
+                seen.add(sym)
+                fallback.append(sym)
+        out: Dict[str, Any] = {
+            "track": str(track).strip().lower(),
+            "as_of": as_of.isoformat(),
+            "symbols": fallback,
+            "source": "env_default",
+            "universe_version": "env_default",
+            "snapshot_at": None,
+        }
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        """
+                        SELECT track, as_of, universe_version, source, symbols_json
+                        FROM asset_universe_snapshots
+                        WHERE track = %s
+                          AND as_of <= %s
+                        ORDER BY as_of DESC
+                        LIMIT 1
+                        """,
+                        (str(track).strip().lower(), as_of),
+                    )
+                except Exception:
+                    conn.rollback()
+                    return out
+                row = cur.fetchone()
+                if not row:
+                    return out
+                payload = row.get("symbols_json")
+                raw_symbols: List[str] = []
+                if isinstance(payload, list):
+                    raw_symbols = [str(x) for x in payload]
+                elif isinstance(payload, dict) and isinstance(payload.get("symbols"), list):
+                    raw_symbols = [str(x) for x in payload.get("symbols")]
+                symbols: List[str] = []
+                seen_symbols = set()
+                for v in raw_symbols:
+                    sym = str(v or "").strip().upper()
+                    if sym and sym not in seen_symbols:
+                        seen_symbols.add(sym)
+                        symbols.append(sym)
+                if not symbols:
+                    return out
+                out["symbols"] = symbols
+                out["source"] = str(row.get("source") or "snapshot")
+                out["universe_version"] = str(row.get("universe_version") or "unknown")
+                snap_as_of = row.get("as_of")
+                out["snapshot_at"] = snap_as_of.isoformat() if isinstance(snap_as_of, datetime) else None
+                return out
+
     def create_backtest_run(self, run_name: str, track: str, config: Dict[str, Any], run_source: str = "prod") -> int:
         with self._connect() as conn:
             with conn.cursor() as cur:

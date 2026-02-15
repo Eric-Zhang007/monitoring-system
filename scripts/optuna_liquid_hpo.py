@@ -41,7 +41,7 @@ def _default_workers(compute_tier: str) -> int:
 def _stage_config(stage: int, symbols: List[str]) -> StageConfig:
     syms = [s.strip().upper() for s in symbols if s.strip()]
     if not syms:
-        syms = ["BTC", "ETH", "SOL"]
+        syms = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "TRX", "AVAX", "LINK"]
     if stage == 1:
         return StageConfig(
             run_source="maintenance",
@@ -130,7 +130,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Parallel Optuna HPO for liquid strategy")
     ap.add_argument("--api-base", default=os.getenv("API_BASE", "http://localhost:8000"))
     ap.add_argument("--track", default="liquid")
-    ap.add_argument("--symbols", default="BTC,ETH,SOL")
+    ap.add_argument("--symbols", default="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK")
     ap.add_argument("--stage", type=int, default=1, choices=[1, 2, 3])
     ap.add_argument("--n-trials", type=int, default=50)
     ap.add_argument("--n-workers", type=int, default=0)

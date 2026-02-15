@@ -8,13 +8,13 @@ import psycopg2
 
 
 def _get_symbols() -> List[str]:
-    raw = os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL")
+    raw = os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK")
     out = []
     for part in raw.split(","):
         sym = part.strip().upper()
         if sym:
             out.append(sym)
-    return out or ["BTC", "ETH", "SOL"]
+    return out or ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "TRX", "AVAX", "LINK"]
 
 
 def main() -> None:
@@ -78,4 +78,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

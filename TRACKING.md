@@ -28,6 +28,39 @@
 - 当前不满足“严格 Sharpe≥1.5”硬门禁，暂不进入 AutoDL `2×A100` 生产切换；
 - 仅建议继续 `paper + maintenance/prod_live` 校准与训练迭代。
 
+## ✅ 2026-02-15 Top10资产池 + as-of快照 + 训练数据审计（本轮）
+
+1. **默认资产池扩容到 Top10**
+- 全链路默认 `LIQUID_SYMBOLS` 从 `BTC,ETH,SOL` 扩到：
+  - `BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK`
+- 已覆盖：`docker-compose`、`training`、`inference`、`collector`、回测批处理与调参脚本默认值。
+
+2. **回测目标池防前视（as-of 快照）**
+- 新增 Alembic 迁移：`backend/alembic/versions/20260215_0011_liquid_universe_snapshots.py`
+  - 新表：`asset_universe_snapshots(track, as_of, universe_version, source, symbols_json)`
+- `backend/v2_repository.py` 新增：
+  - `resolve_asset_universe_asof(track, as_of, fallback_targets)`
+- `backend/v2_router.py` `POST /api/v2/backtest/run` 升级：
+  - 当 `targets` 为空且 `track=liquid` 时，优先按 `as_of=回测窗口起点` 读取快照；
+  - 若快照/表不存在，自动回退环境变量默认资产池；
+  - 回测输出与 config 中新增 `universe_resolve` 审计信息。
+- `backend/schemas_v2.py` 新增请求字段：
+  - `use_universe_snapshot: bool = true`
+  - `universe_asof: Optional[datetime]`
+
+3. **训练数据纰漏审计与可迁移数据管道**
+- 新增：
+  - `scripts/audit_training_data_completeness.py`
+    - 按 symbol 输出 `market_bars_1h` 覆盖率、订单簿/资金费率/链上/事件关联样本统计。
+  - `scripts/seed_liquid_universe_snapshot.py`
+    - 一键写入 Top10 资产池快照（固定 as-of）。
+  - `scripts/ingest_bitget_market_bars.py`
+    - 支持 Top10、代理、Bitget 失败自动降级 CoinGecko、CSV 导出与 `--skip-db`。
+  - `scripts/import_market_bars_csv.py`
+    - 服务器侧 CSV upsert 到 `market_bars`。
+  - `scripts/server_nodocker_down.sh`
+    - 一键停掉无 Docker 模式的 `screen` 进程。
+
 ## ✅ 2026-02-15 双卡训练编排与无 Docker 路线补齐（本轮）
 
 1. **训练脚本双卡改造**
@@ -692,7 +725,7 @@
 - `risk/check` 在 kill switch 命中时，违规码统一为 `kill_switch_triggered:{track}:{strategy_id}`。
 
 3. **加密单域默认值收敛**
-- `LIQUID_SYMBOLS` 默认值统一为 `BTC,ETH,SOL`（训练、推理、Compose、回测默认目标）。
+- `LIQUID_SYMBOLS` 默认值统一为 `BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK`（训练、推理、Compose、回测默认目标）。
 
 4. **漂移与血缘口径修正**
 - `get_execution_slippage_samples` 仅统计 `filled|partially_filled`。

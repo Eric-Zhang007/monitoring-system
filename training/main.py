@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SYMBOLS = os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL").split(",")
+SYMBOLS = os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK").split(",")
 TRAIN_INTERVAL_SEC = int(os.getenv("TRAIN_INTERVAL_SEC", "21600"))
 TRAIN_RUN_ONCE = os.getenv("TRAIN_RUN_ONCE", "0").lower() in {"1", "true", "yes", "y"}
 TRAIN_ENABLE_VC = os.getenv("TRAIN_ENABLE_VC", "1").lower() in {"1", "true", "yes", "y"}

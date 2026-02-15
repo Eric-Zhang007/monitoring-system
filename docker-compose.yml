@@ -94,7 +94,7 @@ services:
       - EVENT_STREAM=event_stream
       - COLLECT_INTERVAL=300
       - API_BASE=http://backend:8000
-      - LIQUID_SYMBOLS=BTC,ETH,SOL
+      - LIQUID_SYMBOLS=BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK
       - INGEST_MAX_RETRIES=3
       - INGEST_TIMEOUT_SEC=8
       - COLLECTOR_METRICS_PORT=9101
@@ -121,7 +121,7 @@ services:
       - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=0
-      - LIQUID_SYMBOLS=BTC,ETH,SOL
+      - LIQUID_SYMBOLS=BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK
       - INFER_INTERVAL_SEC=60
     depends_on:
       - redis
@@ -151,7 +151,7 @@ services:
       - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=1
-      - LIQUID_SYMBOLS=BTC,ETH,SOL
+      - LIQUID_SYMBOLS=BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK
       - TRAIN_INTERVAL_SEC=21600
     depends_on:
       - postgres

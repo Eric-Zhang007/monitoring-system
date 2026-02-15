@@ -65,7 +65,7 @@ def main() -> int:
         payload = {
             "track": cfg.get("track") or "liquid",
             "run_source": "maintenance",
-            "targets": cfg.get("targets") or ["BTC", "ETH", "SOL"],
+            "targets": cfg.get("targets") or ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "TRX", "AVAX", "LINK"],
             "horizon": cfg.get("horizon") or "1d",
             "model_name": cfg.get("model_name") or "liquid_ttm_ensemble",
             "model_version": cfg.get("model_version") or "v2.1",

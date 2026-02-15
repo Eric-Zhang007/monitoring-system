@@ -19,6 +19,13 @@ def _default_map() -> Dict[str, List[str]]:
         "BTC": ["BTC", "BTC_BG2025_PERP", "BTC_BG2025_SPOT", "BTC_BG2025"],
         "ETH": ["ETH", "ETH_BG2025_PERP", "ETH_BG2025_SPOT", "ETH_BG2025"],
         "SOL": ["SOL", "SOL_BG2025_PERP", "SOL_BG2025_SPOT", "SOL_BG2025"],
+        "BNB": ["BNB"],
+        "XRP": ["XRP"],
+        "ADA": ["ADA"],
+        "DOGE": ["DOGE"],
+        "TRX": ["TRX"],
+        "AVAX": ["AVAX"],
+        "LINK": ["LINK"],
     }
 
 
@@ -41,7 +48,7 @@ def main() -> int:
     ap.add_argument("--timeframe", default="1h")
     ap.add_argument("--start", default="2025-01-01T00:00:00+00:00")
     ap.add_argument("--end", default=datetime.now(timezone.utc).isoformat())
-    ap.add_argument("--targets", default="BTC,ETH,SOL")
+    ap.add_argument("--targets", default="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK")
     ap.add_argument("--replace-window", action="store_true")
     ap.add_argument("--symbol-map-json", default="")
     args = ap.parse_args()

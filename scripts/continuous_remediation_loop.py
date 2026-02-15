@@ -43,7 +43,7 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 
 def _parse_targets(raw: str) -> List[str]:
     out = [s.strip().upper() for s in str(raw or "").split(",") if s.strip()]
-    return out or ["BTC", "ETH", "SOL"]
+    return out or ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "TRX", "AVAX", "LINK"]
 
 
 def _metric_trade_proxy(metric: Dict[str, Any]) -> float:
@@ -394,7 +394,7 @@ def main() -> int:
     ap.add_argument("--alignment-version", default="strict_asof_v1")
     ap.add_argument("--max-feature-staleness-hours", type=int, default=24 * 14)
     ap.add_argument("--out-dir", default="artifacts/remediation_loops")
-    ap.add_argument("--strict-targets", default="BTC,ETH,SOL")
+    ap.add_argument("--strict-targets", default="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK")
     ap.add_argument("--signal-polarity-mode", default="auto_train_ic", choices=["normal", "auto_train_ic", "auto_train_pnl"])
     ap.add_argument("--auto-rebuild-backend-on-stale", action="store_true")
     ap.add_argument("--candidate-source", default="auto", choices=["none", "auto", "grid", "optuna", "file"])

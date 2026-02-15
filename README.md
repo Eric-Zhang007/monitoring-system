@@ -74,7 +74,8 @@
   - `gpu_cutover_readiness_180d=false`（严格阈值下 blocker 为 `hard_metrics_passed`）
 
 ### 2026-02-15 P0 稳定化（本轮完善）
-- 默认资产域收敛为加密中频：`LIQUID_SYMBOLS` 默认改为 `BTC,ETH,SOL`（`docker-compose` / `inference` / `training` / `backtest` 默认目标）。
+- 默认资产域收敛为加密中频：`LIQUID_SYMBOLS` 默认改为 `BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK`（`docker-compose` / `inference` / `training` / `backtest` 默认目标）。
+- 回测默认目标池升级为“as-of 快照优先”：`/api/v2/backtest/run` 在 `targets` 为空时优先读取 `asset_universe_snapshots`（按回测窗口起点时间），避免当前资产池前视污染历史评估。
 - 风控违规码统一：`risk/check` 在 kill switch 命中时统一返回 `kill_switch_triggered:{track}:{strategy_id}`。
 - 漂移统计修正：执行滑点样本仅统计 `filled|partially_filled`，不再纳入 `submitted`。
 - 血缘一致性修正：`lineage/check` 在不指定 `target` 时按 `target` 分组比较最近两条快照，避免跨标的误比对。

@@ -21,6 +21,10 @@
 - `scripts/train_gpu_stage2.py`
 - `scripts/ingest_bitget_market_bars.py`
 - `scripts/import_market_bars_csv.py`
+- `scripts/seed_liquid_universe_snapshot.py`
+- `scripts/audit_training_data_completeness.py`
+- `scripts/server_nodocker_up.sh`
+- `scripts/server_nodocker_down.sh`
 
 ## 4. 标准执行流程
 
@@ -96,8 +100,25 @@ cd /path/to/monitoring-system
 export TRAIN_RUN_ONCE=1
 export TRAIN_ENABLE_VC=1
 export TRAIN_ENABLE_LIQUID=1
-export LIQUID_SYMBOLS=BTC,ETH,SOL
+export LIQUID_SYMBOLS=BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK
 python3 scripts/train_gpu_stage2.py --compute-tier a100x2 --nproc-per-node 2 --enable-vc --enable-liquid
+```
+
+### Step N2.2: 固定 as-of 资产池快照（防前视偏差）
+```bash
+python3 scripts/seed_liquid_universe_snapshot.py \
+  --track liquid \
+  --symbols BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK \
+  --as-of 2025-01-01T00:00:00Z \
+  --version top10_static_v1 \
+  --source pretrain_seed
+```
+
+### Step N2.3: 训练前数据完整性审计
+```bash
+python3 scripts/audit_training_data_completeness.py \
+  --symbols BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK \
+  --lookback-days 180
 ```
 
 ### Step N2.5: 服务器无法直连交易所时（本地拉数据再导入）

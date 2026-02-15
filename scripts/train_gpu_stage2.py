@@ -66,7 +66,7 @@ def _api_ready(api_base: str, timeout_sec: float = 3.0) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Stage-2 GPU training orchestrator (strict-asof + external events)")
-    ap.add_argument("--symbols", default=os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL"))
+    ap.add_argument("--symbols", default=os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"))
     ap.add_argument("--epochs", type=int, default=int(os.getenv("LIQUID_EPOCHS", "24")))
     ap.add_argument("--batch-size", type=int, default=int(os.getenv("LIQUID_BATCH_SIZE", "128")))
     ap.add_argument("--compute-tier", default=os.getenv("COMPUTE_TIER", "local"), choices=["local", "a100x2"])

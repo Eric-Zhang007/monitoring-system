@@ -14,7 +14,7 @@ import requests
 
 def _parse_targets(raw: str) -> List[str]:
     vals = [s.strip().upper() for s in str(raw or "").split(",") if s.strip()]
-    return vals or ["BTC", "ETH", "SOL"]
+    return vals or ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "TRX", "AVAX", "LINK"]
 
 
 def _required_metric_contract(metrics: Dict[str, Any]) -> List[str]:
@@ -73,7 +73,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Run strict prod_live model backtest batch")
     ap.add_argument("--api-base", default=os.getenv("API_BASE", "http://localhost:8000"))
     ap.add_argument("--track", default="liquid")
-    ap.add_argument("--targets", default=os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL"))
+    ap.add_argument("--targets", default=os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"))
     ap.add_argument("--n-runs", type=int, default=24)
     ap.add_argument("--sleep-sec", type=float, default=0.2)
     ap.add_argument("--request-timeout-sec", type=float, default=120.0)

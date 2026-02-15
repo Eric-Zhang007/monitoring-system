@@ -125,6 +125,8 @@ class PortfolioScoreResponse(BaseModel):
 class BacktestRunRequest(BaseModel):
     track: TrackType
     targets: List[str] = Field(default_factory=list)
+    use_universe_snapshot: bool = True
+    universe_asof: Optional[datetime] = None
     run_source: Literal["prod", "smoke", "async_test", "maintenance"] = "prod"
     data_regime: DataRegimeType = "prod_live"
     score_source: Literal["model", "heuristic"] = "model"

@@ -31,7 +31,7 @@ class Bar:
     volume: float
 
 
-def _parse_symbol_map(raw: str) -> Dict[str, str]:
+def _parse_symbol_map(raw: str, *, upper_value: bool = True) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for item in str(raw).split(","):
         part = item.strip()
@@ -39,10 +39,11 @@ def _parse_symbol_map(raw: str) -> Dict[str, str]:
             continue
         if ":" in part:
             src, dst = part.split(":", 1)
-            out[src.strip().upper()] = dst.strip().upper()
+            dst_norm = dst.strip().upper() if upper_value else dst.strip()
+            out[src.strip().upper()] = dst_norm
             continue
         src = part.upper()
-        dst = src[:-4] if src.endswith("USDT") else src
+        dst = (src[:-4] if src.endswith("USDT") else src) if upper_value else part
         out[src] = dst
     return out
 
@@ -206,13 +207,23 @@ def _upsert_market_bars(db_url: str, target_symbol: str, timeframe: str, bars: L
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Ingest Bitget candles into market_bars (no-docker path)")
-    ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT", help="Bitget symbols")
-    ap.add_argument("--symbol-map", default="BTCUSDT:BTC,ETHUSDT:ETH,SOLUSDT:SOL")
+    ap.add_argument(
+        "--symbols",
+        default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,AVAXUSDT,LINKUSDT",
+        help="Bitget symbols",
+    )
+    ap.add_argument(
+        "--symbol-map",
+        default="BTCUSDT:BTC,ETHUSDT:ETH,SOLUSDT:SOL,BNBUSDT:BNB,XRPUSDT:XRP,ADAUSDT:ADA,DOGEUSDT:DOGE,TRXUSDT:TRX,AVAXUSDT:AVAX,LINKUSDT:LINK",
+    )
     ap.add_argument("--market", choices=["perp", "spot"], default="perp")
     ap.add_argument("--days", type=int, default=120)
     ap.add_argument("--timeframe", default="1h")
     ap.add_argument("--fallback-source", choices=["none", "coingecko"], default="coingecko")
-    ap.add_argument("--coingecko-map", default="BTCUSDT:bitcoin,ETHUSDT:ethereum,SOLUSDT:solana")
+    ap.add_argument(
+        "--coingecko-map",
+        default="BTCUSDT:bitcoin,ETHUSDT:ethereum,SOLUSDT:solana,BNBUSDT:binancecoin,XRPUSDT:ripple,ADAUSDT:cardano,DOGEUSDT:dogecoin,TRXUSDT:tron,AVAXUSDT:avalanche-2,LINKUSDT:chainlink",
+    )
     ap.add_argument("--proxy", default=os.getenv("HTTPS_PROXY", os.getenv("ALL_PROXY", "")))
     ap.add_argument("--out-csv", default="", help="optional csv output path")
     ap.add_argument("--skip-db", action="store_true", help="fetch only, do not write database")
@@ -224,8 +235,8 @@ def main() -> int:
     start_dt = now - timedelta(days=max(1, int(args.days)))
     start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(now.timestamp() * 1000)
-    symbol_map = _parse_symbol_map(args.symbol_map)
-    coingecko_map = _parse_symbol_map(args.coingecko_map)
+    symbol_map = _parse_symbol_map(args.symbol_map, upper_value=True)
+    coingecko_map = _parse_symbol_map(args.coingecko_map, upper_value=False)
     req_symbols = [s.strip().upper() for s in str(args.symbols).split(",") if s.strip()]
     sess = _build_session(proxy=str(args.proxy))
     csv_rows: List[Dict[str, object]] = []

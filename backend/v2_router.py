@@ -86,6 +86,7 @@ FEATURE_VERSION = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 repo = V2Repository(DATABASE_URL)
 exec_engine = ExecutionEngine()
+DEFAULT_LIQUID_SYMBOLS = "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"
 
 
 def _sigmoid(x: float) -> float:
@@ -94,6 +95,10 @@ def _sigmoid(x: float) -> float:
     if x > 30:
         return 1.0
     return 1.0 / (1.0 + (2.718281828 ** (-x)))
+
+
+def _default_liquid_targets() -> List[str]:
+    return [s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", DEFAULT_LIQUID_SYMBOLS).split(",") if s.strip()]
 
 
 def _risk_limits() -> Dict[str, float]:
@@ -1894,17 +1899,46 @@ async def get_prediction_explanation(prediction_id: int):
 @router.post("/backtest/run", response_model=BacktestRunResponse)
 async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
     targets = payload.targets
+    universe_resolve: Dict[str, Any] = {}
     if not targets:
         if payload.track == "liquid":
-            targets = [s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL").split(",") if s.strip()]
+            env_targets = _default_liquid_targets()
+            if payload.use_universe_snapshot:
+                resolve_asof = payload.universe_asof or (datetime.utcnow() - timedelta(days=max(1, int(payload.lookback_days))))
+                universe_resolve = repo.resolve_asset_universe_asof(
+                    track="liquid",
+                    as_of=resolve_asof,
+                    fallback_targets=env_targets,
+                )
+                targets = [s.strip().upper() for s in universe_resolve.get("symbols", []) if str(s).strip()]
+            else:
+                targets = env_targets
+                universe_resolve = {
+                    "track": "liquid",
+                    "as_of": None,
+                    "symbols": targets,
+                    "source": "env_default",
+                    "universe_version": "env_default",
+                    "snapshot_at": None,
+                }
         else:
             targets = ["OpenAI", "Anthropic", "Scale AI"]
+    elif payload.track == "liquid":
+        universe_resolve = {
+            "track": "liquid",
+            "as_of": None,
+            "symbols": [s.strip().upper() for s in targets if str(s).strip()],
+            "source": "payload_targets",
+            "universe_version": "manual",
+            "snapshot_at": None,
+        }
+    targets = [str(s).strip().upper() for s in targets if str(s).strip()]
 
     run_name = f"{payload.track}-wf-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
     cost_cfg = _cost_model_settings()
     effective_fee_bps = float(payload.fee_bps if payload.fee_bps >= 0 else cost_cfg["fee_bps"])
     effective_slippage_bps = float(payload.slippage_bps if payload.slippage_bps >= 0 else cost_cfg["slippage_bps"])
-    config = payload.model_dump()
+    config = payload.model_dump(mode="json")
     score_source = _score_source_filter(payload.score_source)
     data_regime = str(payload.data_regime).strip().lower()
     if "data_regime" not in payload.model_fields_set:
@@ -1921,6 +1955,8 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
     config["score_source"] = score_source
     config["data_regime"] = data_regime
     config["targets"] = targets
+    if payload.track == "liquid":
+        config["universe_resolve"] = universe_resolve
     config["fee_bps"] = effective_fee_bps
     config["slippage_bps"] = effective_slippage_bps
     run_id = repo.create_backtest_run(run_name=run_name, track=payload.track, config=config, run_source=payload.run_source)
@@ -1962,6 +1998,7 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             "fallback_used": False,
             "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
             "gate_passed": False,
+            "universe_resolve": universe_resolve,
         }
         repo.finish_backtest_run(run_id, agg)
         BACKTEST_FAILED_RUNS_TOTAL.labels(track=payload.track, reason=str(agg["reason"])).inc()
@@ -2045,6 +2082,7 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             "fallback_used": False,
             "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
             "gate_passed": False,
+            "universe_resolve": universe_resolve,
         }
     else:
         per_target: Dict[str, Dict[str, float]] = {}
@@ -2136,6 +2174,7 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
                 "alignment_mode": payload.alignment_mode,
                 "alignment_version": payload.alignment_version,
             },
+            "universe_resolve": universe_resolve,
         }
         agg["gate_passed"] = bool(
             agg["ic"] > 0

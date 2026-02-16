@@ -119,6 +119,22 @@ def _payload_social_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _ensure_alignment_and_provenance_payload(payload: Dict[str, Any], event_times: Dict[str, str]) -> Dict[str, Any]:
+    out = dict(payload or {})
+    out["time_alignment"] = dict(out.get("time_alignment") or {})
+    out["time_alignment"].setdefault("alignment_mode", "strict_asof_v1")
+    out["time_alignment"].setdefault("occurred_at", str(event_times.get("occurred_at") or ""))
+    out["time_alignment"].setdefault("published_at", str(event_times.get("published_at") or ""))
+    out["time_alignment"].setdefault("available_at", str(event_times.get("available_at") or ""))
+    out["time_alignment"].setdefault("effective_at", str(event_times.get("effective_at") or ""))
+    out["time_alignment"].setdefault("monotonic_non_decreasing", True)
+    out["provenance"] = dict(out.get("provenance") or {})
+    out["provenance"].setdefault("source_script", "scripts/import_social_events_jsonl.py")
+    out["provenance"].setdefault("ingest_mode", "social_jsonl_import")
+    out["provenance"].setdefault("ingested_at", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    return out
+
+
 def _symbols_to_entities(symbols: Iterable[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for symbol in _normalize_symbols(list(symbols)):
@@ -153,6 +169,16 @@ def to_canonical_event(raw: Dict[str, Any]) -> Dict[str, Any]:
         canonical["published_at"] = _parse_datetime(canonical.get("published_at") or canonical["occurred_at"])
         canonical["available_at"] = _parse_datetime(canonical.get("available_at") or canonical["published_at"])
         canonical["effective_at"] = _parse_datetime(canonical.get("effective_at") or canonical["available_at"])
+        canonical_payload = _ensure_alignment_and_provenance_payload(
+            canonical_payload,
+            event_times={
+                "occurred_at": str(canonical.get("occurred_at") or ""),
+                "published_at": str(canonical.get("published_at") or ""),
+                "available_at": str(canonical.get("available_at") or ""),
+                "effective_at": str(canonical.get("effective_at") or ""),
+            },
+        )
+        canonical["payload"] = canonical_payload
         canonical["event_type"] = str(canonical.get("event_type") or "market")
         canonical["market_scope"] = str(canonical.get("market_scope") or "crypto")
         return canonical
@@ -232,13 +258,27 @@ def to_canonical_event(raw: Dict[str, Any]) -> Dict[str, Any]:
     novelty = max(0.0, min(1.0, _safe_float(raw.get("novelty_score"), default=0.5)))
     entity_conf = max(0.0, min(1.0, _safe_float(raw.get("entity_confidence"), default=0.5)))
 
+    occurred_at_iso = occurred_at
+    published_at_iso = _parse_datetime(raw.get("published_at") or occurred_at_iso)
+    available_at_iso = _parse_datetime(raw.get("available_at") or occurred_at_iso)
+    effective_at_iso = _parse_datetime(raw.get("effective_at") or occurred_at_iso)
+    out_payload = _ensure_alignment_and_provenance_payload(
+        out_payload,
+        event_times={
+            "occurred_at": occurred_at_iso,
+            "published_at": published_at_iso,
+            "available_at": available_at_iso,
+            "effective_at": effective_at_iso,
+        },
+    )
+
     return {
         "event_type": event_type,
         "title": title[:500],
-        "occurred_at": occurred_at,
-        "published_at": _parse_datetime(raw.get("published_at") or occurred_at),
-        "available_at": _parse_datetime(raw.get("available_at") or occurred_at),
-        "effective_at": _parse_datetime(raw.get("effective_at") or occurred_at),
+        "occurred_at": occurred_at_iso,
+        "published_at": published_at_iso,
+        "available_at": available_at_iso,
+        "effective_at": effective_at_iso,
         "source_url": str(raw.get("source_url") or raw.get("url") or ""),
         "source_name": str(raw.get("source_name") or f"social_{platform}"),
         "source_timezone": str(raw.get("source_timezone") or "UTC"),

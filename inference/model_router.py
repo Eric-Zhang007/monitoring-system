@@ -99,8 +99,15 @@ class ModelRouter:
         self.torch_cache: Dict[str, Dict[str, Any]] = {}
         self.tabular_cache: Dict[str, Dict[str, Any]] = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.expected_feature_schema = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.2")
+        self.expected_feature_schema = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.3")
+        self.compatible_feature_schemas = self._resolve_compatible_schemas(self.expected_feature_schema)
         self.expected_data_version = os.getenv("DATA_VERSION", "v1")
+
+    @staticmethod
+    def _resolve_compatible_schemas(expected: str) -> set[str]:
+        cur = str(expected or "").strip() or "v2.3"
+        out = {cur, "v2.2"}
+        return {x for x in out if x}
 
     @staticmethod
     def _align_features(features: np.ndarray, in_dim: int) -> np.ndarray:
@@ -174,7 +181,7 @@ class ModelRouter:
         elif model_name == "tsmixer_liquid":
             ckpt_schema = str(ckpt.get("feature_payload_schema_version") or "").strip()
             ckpt_data_version = str(ckpt.get("data_version") or "").strip()
-            if ckpt_schema and ckpt_schema != self.expected_feature_schema:
+            if ckpt_schema and ckpt_schema not in self.compatible_feature_schemas:
                 return None
             if ckpt_data_version and ckpt_data_version != self.expected_data_version:
                 return None
@@ -220,6 +227,9 @@ class ModelRouter:
         if str(model.get("feature_version") or "").strip() != os.getenv("FEATURE_VERSION", "feature-store-v2.1"):
             return None
         if str(model.get("data_version") or "").strip() != self.expected_data_version:
+            return None
+        schema_version = str(model.get("feature_payload_schema_version") or "").strip()
+        if schema_version and schema_version not in self.compatible_feature_schemas:
             return None
         loaded: Dict[str, Any] = {
             "name": str(model.get("model") or "unknown"),

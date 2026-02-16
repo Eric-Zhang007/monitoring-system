@@ -302,7 +302,16 @@ def _build_feature_rows(candles: List[Candle], event_points: Optional[List[Event
             "social_influence_norm": 0.0,
             "social_event_ratio": 0.0,
             "social_buzz": 0.0,
-            "feature_payload_schema_version": "v2.2",
+            "event_velocity_1h": 0.0,
+            "event_velocity_6h": 0.0,
+            "event_disagreement": 0.0,
+            "source_diversity": 0.0,
+            "cross_source_consensus": 0.0,
+            "comment_skew": 0.0,
+            "event_lag_bucket_0_1h": 0.0,
+            "event_lag_bucket_1_6h": 0.0,
+            "event_lag_bucket_6_24h": 0.0,
+            "feature_payload_schema_version": "v2.3",
         }
         rows.append((candles[i].ts_ms, feat))
     return rows

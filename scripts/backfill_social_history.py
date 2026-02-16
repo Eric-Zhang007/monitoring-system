@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 
 def _to_bool(raw: str, default: bool = False) -> bool:
@@ -31,6 +33,38 @@ def _normalize_symbols(raw: Iterable[object]) -> List[str]:
     return out
 
 
+def _detect_language(text: str) -> str:
+    body = str(text or "").strip()
+    if not body:
+        return "other"
+    if re.search(r"[\u4e00-\u9fff]", body):
+        return "zh"
+    if re.search(r"[A-Za-z]", body):
+        return "en"
+    return "other"
+
+
+def _parse_dt_utc(raw: object) -> datetime:
+    if isinstance(raw, datetime):
+        if raw.tzinfo is None:
+            raw = raw.replace(tzinfo=timezone.utc)
+        return raw.astimezone(timezone.utc)
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("empty_datetime")
+    norm = text.replace(" ", "T")
+    if norm.endswith("Z"):
+        norm = norm[:-1] + "+00:00"
+    dt_obj = datetime.fromisoformat(norm)
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+    return dt_obj.astimezone(timezone.utc)
+
+
+def _to_iso_z(ts: datetime) -> str:
+    return ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _ensure_social_payload(payload: Dict[str, object]) -> Dict[str, object]:
     defaults = {
         "social_platform": "none",
@@ -50,6 +84,28 @@ def _ensure_social_payload(payload: Dict[str, object]) -> Dict[str, object]:
         out.setdefault(key, list(value) if isinstance(value, list) else value)
     out["symbol_mentions"] = _normalize_symbols(out.get("symbol_mentions") or [])
     return out
+
+
+def _normalize_time_alignment(event: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    occurred_at = _parse_dt_utc(event.get("occurred_at") or datetime.now(timezone.utc))
+    published_at = _parse_dt_utc(event.get("published_at") or occurred_at)
+    if published_at < occurred_at:
+        published_at = occurred_at
+    available_at = _parse_dt_utc(event.get("available_at") or published_at)
+    if available_at < published_at:
+        available_at = published_at
+    effective_at = _parse_dt_utc(event.get("effective_at") or available_at)
+    if effective_at < available_at:
+        effective_at = available_at
+    event["occurred_at"] = _to_iso_z(occurred_at)
+    event["published_at"] = _to_iso_z(published_at)
+    event["available_at"] = _to_iso_z(available_at)
+    event["effective_at"] = _to_iso_z(effective_at)
+    source_latency_ms = int(max(0.0, (available_at - occurred_at).total_seconds() * 1000.0))
+    event["source_latency_ms"] = int(max(int(event.get("source_latency_ms") or 0), source_latency_ms))
+    event["latency_ms"] = int(max(int(event.get("latency_ms") or 0), source_latency_ms))
+    monotonic = bool(occurred_at <= published_at <= available_at <= effective_at)
+    return event, monotonic
 
 
 def _dedup(events: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -133,6 +189,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Backfill social-source events into canonical JSONL")
     ap.add_argument("--sources", default=os.getenv("SOCIAL_CONNECTORS", "twitter,reddit,youtube,telegram"))
     ap.add_argument("--out-jsonl", default="artifacts/social_history_backfill.jsonl")
+    ap.add_argument("--start", default="", help="inclusive UTC start, e.g. 2018-01-01T00:00:00Z")
+    ap.add_argument("--end", default="", help="inclusive UTC end, default now")
+    ap.add_argument("--language-targets", default=os.getenv("SOCIAL_LANGUAGE_TARGETS", "en,zh"))
+    ap.add_argument("--pipeline-tag", default=os.getenv("SOCIAL_PIPELINE_TAG", "task_h_social_2018_now"))
+    ap.add_argument("--provenance-run-id", default=os.getenv("SOCIAL_PROVENANCE_RUN_ID", ""))
+    ap.add_argument("--max-fetch-retries", type=int, default=max(1, int(os.getenv("SOCIAL_FETCH_MAX_RETRIES", "3"))))
+    ap.add_argument("--retry-backoff-sec", type=float, default=float(os.getenv("SOCIAL_FETCH_RETRY_BACKOFF_SEC", "1.0")))
+    ap.add_argument("--dry-run", action="store_true", help="plan connector run only; no fetch")
 
     ap.add_argument("--twitter-bearer-token", default=os.getenv("TWITTER_BEARER_TOKEN", ""))
     ap.add_argument(
@@ -168,19 +232,64 @@ def main() -> int:
     ap.add_argument("--llm-max-events", type=int, default=int(os.getenv("LLM_ENRICH_MAX_EVENTS", "0")))
     args = ap.parse_args()
 
+    end_dt = _parse_dt_utc(args.end) if str(args.end).strip() else datetime.now(timezone.utc)
+    start_dt = _parse_dt_utc(args.start) if str(args.start).strip() else datetime(2018, 1, 1, tzinfo=timezone.utc)
+    if end_dt <= start_dt:
+        raise RuntimeError("invalid_time_range_end_must_be_gt_start")
+    language_targets = {x.strip().lower() for x in str(args.language_targets).split(",") if x.strip()}
+    if not language_targets:
+        language_targets = {"en", "zh"}
+    selected_sources = [s.strip().lower() for s in str(args.sources).split(",") if s.strip()]
+
     liquid_symbols = [s.strip().upper() for s in str(args.liquid_symbols).split(",") if s.strip()]
     connectors = _build_connectors(args, liquid_symbols=liquid_symbols)
+    provenance_run_id = str(args.provenance_run_id).strip() or f"social-backfill-{int(time.time())}"
+
+    if bool(args.dry_run):
+        print(
+            json.dumps(
+                {
+                    "status": "dry_run",
+                    "pipeline_tag": str(args.pipeline_tag),
+                    "provenance_run_id": provenance_run_id,
+                    "start": _to_iso_z(start_dt),
+                    "end": _to_iso_z(end_dt),
+                    "sources": selected_sources,
+                    "connectors": [c.name for c in connectors],
+                    "language_targets": sorted(language_targets),
+                    "llm_enrich": bool(args.llm_enrich),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
 
     events: List[Dict[str, object]] = []
     failures: List[Dict[str, object]] = []
     counts: Dict[str, int] = {}
+    alignment_violations = 0
+    language_counts: Dict[str, int] = {}
+    dropped_outside_window = 0
+    dropped_language = 0
 
     for connector in connectors:
-        try:
-            raw_rows = connector.fetch()
-        except Exception as exc:
-            failures.append({"connector": connector.name, "stage": "fetch", "error": str(exc)[:240]})
+        raw_rows: List[Dict[str, Any]] = []
+        last_err: Exception | None = None
+        for attempt in range(1, max(1, int(args.max_fetch_retries)) + 1):
+            try:
+                raw_rows = connector.fetch()
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = exc
+                if attempt >= max(1, int(args.max_fetch_retries)):
+                    break
+                sleep_s = min(90.0, float(args.retry_backoff_sec) * (2 ** (attempt - 1)))
+                time.sleep(max(0.1, sleep_s))
+        if last_err is not None:
+            failures.append({"connector": connector.name, "stage": "fetch", "error": str(last_err)[:240]})
             continue
+
         counts[f"{connector.name}_raw"] = len(raw_rows)
         for raw in raw_rows:
             try:
@@ -189,11 +298,50 @@ def main() -> int:
                 failures.append({"connector": connector.name, "stage": "normalize", "error": str(exc)[:240]})
                 continue
             payload = _ensure_social_payload(dict(event.get("payload") or {}))
-            occurred_at = str(event.get("occurred_at") or datetime.utcnow().isoformat() + "Z")
+            base_text = f"{event.get('title') or ''}\n{payload.get('summary') or ''}"
+            detected_language = str(payload.get("language") or "").strip().lower() or _detect_language(base_text)
+            payload["language"] = detected_language
+            if detected_language not in language_targets:
+                dropped_language += 1
+                continue
+            language_counts[detected_language] = int(language_counts.get(detected_language, 0)) + 1
             event["payload"] = payload
-            event.setdefault("published_at", occurred_at)
-            event.setdefault("available_at", occurred_at)
-            event.setdefault("effective_at", occurred_at)
+            event.setdefault("published_at", event.get("occurred_at"))
+            event.setdefault("available_at", event.get("published_at"))
+            event.setdefault("effective_at", event.get("available_at"))
+            try:
+                event, monotonic = _normalize_time_alignment(event)
+            except Exception as exc:
+                failures.append({"connector": connector.name, "stage": "time_normalize", "error": str(exc)[:240]})
+                continue
+            if not monotonic:
+                alignment_violations += 1
+            occurred_dt = _parse_dt_utc(event.get("occurred_at"))
+            if occurred_dt < start_dt or occurred_dt > end_dt:
+                dropped_outside_window += 1
+                continue
+            provenance = {
+                "pipeline_tag": str(args.pipeline_tag),
+                "provenance_run_id": provenance_run_id,
+                "collector_connector": connector.name,
+                "window_start": _to_iso_z(start_dt),
+                "window_end": _to_iso_z(end_dt),
+                "language_targets": sorted(language_targets),
+                "source_script": "scripts/backfill_social_history.py",
+                "generated_at": _to_iso_z(datetime.now(timezone.utc)),
+            }
+            time_alignment_meta = {
+                "alignment_mode": "strict_asof_v1",
+                "occurred_at": str(event.get("occurred_at")),
+                "published_at": str(event.get("published_at")),
+                "available_at": str(event.get("available_at")),
+                "effective_at": str(event.get("effective_at")),
+                "monotonic_non_decreasing": bool(monotonic),
+            }
+            event_payload = dict(event.get("payload") or {})
+            event_payload["provenance"] = provenance
+            event_payload["time_alignment"] = time_alignment_meta
+            event["payload"] = event_payload
             events.append(event)
 
     if args.dedup:
@@ -227,6 +375,15 @@ def main() -> int:
                 "counts": counts,
                 "events": len(events),
                 "failures": failures[:20],
+                "start": _to_iso_z(start_dt),
+                "end": _to_iso_z(end_dt),
+                "language_targets": sorted(language_targets),
+                "language_counts": language_counts,
+                "dropped_outside_window": dropped_outside_window,
+                "dropped_language": dropped_language,
+                "alignment_violations": alignment_violations,
+                "pipeline_tag": str(args.pipeline_tag),
+                "provenance_run_id": provenance_run_id,
                 "llm_enrichment": llm_meta,
                 "out_jsonl": out_jsonl,
             },

@@ -8,9 +8,10 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import random
 import time
-from typing import Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import psycopg2
 from psycopg2.extras import execute_values
@@ -107,6 +108,102 @@ def _parse_dt_utc(raw: str) -> datetime:
     if dt_obj.tzinfo is None:
         dt_obj = dt_obj.replace(tzinfo=timezone.utc)
     return dt_obj.astimezone(timezone.utc)
+
+
+def _to_iso_z(ts: datetime) -> str:
+    return ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _utc_from_ms(ts_ms: int) -> datetime:
+    return datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc)
+
+
+def _iter_chunks_ms(start_ms: int, end_ms: int, chunk_days: int) -> Iterable[Tuple[int, int]]:
+    cur = int(start_ms)
+    chunk_ms = max(1, int(chunk_days)) * 24 * 60 * 60 * 1000
+    while cur <= int(end_ms):
+        nxt = min(int(end_ms), cur + chunk_ms - 1)
+        yield cur, nxt
+        cur = nxt + 1
+
+
+def _chunk_id(idx: int, start_ms: int, end_ms: int) -> str:
+    return f"{idx:05d}_{start_ms}-{end_ms}"
+
+
+def _run_spec(
+    *,
+    market: str,
+    timeframe: str,
+    symbols: List[str],
+    start_ms: int,
+    end_ms: int,
+    chunk_days: int,
+) -> Dict[str, Any]:
+    return {
+        "market": str(market),
+        "timeframe": str(timeframe),
+        "symbols": list(symbols),
+        "start_ms": int(start_ms),
+        "end_ms": int(end_ms),
+        "chunk_days": int(chunk_days),
+    }
+
+
+def _load_checkpoint(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise RuntimeError("invalid_checkpoint_not_object")
+    return obj
+
+
+def _save_checkpoint(path: str, state: Dict[str, Any]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(str(tmp), str(p))
+
+
+def _ensure_checkpoint(
+    *,
+    path: str,
+    resume: bool,
+    run_spec: Dict[str, Any],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    now_iso = _to_iso_z(datetime.now(timezone.utc))
+    if resume and os.path.exists(path):
+        state = _load_checkpoint(path)
+        ck_spec = dict(state.get("run_spec") or {})
+        if ck_spec != run_spec:
+            raise RuntimeError(
+                json.dumps(
+                    {
+                        "checkpoint_mismatch": True,
+                        "checkpoint_file": path,
+                        "checkpoint_run_spec": ck_spec,
+                        "current_run_spec": run_spec,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        state["updated_at"] = now_iso
+        if "completed_chunks" not in state or not isinstance(state.get("completed_chunks"), dict):
+            state["completed_chunks"] = {}
+        return state
+    state = {
+        "version": 1,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "run_spec": run_spec,
+        "completed_chunks": {},
+    }
+    if (not dry_run) and path:
+        _save_checkpoint(path, state)
+    return state
 
 
 def _build_session(proxy: str = "") -> requests.Session:
@@ -356,6 +453,11 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=max(1, int(os.getenv("INGEST_WORKERS", "4"))))
     ap.add_argument("--max-fetch-retries", type=int, default=max(1, int(os.getenv("INGEST_MAX_FETCH_RETRIES", "4"))))
     ap.add_argument("--retry-backoff-sec", type=float, default=float(os.getenv("INGEST_RETRY_BACKOFF_SEC", "1.0")))
+    ap.add_argument("--chunk-days", type=int, default=max(1, int(os.getenv("INGEST_CHUNK_DAYS", "30"))))
+    ap.add_argument("--checkpoint-file", default="", help="json checkpoint file for resumable long-range backfill")
+    ap.add_argument("--resume", action="store_true", help="resume from checkpoint-file")
+    ap.add_argument("--max-chunks", type=int, default=0, help="optional chunk cap for staged backfill")
+    ap.add_argument("--dry-run", action="store_true", help="plan chunks only; no network/db/csv writes")
     ap.add_argument("--allow-partial", action="store_true", help="continue if some symbols fail")
     args = ap.parse_args()
 
@@ -371,11 +473,32 @@ def main() -> int:
     symbol_map = _parse_symbol_map(args.symbol_map, upper_value=True)
     coingecko_map = _parse_symbol_map(args.coingecko_map, upper_value=False)
     req_symbols = [s.strip().upper() for s in str(args.symbols).split(",") if s.strip()]
-    summary: Dict[str, Dict[str, object]] = {}
+    run_spec = _run_spec(
+        market=str(args.market),
+        timeframe=str(args.timeframe),
+        symbols=req_symbols,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        chunk_days=max(1, int(args.chunk_days)),
+    )
+    checkpoint_file = str(args.checkpoint_file).strip()
+    checkpoint = None
+    completed_chunk_ids = set()
+    if checkpoint_file:
+        checkpoint = _ensure_checkpoint(
+            path=checkpoint_file,
+            resume=bool(args.resume),
+            run_spec=run_spec,
+            dry_run=bool(args.dry_run),
+        )
+        completed_chunk_ids = set((checkpoint.get("completed_chunks") or {}).keys())
+
+    summary_rows: Dict[str, int] = {}
+    summary_sources: Dict[str, set] = {}
     out_csv = str(args.out_csv).strip()
     csv_file = None
     csv_writer = None
-    if out_csv:
+    if out_csv and not bool(args.dry_run):
         os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
         csv_file = open(out_csv, "w", encoding="utf-8", newline="")
         csv_writer = csv.DictWriter(
@@ -385,65 +508,144 @@ def main() -> int:
         csv_writer.writeheader()
 
     failed: List[Dict[str, str]] = []
+    chunks = list(_iter_chunks_ms(start_ms, end_ms, chunk_days=max(1, int(args.chunk_days))))
+    dry_plan: List[Dict[str, object]] = []
+    chunks_attempted = 0
+    chunks_skipped_resume = 0
+    chunks_completed = 0
     workers = max(1, int(args.workers))
     try:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {}
-            for src_symbol in req_symbols:
-                target = symbol_map.get(src_symbol) or (src_symbol[:-4] if src_symbol.endswith("USDT") else src_symbol)
-                fut = ex.submit(
-                    _fetch_one_symbol,
-                    src_symbol=src_symbol,
-                    target_symbol=target,
-                    market=str(args.market),
-                    timeframe=str(args.timeframe),
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    fallback_source=str(args.fallback_source),
-                    coingecko_map=coingecko_map,
-                    proxy=str(args.proxy),
-                    source_label=str(args.source),
-                    days_for_fallback=int(args.days),
-                    max_retries=int(args.max_fetch_retries),
-                    retry_backoff_sec=float(args.retry_backoff_sec),
+        for idx, (chunk_start_ms, chunk_end_ms) in enumerate(chunks):
+            if int(args.max_chunks) > 0 and chunks_attempted >= int(args.max_chunks):
+                break
+            chunk_name = _chunk_id(idx, chunk_start_ms, chunk_end_ms)
+            if chunk_name in completed_chunk_ids:
+                chunks_skipped_resume += 1
+                continue
+            chunks_attempted += 1
+            if bool(args.dry_run):
+                dry_plan.append(
+                    {
+                        "chunk": chunk_name,
+                        "start": _to_iso_z(_utc_from_ms(chunk_start_ms)),
+                        "end": _to_iso_z(_utc_from_ms(chunk_end_ms)),
+                        "symbols": req_symbols,
+                    }
                 )
-                futs[fut] = {"src_symbol": src_symbol, "target_symbol": target}
-            for fut in as_completed(futs):
-                meta = futs[fut]
-                src_symbol = str(meta.get("src_symbol") or "")
-                target = str(meta.get("target_symbol") or "")
-                try:
-                    target, bars, used_source = fut.result()
-                    if csv_writer is not None:
-                        for bar in bars:
-                            csv_writer.writerow(
-                                {
-                                    "symbol": target,
-                                    "timeframe": str(args.timeframe),
-                                    "ts": datetime.fromtimestamp(bar.ts_ms / 1000.0, tz=timezone.utc).isoformat(),
-                                    "open": float(bar.open),
-                                    "high": float(bar.high),
-                                    "low": float(bar.low),
-                                    "close": float(bar.close),
-                                    "volume": float(bar.volume),
-                                    "trades_count": 0,
-                                    "source": used_source,
-                                }
+                continue
+
+            chunk_failed: List[Dict[str, str]] = []
+            chunk_rows = 0
+            days_for_fallback = max(1, int(((chunk_end_ms - chunk_start_ms) / (24 * 60 * 60 * 1000)) + 2))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {}
+                for src_symbol in req_symbols:
+                    target = symbol_map.get(src_symbol) or (src_symbol[:-4] if src_symbol.endswith("USDT") else src_symbol)
+                    fut = ex.submit(
+                        _fetch_one_symbol,
+                        src_symbol=src_symbol,
+                        target_symbol=target,
+                        market=str(args.market),
+                        timeframe=str(args.timeframe),
+                        start_ms=chunk_start_ms,
+                        end_ms=chunk_end_ms,
+                        fallback_source=str(args.fallback_source),
+                        coingecko_map=coingecko_map,
+                        proxy=str(args.proxy),
+                        source_label=str(args.source),
+                        days_for_fallback=days_for_fallback,
+                        max_retries=int(args.max_fetch_retries),
+                        retry_backoff_sec=float(args.retry_backoff_sec),
+                    )
+                    futs[fut] = {"src_symbol": src_symbol, "target_symbol": target}
+                for fut in as_completed(futs):
+                    meta = futs[fut]
+                    src_symbol = str(meta.get("src_symbol") or "")
+                    target = str(meta.get("target_symbol") or "")
+                    try:
+                        target, bars, used_source = fut.result()
+                        if csv_writer is not None:
+                            for bar in bars:
+                                csv_writer.writerow(
+                                    {
+                                        "symbol": target,
+                                        "timeframe": str(args.timeframe),
+                                        "ts": datetime.fromtimestamp(bar.ts_ms / 1000.0, tz=timezone.utc).isoformat(),
+                                        "open": float(bar.open),
+                                        "high": float(bar.high),
+                                        "low": float(bar.low),
+                                        "close": float(bar.close),
+                                        "volume": float(bar.volume),
+                                        "trades_count": 0,
+                                        "source": used_source,
+                                    }
+                                )
+                        if bool(args.skip_db):
+                            count = int(len(bars))
+                        else:
+                            count = _upsert_market_bars(
+                                args.database_url,
+                                target_symbol=target,
+                                timeframe=str(args.timeframe),
+                                bars=bars,
+                                source=used_source,
                             )
-                    if bool(args.skip_db):
-                        count = int(len(bars))
-                    else:
-                        count = _upsert_market_bars(args.database_url, target_symbol=target, timeframe=str(args.timeframe), bars=bars, source=used_source)
-                    summary[target] = {"rows": int(count), "source": used_source}
-                except Exception as exc:
-                    failed.append({"src_symbol": src_symbol, "target_symbol": target, "error": str(exc)})
-                    summary[target or src_symbol] = {"rows": 0, "source": "failed", "error": str(exc)}
+                        chunk_rows += int(count)
+                        summary_rows[target] = int(summary_rows.get(target, 0)) + int(count)
+                        summary_sources.setdefault(target, set()).add(str(used_source))
+                    except Exception as exc:
+                        chunk_failed.append({"src_symbol": src_symbol, "target_symbol": target, "error": str(exc)})
+                        failed.append({"chunk": chunk_name, "src_symbol": src_symbol, "target_symbol": target, "error": str(exc)})
+                        summary_rows.setdefault(target or src_symbol, 0)
+                        summary_sources.setdefault(target or src_symbol, set()).add("failed")
+
+            if checkpoint_file and checkpoint is not None:
+                completed_map = checkpoint.setdefault("completed_chunks", {})
+                completed_map[chunk_name] = {
+                    "start": _to_iso_z(_utc_from_ms(chunk_start_ms)),
+                    "end": _to_iso_z(_utc_from_ms(chunk_end_ms)),
+                    "rows": int(chunk_rows),
+                    "failed_symbols": chunk_failed,
+                    "completed_at": _to_iso_z(datetime.now(timezone.utc)),
+                }
+                checkpoint["updated_at"] = _to_iso_z(datetime.now(timezone.utc))
+                _save_checkpoint(checkpoint_file, checkpoint)
+                completed_chunk_ids.add(chunk_name)
+
+            chunks_completed += 1
+            if chunk_failed and not bool(args.allow_partial):
+                raise RuntimeError(json.dumps({"failed_symbols": chunk_failed, "chunk": chunk_name}, ensure_ascii=False))
     finally:
         if csv_file is not None:
             csv_file.close()
 
+    if bool(args.dry_run):
+        print(
+            json.dumps(
+                {
+                    "status": "dry_run",
+                    "market": args.market,
+                    "start": start_dt.isoformat(),
+                    "end": end_dt.isoformat(),
+                    "chunks_total": len(chunks),
+                    "chunks_planned": len(dry_plan),
+                    "chunks_skipped_resume": chunks_skipped_resume,
+                    "chunk_days": int(args.chunk_days),
+                    "checkpoint_file": checkpoint_file or None,
+                    "plan": dry_plan,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
     if failed and not bool(args.allow_partial):
         raise RuntimeError(json.dumps({"failed_symbols": failed}, ensure_ascii=False))
+
+    summary = {
+        k: {"rows": int(summary_rows.get(k, 0)), "sources": sorted(list(summary_sources.get(k, set())))}
+        for k in sorted(summary_rows.keys())
+    }
 
     print(
         json.dumps(
@@ -453,6 +655,12 @@ def main() -> int:
                 "days": int(args.days),
                 "start": start_dt.isoformat(),
                 "end": end_dt.isoformat(),
+                "chunks_total": len(chunks),
+                "chunks_attempted": chunks_attempted,
+                "chunks_completed": chunks_completed,
+                "chunks_skipped_resume": chunks_skipped_resume,
+                "chunk_days": int(args.chunk_days),
+                "checkpoint_file": checkpoint_file or None,
                 "failed": failed,
                 "inserted": summary,
             },

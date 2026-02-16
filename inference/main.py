@@ -19,6 +19,13 @@ from psycopg2.extras import RealDictCursor
 import redis
 
 from explainer import build_explanation
+from liquid_feature_contract import (
+    LIQUID_FEATURE_KEYS,
+    LIQUID_FEATURE_SCHEMA_VERSION,
+    event_quality_profile,
+    source_tier_weights,
+    vector_from_payload,
+)
 from model_router import ModelRouter
 
 logging.basicConfig(
@@ -43,115 +50,18 @@ class InferenceServiceV2:
         self.active_model_ttl_sec = int(os.getenv("ACTIVE_MODEL_TTL_SEC", "30"))
         self.feature_version = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
         self.data_version = os.getenv("DATA_VERSION", "v1")
-        self.feature_payload_schema_version = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.2")
+        self.feature_payload_schema_version = LIQUID_FEATURE_SCHEMA_VERSION
 
     @staticmethod
     def _source_tier_weights() -> Dict[int, float]:
-        raw = os.getenv("SOURCE_TIER_WEIGHTS", "1=1.0,2=0.85,3=0.65,4=0.4,5=0.2")
-        out: Dict[int, float] = {1: 1.0, 2: 0.85, 3: 0.65, 4: 0.4, 5: 0.2}
-        for part in raw.split(","):
-            piece = part.strip()
-            if not piece or "=" not in piece:
-                continue
-            k_raw, v_raw = piece.split("=", 1)
-            try:
-                k = int(k_raw.strip())
-                v = float(v_raw.strip())
-            except Exception:
-                continue
-            if 1 <= k <= 5 and v >= 0:
-                out[k] = v
-        return out
+        return source_tier_weights()
 
-    def _event_quality_profile(self, event_ctx: List[Dict]) -> Dict[str, object]:
-        max_tier = int(os.getenv("EVENT_MAX_SOURCE_TIER", "5"))
-        min_conf = float(os.getenv("EVENT_MIN_CONFIDENCE", "0.0"))
-        tier_weights = self._source_tier_weights()
-        now = datetime.now(timezone.utc)
-        accepted: List[Dict[str, float]] = []
-        tier_counts: Dict[str, int] = {}
-        for e in event_ctx:
-            tier = int(e.get("source_tier") or 5)
-            conf = float(e.get("confidence_score") or 0.0)
-            if tier > max_tier or conf < min_conf:
-                continue
-            ts = e.get("available_at") or e.get("occurred_at")
-            if isinstance(ts, datetime):
-                ts_utc = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-            else:
-                ts_utc = now
-            age_hours = max(0.0, (now - ts_utc.astimezone(timezone.utc)).total_seconds() / 3600.0)
-            decay = float(np.exp(-age_hours / 12.0))
-            tier_w = float(tier_weights.get(tier, 0.1))
-            payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
-            social_platform = str(payload.get("social_platform") or "").strip().lower() if isinstance(payload, dict) else ""
-            is_social = bool(social_platform and social_platform not in {"none", "unknown"})
-            post_sent = float(payload.get("post_sentiment", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
-            comment_sent = float(payload.get("comment_sentiment", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
-            engagement = float(payload.get("engagement_score", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
-            followers = float(payload.get("author_followers", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
-            accepted.append(
-                {
-                    "decay": decay,
-                    "tier_weight": tier_w,
-                    "confidence": conf,
-                    "joint_weight": tier_w * conf,
-                    "is_social": 1.0 if is_social else 0.0,
-                    "post_sentiment": float(np.clip(post_sent, -1.0, 1.0)),
-                    "comment_sentiment": float(np.clip(comment_sent, -1.0, 1.0)),
-                    "engagement_score": max(0.0, engagement),
-                    "author_followers": max(0.0, followers),
-                }
-            )
-            tier_key = str(tier)
-            tier_counts[tier_key] = tier_counts.get(tier_key, 0) + 1
-        if not accepted:
-            return {
-                "event_decay": 0.0,
-                "source_tier_weight": 0.0,
-                "source_confidence": 0.0,
-                "social_post_sentiment": 0.0,
-                "social_comment_sentiment": 0.0,
-                "social_engagement_norm": 0.0,
-                "social_influence_norm": 0.0,
-                "social_event_ratio": 0.0,
-                "social_buzz": 0.0,
-                "source_tiers": {},
-                "missing_markers": ["event_quality_unavailable"],
-            }
-        den = float(sum(a["joint_weight"] for a in accepted))
-        event_decay = float(sum(a["joint_weight"] * a["decay"] for a in accepted) / max(1e-9, den))
-        tier_weight = float(sum(a["tier_weight"] for a in accepted) / max(1, len(accepted)))
-        conf_mean = float(sum(a["confidence"] for a in accepted) / max(1, len(accepted)))
-        social_den = float(sum(a["joint_weight"] for a in accepted if a.get("is_social", 0.0) > 0.5))
-        social_cnt = int(sum(1 for a in accepted if a.get("is_social", 0.0) > 0.5))
-        social_post = float(sum(a["joint_weight"] * a.get("post_sentiment", 0.0) for a in accepted if a.get("is_social", 0.0) > 0.5))
-        social_comment = float(sum(a["joint_weight"] * a.get("comment_sentiment", 0.0) for a in accepted if a.get("is_social", 0.0) > 0.5))
-        social_engage = float(
-            sum(a["joint_weight"] * float(np.log1p(float(a.get("engagement_score", 0.0)))) for a in accepted if a.get("is_social", 0.0) > 0.5)
-        )
-        social_followers = float(
-            sum(a["joint_weight"] * float(np.log1p(float(a.get("author_followers", 0.0)))) for a in accepted if a.get("is_social", 0.0) > 0.5)
-        )
-        social_post_sentiment = float(social_post / max(1e-9, social_den)) if social_den > 0 else 0.0
-        social_comment_sentiment = float(social_comment / max(1e-9, social_den)) if social_den > 0 else 0.0
-        social_engagement_norm = float(np.tanh((social_engage / max(1e-9, social_den)) / 6.0)) if social_den > 0 else 0.0
-        social_influence_norm = float(np.tanh((social_followers / max(1e-9, social_den)) / 14.0)) if social_den > 0 else 0.0
-        social_event_ratio = float(social_cnt / max(1, len(accepted)))
-        social_buzz = float(np.tanh(social_den))
-        return {
-            "event_decay": event_decay,
-            "source_tier_weight": tier_weight,
-            "source_confidence": conf_mean,
-            "social_post_sentiment": social_post_sentiment,
-            "social_comment_sentiment": social_comment_sentiment,
-            "social_engagement_norm": social_engagement_norm,
-            "social_influence_norm": social_influence_norm,
-            "social_event_ratio": social_event_ratio,
-            "social_buzz": social_buzz,
-            "source_tiers": {k: float(v) for k, v in sorted(tier_counts.items())},
-            "missing_markers": [],
-        }
+    @staticmethod
+    def _vector_from_payload(payload: Dict[str, float]) -> np.ndarray:
+        return vector_from_payload(payload)
+
+    def _event_quality_profile(self, event_ctx: List[Dict], *, as_of_ts: Optional[datetime] = None) -> Dict[str, object]:
+        return event_quality_profile(event_ctx, as_of_ts=as_of_ts)
 
     def connect(self):
         self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -300,12 +210,13 @@ class InferenceServiceV2:
             try:
                 cur.execute(
                     """
-                    SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier,
+                    SELECT e.id, e.event_type, e.title, e.source_url, e.source_name, e.confidence_score, e.source_tier,
                            e.occurred_at, e.available_at, e.market_scope, e.payload
                     FROM events e
                     LEFT JOIN event_links el ON el.event_id = e.id
                     LEFT JOIN entities en ON en.id = el.entity_id
-                    WHERE en.symbol = UPPER(%s) OR en.name = %s
+                    WHERE (en.symbol = UPPER(%s) OR en.name = %s)
+                      AND COALESCE(e.available_at, e.occurred_at) <= NOW()
                     ORDER BY COALESCE(e.available_at, e.occurred_at) DESC
                     LIMIT %s
                     """,
@@ -314,12 +225,13 @@ class InferenceServiceV2:
             except Exception:
                 cur.execute(
                     """
-                    SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at
+                    SELECT e.id, e.event_type, e.title, e.source_url, e.source_name, e.confidence_score, e.source_tier, e.occurred_at
                            , e.payload
                     FROM events e
                     LEFT JOIN event_links el ON el.event_id = e.id
                     LEFT JOIN entities en ON en.id = el.entity_id
-                    WHERE en.symbol = UPPER(%s) OR en.name = %s
+                    WHERE (en.symbol = UPPER(%s) OR en.name = %s)
+                      AND e.occurred_at <= NOW()
                     ORDER BY e.occurred_at DESC
                     LIMIT %s
                     """,
@@ -338,7 +250,7 @@ class InferenceServiceV2:
                     WITH linked AS (
                         SELECT
                             COALESCE(UPPER(en.symbol), en.name) AS target_key,
-                            e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier,
+                            e.id, e.event_type, e.title, e.source_url, e.source_name, e.confidence_score, e.source_tier,
                             e.occurred_at, e.available_at, e.market_scope, e.payload,
                             ROW_NUMBER() OVER (
                                 PARTITION BY COALESCE(UPPER(en.symbol), en.name)
@@ -347,9 +259,10 @@ class InferenceServiceV2:
                         FROM events e
                         LEFT JOIN event_links el ON el.event_id = e.id
                         LEFT JOIN entities en ON en.id = el.entity_id
-                        WHERE UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s)
+                        WHERE (UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s))
+                          AND COALESCE(e.available_at, e.occurred_at) <= NOW()
                     )
-                    SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at, available_at, market_scope, payload
+                    SELECT target_key, id, event_type, title, source_url, source_name, confidence_score, source_tier, occurred_at, available_at, market_scope, payload
                     FROM linked
                     WHERE rn <= %s
                     ORDER BY target_key, COALESCE(available_at, occurred_at) DESC
@@ -363,7 +276,7 @@ class InferenceServiceV2:
                     WITH linked AS (
                         SELECT
                             COALESCE(UPPER(en.symbol), en.name) AS target_key,
-                            e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at, e.payload,
+                            e.id, e.event_type, e.title, e.source_url, e.source_name, e.confidence_score, e.source_tier, e.occurred_at, e.payload,
                             ROW_NUMBER() OVER (
                                 PARTITION BY COALESCE(UPPER(en.symbol), en.name)
                                 ORDER BY e.occurred_at DESC
@@ -371,9 +284,10 @@ class InferenceServiceV2:
                         FROM events e
                         LEFT JOIN event_links el ON el.event_id = e.id
                         LEFT JOIN entities en ON en.id = el.entity_id
-                        WHERE UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s)
+                        WHERE (UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s))
+                          AND e.occurred_at <= NOW()
                     )
-                    SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at, payload
+                    SELECT target_key, id, event_type, title, source_url, source_name, confidence_score, source_tier, occurred_at, payload
                     FROM linked
                     WHERE rn <= %s
                     ORDER BY target_key, occurred_at DESC
@@ -391,10 +305,13 @@ class InferenceServiceV2:
             try:
                 cur.execute(
                     """
-                    SELECT id, event_type, title, source_url, confidence_score, source_tier, occurred_at, available_at, market_scope, payload
+                    SELECT id, event_type, title, source_url, source_name, confidence_score, source_tier, occurred_at, available_at, market_scope, payload
                     FROM events
-                    WHERE market_scope = 'macro'
-                       OR COALESCE(payload->>'global_impact', 'false') = 'true'
+                    WHERE (
+                      market_scope = 'macro'
+                      OR COALESCE(payload->>'global_impact', 'false') = 'true'
+                    )
+                      AND COALESCE(available_at, occurred_at) <= NOW()
                     ORDER BY COALESCE(available_at, occurred_at) DESC
                     LIMIT %s
                     """,
@@ -558,6 +475,67 @@ class InferenceServiceV2:
             },
         )
 
+    def _build_liquid_feature_payload(
+        self,
+        *,
+        volume: float,
+        ret_1: float,
+        ret_3: float,
+        ret_12: float,
+        ret_48: float,
+        vol_3: float,
+        vol_12: float,
+        vol_48: float,
+        vol_96: float,
+        vol_z: float,
+        volume_impact: float,
+        orderbook_imbalance: float,
+        funding_rate: float,
+        onchain_norm: float,
+        orderbook_missing_flag: float,
+        funding_missing_flag: float,
+        onchain_missing_flag: float,
+        source_profile: Dict[str, object],
+    ) -> Dict[str, float]:
+        payload = {
+            "ret_1": float(ret_1),
+            "ret_3": float(ret_3),
+            "ret_12": float(ret_12),
+            "ret_48": float(ret_48),
+            "vol_3": float(vol_3),
+            "vol_12": float(vol_12),
+            "vol_48": float(vol_48),
+            "vol_96": float(vol_96),
+            "log_volume": float(np.log1p(max(volume, 0.0))),
+            "vol_z": float(vol_z),
+            "volume_impact": float(volume_impact),
+            "orderbook_imbalance": float(orderbook_imbalance),
+            "funding_rate": float(funding_rate),
+            "onchain_norm": float(onchain_norm),
+            "event_decay": float(source_profile.get("event_decay") or 0.0),
+            "orderbook_missing_flag": float(orderbook_missing_flag),
+            "funding_missing_flag": float(funding_missing_flag),
+            "onchain_missing_flag": float(onchain_missing_flag),
+            "source_tier_weight": float(source_profile.get("source_tier_weight") or 0.0),
+            "source_confidence": float(source_profile.get("source_confidence") or 0.0),
+            "social_post_sentiment": float(source_profile.get("social_post_sentiment") or 0.0),
+            "social_comment_sentiment": float(source_profile.get("social_comment_sentiment") or 0.0),
+            "social_engagement_norm": float(source_profile.get("social_engagement_norm") or 0.0),
+            "social_influence_norm": float(source_profile.get("social_influence_norm") or 0.0),
+            "social_event_ratio": float(source_profile.get("social_event_ratio") or 0.0),
+            "social_buzz": float(source_profile.get("social_buzz") or 0.0),
+            "event_velocity_1h": float(source_profile.get("event_velocity_1h") or 0.0),
+            "event_velocity_6h": float(source_profile.get("event_velocity_6h") or 0.0),
+            "event_disagreement": float(source_profile.get("event_disagreement") or 0.0),
+            "source_diversity": float(source_profile.get("source_diversity") or 0.0),
+            "cross_source_consensus": float(source_profile.get("cross_source_consensus") or 0.0),
+            "comment_skew": float(source_profile.get("comment_skew") or 0.0),
+            "event_lag_bucket_0_1h": float(source_profile.get("event_lag_bucket_0_1h") or 0.0),
+            "event_lag_bucket_1_6h": float(source_profile.get("event_lag_bucket_1_6h") or 0.0),
+            "event_lag_bucket_6_24h": float(source_profile.get("event_lag_bucket_6_24h") or 0.0),
+        }
+        return {k: float(payload.get(k, 0.0) or 0.0) for k in LIQUID_FEATURE_KEYS}
+
     def run_vc_once(self):
         targets = ["OpenAI", "Anthropic", "Scale AI"]
         active_model = self.get_active_model("vc")
@@ -607,7 +585,7 @@ class InferenceServiceV2:
     def run_liquid_once(self):
         active_model = self.get_active_model("liquid")
         latest_map = self.get_latest_prices(LIQUID_SYMBOLS)
-        event_map = self.get_event_contexts(LIQUID_SYMBOLS, limit_per_target=8)
+        event_map = self.get_event_contexts(LIQUID_SYMBOLS, limit_per_target=128)
         orderbook_map = self.get_orderbook_imbalance_latest(LIQUID_SYMBOLS)
         funding_map = self.get_funding_latest(LIQUID_SYMBOLS)
         onchain_map = self.get_onchain_latest(LIQUID_SYMBOLS)
@@ -616,7 +594,12 @@ class InferenceServiceV2:
             if not row:
                 continue
             event_ctx = event_map.get(symbol, [])
-            source_profile = self._event_quality_profile(event_ctx)
+            as_of_ts = row.get("timestamp")
+            if isinstance(as_of_ts, datetime):
+                as_of_ts = as_of_ts if as_of_ts.tzinfo else as_of_ts.replace(tzinfo=timezone.utc)
+            else:
+                as_of_ts = datetime.now(timezone.utc)
+            source_profile = self._event_quality_profile(event_ctx, as_of_ts=as_of_ts)
             price = float(row["price"])
             volume = float(row.get("volume") or 0.0)
             history = self.get_recent_prices(symbol, limit=144)
@@ -650,47 +633,27 @@ class InferenceServiceV2:
             funding_missing_flag = 0.0 if symbol in funding_map else 1.0
             onchain_missing_flag = 0.0 if symbol in onchain_map else 1.0
 
-            event_decay = float(source_profile.get("event_decay") or 0.0)
-            source_tier_weight = float(source_profile.get("source_tier_weight") or 0.0)
-            source_confidence = float(source_profile.get("source_confidence") or 0.0)
-            social_post_sentiment = float(source_profile.get("social_post_sentiment") or 0.0)
-            social_comment_sentiment = float(source_profile.get("social_comment_sentiment") or 0.0)
-            social_engagement_norm = float(source_profile.get("social_engagement_norm") or 0.0)
-            social_influence_norm = float(source_profile.get("social_influence_norm") or 0.0)
-            social_event_ratio = float(source_profile.get("social_event_ratio") or 0.0)
-            social_buzz = float(source_profile.get("social_buzz") or 0.0)
-
-            feature = np.array(
-                [
-                    ret_1,
-                    ret_3,
-                    ret_12,
-                    ret_48,
-                    vol_3,
-                    vol_12,
-                    vol_48,
-                    vol_96,
-                    np.log1p(max(volume, 0.0)),
-                    vol_z,
-                    volume_impact,
-                    orderbook_imbalance,
-                    funding_rate,
-                    onchain_norm,
-                    event_decay,
-                    orderbook_missing_flag,
-                    funding_missing_flag,
-                    onchain_missing_flag,
-                    source_tier_weight,
-                    source_confidence,
-                    social_post_sentiment,
-                    social_comment_sentiment,
-                    social_engagement_norm,
-                    social_influence_norm,
-                    social_event_ratio,
-                    social_buzz,
-                ],
-                dtype=np.float32,
+            feature_payload = self._build_liquid_feature_payload(
+                volume=volume,
+                ret_1=ret_1,
+                ret_3=ret_3,
+                ret_12=ret_12,
+                ret_48=ret_48,
+                vol_3=vol_3,
+                vol_12=vol_12,
+                vol_48=vol_48,
+                vol_96=vol_96,
+                vol_z=vol_z,
+                volume_impact=volume_impact,
+                orderbook_imbalance=orderbook_imbalance,
+                funding_rate=funding_rate,
+                onchain_norm=onchain_norm,
+                orderbook_missing_flag=orderbook_missing_flag,
+                funding_missing_flag=funding_missing_flag,
+                onchain_missing_flag=onchain_missing_flag,
+                source_profile=source_profile,
             )
+            feature = self._vector_from_payload(feature_payload)
             infer_lineage_id = f"infer-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{symbol.lower()}"
             latest_event_time = None
             if event_ctx:
@@ -699,32 +662,7 @@ class InferenceServiceV2:
                 track="liquid",
                 target=symbol,
                 features={
-                    "ret_1": float(feature[0]),
-                    "ret_3": float(feature[1]),
-                    "ret_12": float(feature[2]),
-                    "ret_48": float(feature[3]),
-                    "vol_3": float(feature[4]),
-                    "vol_12": float(feature[5]),
-                    "vol_48": float(feature[6]),
-                    "vol_96": float(feature[7]),
-                    "log_volume": float(feature[8]),
-                    "vol_z": float(feature[9]),
-                    "volume_impact": float(feature[10]),
-                    "orderbook_imbalance": float(feature[11]),
-                    "funding_rate": float(feature[12]),
-                    "onchain_norm": float(feature[13]),
-                    "event_decay": float(feature[14]),
-                    "orderbook_missing_flag": float(feature[15]),
-                    "funding_missing_flag": float(feature[16]),
-                    "onchain_missing_flag": float(feature[17]),
-                    "source_tier_weight": float(feature[18]),
-                    "source_confidence": float(feature[19]),
-                    "social_post_sentiment": float(feature[20]),
-                    "social_comment_sentiment": float(feature[21]),
-                    "social_engagement_norm": float(feature[22]),
-                    "social_influence_norm": float(feature[23]),
-                    "social_event_ratio": float(feature[24]),
-                    "social_buzz": float(feature[25]),
+                    **feature_payload,
                     "feature_payload_schema_version": self.feature_payload_schema_version,
                 },
                 lineage_id=infer_lineage_id,

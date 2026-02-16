@@ -1,5 +1,43 @@
 # 代码追踪与问题清单
 
+## 🆕 2026-02-16 阶段更新（Task H：2018-now 数据窗口扩展，code-first）
+
+> 说明：本阶段仅完成“代码与命令级 dry-run 验证”，不执行重型历史拉取任务。
+
+### 1) 市场数据长历史回填能力（已实现）
+- `scripts/ingest_bitget_market_bars.py` 已扩展：
+  - 新增 `--chunk-days`：按时间窗口分块回填（适配 2018-now 长窗口）；
+  - 新增 `--checkpoint-file` + `--resume`：断点续跑；
+  - 新增 `--max-chunks`：分批推进大任务；
+  - 新增 `--dry-run`：仅输出执行计划，不发起网络请求/不写 DB；
+  - 保留并沿用现有 `max-fetch-retries + retry-backoff-sec` 指数退避策略。
+
+### 2) 事件/社媒长历史编排能力（已实现）
+- 新增 `scripts/orchestrate_event_social_backfill.py`：
+  - 统一编排事件(`build_multisource_events_2025.py`)与社媒(`backfill_social_history.py`)分块回填；
+  - 支持 `--start/--end/--chunk-days/--checkpoint-file/--resume/--max-chunks`；
+  - 支持 `--language-targets=en,zh` 与 `--google-locales=US:en,CN:zh-Hans`；
+  - 每块补充并校验 strict as-of 时序元数据（`occurred/published/available/effective`）；
+  - 写入统一 provenance 字段（pipeline_tag、run_id、window、stream、脚本来源）。
+
+### 3) 社媒回填脚本增强（已实现）
+- `scripts/backfill_social_history.py` 已扩展：
+  - 新增 `--start/--end` 窗口过滤；
+  - 新增 `--language-targets`（默认 `en,zh`）；
+  - 新增 `--pipeline-tag`、`--provenance-run-id`；
+  - 新增 `--max-fetch-retries`、`--retry-backoff-sec`；
+  - 新增 `--dry-run`；
+  - 输出 payload 内 `provenance` 与 `time_alignment` 元字段，并强制单调时序归一化。
+
+### 4) 入库侧元数据补齐（已实现）
+- `scripts/import_social_events_jsonl.py` 在 canonical/raw 两条路径统一补齐：
+  - `payload.time_alignment`（`strict_asof_v1` + 四时点）；
+  - `payload.provenance`（导入脚本来源、导入模式、导入时间）。
+
+### 5) 运行约束
+- 全部新增能力为 WSL/no-docker 兼容（bash + python3）；
+- 当前阶段不触发全量历史任务，仅允许 `--dry-run` 与语法级校验。
+
 ## 🆕 2026-02-16 阶段更新（WSL-only 运维化 + 多语言/LLM 集成规划）
 
 > 说明：本阶段新增约束为 **WSL-only**。所有运维命令仅保证 `bash`/Linux 路径；PowerShell 路径为非目标。

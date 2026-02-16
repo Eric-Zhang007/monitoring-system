@@ -13,7 +13,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
-LIQUID_FEATURE_SCHEMA_VERSION = "v2.2"
+LIQUID_FEATURE_SCHEMA_VERSION = "v2.3"
 LIQUID_FEATURE_KEYS: List[str] = [
     "ret_1",
     "ret_3",
@@ -41,6 +41,15 @@ LIQUID_FEATURE_KEYS: List[str] = [
     "social_influence_norm",
     "social_event_ratio",
     "social_buzz",
+    "event_velocity_1h",
+    "event_velocity_6h",
+    "event_disagreement",
+    "source_diversity",
+    "cross_source_consensus",
+    "comment_skew",
+    "event_lag_bucket_0_1h",
+    "event_lag_bucket_1_6h",
+    "event_lag_bucket_6_24h",
 ]
 
 
@@ -116,6 +125,176 @@ class FeaturePipeline:
             return max(1, int(tf))
         except Exception:
             return 5
+
+    @staticmethod
+    def vector_to_feature_payload(feature_row: np.ndarray | List[float]) -> Dict[str, float]:
+        arr = np.array(feature_row, dtype=np.float64).reshape(-1)
+        return {k: float(arr[idx]) if idx < arr.shape[0] else 0.0 for idx, k in enumerate(LIQUID_FEATURE_KEYS)}
+
+    @staticmethod
+    def _weighted_std(values: List[float], weights: List[float]) -> float:
+        if not values or not weights:
+            return 0.0
+        vv = np.array(values, dtype=np.float64)
+        ww = np.array(weights, dtype=np.float64)
+        den = float(np.sum(ww))
+        if den <= 1e-12:
+            return 0.0
+        mean = float(np.sum(vv * ww) / den)
+        var = float(np.sum(ww * ((vv - mean) ** 2)) / den)
+        return float(np.sqrt(max(0.0, var)))
+
+    @staticmethod
+    def _event_social_temporal_profile(ev_rows: List[Dict[str, object]], as_of_ts: datetime) -> Dict[str, float]:
+        base = {
+            "event_decay": 0.0,
+            "source_tier_weight": 0.0,
+            "source_confidence": 0.0,
+            "social_post_sentiment": 0.0,
+            "social_comment_sentiment": 0.0,
+            "social_engagement_norm": 0.0,
+            "social_influence_norm": 0.0,
+            "social_event_ratio": 0.0,
+            "social_buzz": 0.0,
+            "event_velocity_1h": 0.0,
+            "event_velocity_6h": 0.0,
+            "event_disagreement": 0.0,
+            "source_diversity": 0.0,
+            "cross_source_consensus": 0.0,
+            "comment_skew": 0.0,
+            "event_lag_bucket_0_1h": 0.0,
+            "event_lag_bucket_1_6h": 0.0,
+            "event_lag_bucket_6_24h": 0.0,
+        }
+        if not ev_rows:
+            return base
+
+        lookback_start = as_of_ts - timedelta(hours=24)
+        selected: List[Dict[str, object]] = []
+        for evt in ev_rows:
+            evt_ts = evt.get("timestamp")
+            if not isinstance(evt_ts, datetime):
+                continue
+            # No-lookahead invariant: features at t may only use events available at/before t.
+            if evt_ts > as_of_ts:
+                continue
+            if evt_ts <= lookback_start:
+                continue
+            selected.append(evt)
+        if not selected:
+            return base
+
+        num = 0.0
+        den = 0.0
+        tier_sum = 0.0
+        conf_sum = 0.0
+        cnt = 0
+
+        social_cnt = 0
+        social_den = 0.0
+        social_post = 0.0
+        social_comment = 0.0
+        social_engage = 0.0
+        social_followers = 0.0
+
+        lag_0_1h = 0.0
+        lag_1_6h = 0.0
+        lag_6_24h = 0.0
+        mass_1h = 0.0
+        mass_6h = 0.0
+
+        event_sent_values: List[float] = []
+        event_sent_weights: List[float] = []
+        source_mass: Dict[str, float] = {}
+        source_sent_num: Dict[str, float] = {}
+
+        for evt in selected:
+            evt_ts = evt["timestamp"]
+            age_hours = max(0.0, float((as_of_ts - evt_ts).total_seconds()) / 3600.0)
+            tier_weight = float(evt.get("tier_weight") or 0.0)
+            confidence = float(evt.get("confidence") or 0.0)
+            raw_confidence = float(evt.get("raw_confidence") or 0.0)
+            ew = max(0.0, tier_weight * confidence)
+            if ew <= 0:
+                continue
+            decay = float(np.exp(-age_hours / 12.0))
+            num += ew * decay
+            den += ew
+            tier_sum += tier_weight
+            conf_sum += raw_confidence
+            cnt += 1
+
+            if age_hours <= 1.0:
+                lag_0_1h += ew
+                mass_1h += ew
+            elif age_hours <= 6.0:
+                lag_1_6h += ew
+            else:
+                lag_6_24h += ew
+            if age_hours <= 6.0:
+                mass_6h += ew
+
+            post_sent = float(evt.get("post_sentiment") or 0.0)
+            comment_sent = float(evt.get("comment_sentiment") or 0.0)
+            event_sent = float(np.clip(0.5 * (post_sent + comment_sent), -1.0, 1.0))
+            event_sent_values.append(event_sent)
+            event_sent_weights.append(ew)
+
+            source_key = str(evt.get("source_key") or "unknown").strip().lower() or "unknown"
+            source_mass[source_key] = source_mass.get(source_key, 0.0) + ew
+            source_sent_num[source_key] = source_sent_num.get(source_key, 0.0) + ew * event_sent
+
+            if bool(evt.get("is_social")):
+                social_cnt += 1
+                social_den += ew
+                social_post += ew * post_sent
+                social_comment += ew * comment_sent
+                social_engage += ew * float(np.log1p(float(evt.get("engagement_score") or 0.0)))
+                social_followers += ew * float(np.log1p(float(evt.get("author_followers") or 0.0)))
+
+        if den <= 1e-9 or cnt <= 0:
+            return base
+
+        source_keys = sorted(source_mass.keys())
+        src_weights = [float(source_mass[k]) for k in source_keys]
+        src_sent_means = [float(source_sent_num[k] / max(1e-9, source_mass[k])) for k in source_keys]
+        if len(src_weights) >= 2:
+            probs = np.array(src_weights, dtype=np.float64) / max(1e-9, float(np.sum(src_weights)))
+            src_entropy = float(-np.sum(probs * np.log(np.clip(probs, 1e-12, None))))
+            source_diversity = float(src_entropy / max(1e-9, np.log(float(len(src_weights)))))
+        else:
+            source_diversity = 0.0
+        source_std = FeaturePipeline._weighted_std(src_sent_means, src_weights) if src_weights else 0.0
+        event_disagreement = float(min(1.0, FeaturePipeline._weighted_std(event_sent_values, event_sent_weights)))
+        cross_source_consensus = float(max(0.0, 1.0 - min(1.0, source_std)))
+
+        social_post_sentiment = float(social_post / max(1e-9, social_den)) if social_den > 0 else 0.0
+        social_comment_sentiment = float(social_comment / max(1e-9, social_den)) if social_den > 0 else 0.0
+        social_engagement_norm = float(np.tanh((social_engage / max(1e-9, social_den)) / 6.0)) if social_den > 0 else 0.0
+        social_influence_norm = float(np.tanh((social_followers / max(1e-9, social_den)) / 14.0)) if social_den > 0 else 0.0
+        social_event_ratio = float(social_cnt / max(1, cnt))
+        social_buzz = float(np.tanh(social_den))
+
+        return {
+            "event_decay": float(num / max(1e-9, den)),
+            "source_tier_weight": float(tier_sum / max(1, cnt)),
+            "source_confidence": float(conf_sum / max(1, cnt)),
+            "social_post_sentiment": social_post_sentiment,
+            "social_comment_sentiment": social_comment_sentiment,
+            "social_engagement_norm": social_engagement_norm,
+            "social_influence_norm": social_influence_norm,
+            "social_event_ratio": social_event_ratio,
+            "social_buzz": social_buzz,
+            "event_velocity_1h": float(np.tanh(mass_1h)),
+            "event_velocity_6h": float(np.tanh(mass_6h / 6.0)),
+            "event_disagreement": event_disagreement,
+            "source_diversity": source_diversity,
+            "cross_source_consensus": cross_source_consensus,
+            "comment_skew": float(social_comment_sentiment - social_post_sentiment),
+            "event_lag_bucket_0_1h": float(lag_0_1h / max(1e-9, den)),
+            "event_lag_bucket_1_6h": float(lag_1_6h / max(1e-9, den)),
+            "event_lag_bucket_6_24h": float(lag_6_24h / max(1e-9, den)),
+        }
 
     def check_data_quality(
         self,
@@ -384,9 +563,11 @@ class FeaturePipeline:
                             cur.execute(
                                 """
                                 SELECT
+                                    e.id AS event_id,
                                     COALESCE(e.available_at, e.occurred_at) AS timestamp,
                                     e.source_tier,
                                     e.confidence_score,
+                                    e.source_name,
                                     e.payload,
                                     1.0::double precision AS scope_weight
                                 FROM events e
@@ -405,9 +586,11 @@ class FeaturePipeline:
                             cur.execute(
                                 """
                                 SELECT
+                                    e.id AS event_id,
                                     e.occurred_at AS timestamp,
                                     e.source_tier,
                                     e.confidence_score,
+                                    e.source_name,
                                     e.payload,
                                     1.0::double precision AS scope_weight
                                 FROM events e
@@ -429,9 +612,11 @@ class FeaturePipeline:
                             cur.execute(
                                 """
                                 SELECT
+                                    e.id AS event_id,
                                     COALESCE(e.available_at, e.occurred_at) AS timestamp,
                                     e.source_tier,
                                     e.confidence_score,
+                                    e.source_name,
                                     e.payload,
                                     0.7::double precision AS scope_weight
                                 FROM events e
@@ -465,8 +650,14 @@ class FeaturePipeline:
         min_event_conf = float(os.getenv("EVENT_MIN_CONFIDENCE", "0.0"))
         max_event_tier = int(os.getenv("EVENT_MAX_SOURCE_TIER", "5"))
         tier_weights = self._source_tier_weights()
-        ev_rows = []
+        ev_rows: List[Dict[str, object]] = []
+        seen_event_ids: set[int] = set()
         for r in event_rows + global_event_rows:
+            evt_id = int(r.get("event_id") or 0)
+            if evt_id > 0:
+                if evt_id in seen_event_ids:
+                    continue
+                seen_event_ids.add(evt_id)
             tier = int(r.get("source_tier") or 5)
             conf = float(r.get("confidence_score") or 0.0)
             if conf < min_event_conf or tier > max_event_tier:
@@ -478,6 +669,12 @@ class FeaturePipeline:
             comment_sent = float(payload.get("comment_sentiment", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
             engagement = float(payload.get("engagement_score", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
             followers = float(payload.get("author_followers", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
+            source_key = (
+                str(r.get("source_name") or "").strip().lower()
+                or social_platform
+                or str(payload.get("source") or "").strip().lower()
+                or "unknown"
+            )
             ev_rows.append(
                 {
                     "timestamp": r["timestamp"],
@@ -490,9 +687,10 @@ class FeaturePipeline:
                     "comment_sentiment": float(np.clip(comment_sent, -1.0, 1.0)),
                     "engagement_score": max(0.0, engagement),
                     "author_followers": max(0.0, followers),
+                    "source_key": source_key,
                 }
             )
-        ev_ts = [r["timestamp"] for r in ev_rows]
+        ev_rows.sort(key=lambda x: x["timestamp"])
 
         def latest_before(ts_list, values, ts):
             if not ts_list:
@@ -536,57 +734,7 @@ class FeaturePipeline:
             funding = latest_before(fr_ts, fr_vals, ts)
             onchain_flow = latest_before(oc_ts, oc_vals, ts)
             onchain_norm = float(np.tanh(onchain_flow / 1e6))
-            evt_idx = bisect_right(ev_ts, ts) - 1 if ev_ts else -1
-            if evt_idx >= 0:
-                left_idx = bisect_right(ev_ts, ts - timedelta(hours=24))
-                num = 0.0
-                den = 0.0
-                tier_sum = 0.0
-                conf_sum = 0.0
-                cnt = 0
-                social_cnt = 0
-                social_den = 0.0
-                social_post = 0.0
-                social_comment = 0.0
-                social_engage = 0.0
-                social_followers = 0.0
-                for j in range(left_idx, evt_idx + 1):
-                    evt = ev_rows[j]
-                    evt_ts = evt["timestamp"]
-                    age_hours = max(0.0, float((ts - evt_ts).total_seconds()) / 3600.0)
-                    decay = float(np.exp(-age_hours / 12.0))
-                    ew = float(evt["tier_weight"]) * float(evt["confidence"])
-                    num += ew * decay
-                    den += ew
-                    tier_sum += float(evt["tier_weight"])
-                    conf_sum += float(evt["raw_confidence"])
-                    cnt += 1
-                    if bool(evt.get("is_social")):
-                        social_cnt += 1
-                        social_den += ew
-                        social_post += ew * float(evt.get("post_sentiment", 0.0))
-                        social_comment += ew * float(evt.get("comment_sentiment", 0.0))
-                        social_engage += ew * float(np.log1p(float(evt.get("engagement_score", 0.0))))
-                        social_followers += ew * float(np.log1p(float(evt.get("author_followers", 0.0))))
-                event_decay = float(num / max(1e-9, den))
-                source_tier_weight = float(tier_sum / max(1, cnt))
-                source_confidence = float(conf_sum / max(1, cnt))
-                social_post_sentiment = float(social_post / max(1e-9, social_den)) if social_den > 0 else 0.0
-                social_comment_sentiment = float(social_comment / max(1e-9, social_den)) if social_den > 0 else 0.0
-                social_engagement_norm = float(np.tanh((social_engage / max(1e-9, social_den)) / 6.0)) if social_den > 0 else 0.0
-                social_influence_norm = float(np.tanh((social_followers / max(1e-9, social_den)) / 14.0)) if social_den > 0 else 0.0
-                social_event_ratio = float(social_cnt / max(1, cnt))
-                social_buzz = float(np.tanh(social_den))
-            else:
-                event_decay = 0.0
-                source_tier_weight = 0.0
-                source_confidence = 0.0
-                social_post_sentiment = 0.0
-                social_comment_sentiment = 0.0
-                social_engagement_norm = 0.0
-                social_influence_norm = 0.0
-                social_event_ratio = 0.0
-                social_buzz = 0.0
+            event_profile = self._event_social_temporal_profile(ev_rows, ts)
             orderbook_missing_flag = 0.0 if ob_ts else 1.0
             funding_missing_flag = 0.0 if fr_ts else 1.0
             onchain_missing_flag = 0.0 if oc_ts else 1.0
@@ -606,18 +754,27 @@ class FeaturePipeline:
                     orderbook_imbalance,
                     funding,
                     onchain_norm,
-                    event_decay,
+                    float(event_profile["event_decay"]),
                     orderbook_missing_flag,
                     funding_missing_flag,
                     onchain_missing_flag,
-                    source_tier_weight,
-                    source_confidence,
-                    social_post_sentiment,
-                    social_comment_sentiment,
-                    social_engagement_norm,
-                    social_influence_norm,
-                    social_event_ratio,
-                    social_buzz,
+                    float(event_profile["source_tier_weight"]),
+                    float(event_profile["source_confidence"]),
+                    float(event_profile["social_post_sentiment"]),
+                    float(event_profile["social_comment_sentiment"]),
+                    float(event_profile["social_engagement_norm"]),
+                    float(event_profile["social_influence_norm"]),
+                    float(event_profile["social_event_ratio"]),
+                    float(event_profile["social_buzz"]),
+                    float(event_profile["event_velocity_1h"]),
+                    float(event_profile["event_velocity_6h"]),
+                    float(event_profile["event_disagreement"]),
+                    float(event_profile["source_diversity"]),
+                    float(event_profile["cross_source_consensus"]),
+                    float(event_profile["comment_skew"]),
+                    float(event_profile["event_lag_bucket_0_1h"]),
+                    float(event_profile["event_lag_bucket_1_6h"]),
+                    float(event_profile["event_lag_bucket_6_24h"]),
                 ]
             )
 

@@ -320,32 +320,7 @@ class LiquidModelTrainer:
         train_lineage_id = f"train-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{symbol.lower()}"
         feature_rows = [
             {
-                "ret_1": float(r[0]),
-                "ret_3": float(r[1]),
-                "ret_12": float(r[2]),
-                "ret_48": float(r[3]),
-                "vol_3": float(r[4]),
-                "vol_12": float(r[5]),
-                "vol_48": float(r[6]),
-                "vol_96": float(r[7]),
-                "log_volume": float(r[8]),
-                "vol_z": float(r[9]),
-                "volume_impact": float(r[10]),
-                "orderbook_imbalance": float(r[11]),
-                "funding_rate": float(r[12]),
-                "onchain_norm": float(r[13]),
-                "event_decay": float(r[14]),
-                "orderbook_missing_flag": float(r[15]) if len(r) > 15 else 1.0,
-                "funding_missing_flag": float(r[16]) if len(r) > 16 else 1.0,
-                "onchain_missing_flag": float(r[17]) if len(r) > 17 else 1.0,
-                "source_tier_weight": float(r[18]) if len(r) > 18 else 0.0,
-                "source_confidence": float(r[19]) if len(r) > 19 else 0.0,
-                "social_post_sentiment": float(r[20]) if len(r) > 20 else 0.0,
-                "social_comment_sentiment": float(r[21]) if len(r) > 21 else 0.0,
-                "social_engagement_norm": float(r[22]) if len(r) > 22 else 0.0,
-                "social_influence_norm": float(r[23]) if len(r) > 23 else 0.0,
-                "social_event_ratio": float(r[24]) if len(r) > 24 else 0.0,
-                "social_buzz": float(r[25]) if len(r) > 25 else 0.0,
+                **self.pipeline.vector_to_feature_payload(r),
                 "feature_payload_schema_version": LIQUID_FEATURE_SCHEMA_VERSION,
             }
             for r in X

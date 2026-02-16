@@ -89,7 +89,8 @@ from task_queue import enqueue_task, get_task
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
 FEATURE_VERSION = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
-FEATURE_PAYLOAD_SCHEMA_VERSION = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.2")
+FEATURE_PAYLOAD_SCHEMA_VERSION = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.3")
+FEATURE_PAYLOAD_SCHEMA_COMPAT = {FEATURE_PAYLOAD_SCHEMA_VERSION, "v2.2"}
 DATA_VERSION = os.getenv("DATA_VERSION", "v1")
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
@@ -97,6 +98,43 @@ repo = V2Repository(DATABASE_URL)
 exec_engine = ExecutionEngine()
 DEFAULT_LIQUID_SYMBOLS = "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"
 _TABULAR_MODEL_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+LIQUID_FEATURE_KEYS: List[str] = [
+    "ret_1",
+    "ret_3",
+    "ret_12",
+    "ret_48",
+    "vol_3",
+    "vol_12",
+    "vol_48",
+    "vol_96",
+    "log_volume",
+    "vol_z",
+    "volume_impact",
+    "orderbook_imbalance",
+    "funding_rate",
+    "onchain_norm",
+    "event_decay",
+    "orderbook_missing_flag",
+    "funding_missing_flag",
+    "onchain_missing_flag",
+    "source_tier_weight",
+    "source_confidence",
+    "social_post_sentiment",
+    "social_comment_sentiment",
+    "social_engagement_norm",
+    "social_influence_norm",
+    "social_event_ratio",
+    "social_buzz",
+    "event_velocity_1h",
+    "event_velocity_6h",
+    "event_disagreement",
+    "source_diversity",
+    "cross_source_consensus",
+    "comment_skew",
+    "event_lag_bucket_0_1h",
+    "event_lag_bucket_1_6h",
+    "event_lag_bucket_6_24h",
+]
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -1489,35 +1527,7 @@ def _run_model_replay_backtest(
 
 
 def _feature_vector_from_payload(payload: Dict[str, Any]) -> np.ndarray:
-    keys = [
-        "ret_1",
-        "ret_3",
-        "ret_12",
-        "ret_48",
-        "vol_3",
-        "vol_12",
-        "vol_48",
-        "vol_96",
-        "log_volume",
-        "vol_z",
-        "volume_impact",
-        "orderbook_imbalance",
-        "funding_rate",
-        "onchain_norm",
-        "event_decay",
-        "orderbook_missing_flag",
-        "funding_missing_flag",
-        "onchain_missing_flag",
-        "source_tier_weight",
-        "source_confidence",
-        "social_post_sentiment",
-        "social_comment_sentiment",
-        "social_engagement_norm",
-        "social_influence_norm",
-        "social_event_ratio",
-        "social_buzz",
-    ]
-    return np.array([float(payload.get(k, 0.0) or 0.0) for k in keys], dtype=np.float64)
+    return np.array([float(payload.get(k, 0.0) or 0.0) for k in LIQUID_FEATURE_KEYS], dtype=np.float64)
 
 
 def _align_feature_dim(x: np.ndarray, dim: int, pad_value: float = 0.0) -> np.ndarray:
@@ -1557,12 +1567,12 @@ def _load_tabular_model_artifact(target: str) -> Optional[Dict[str, Any]]:
         _TABULAR_MODEL_CACHE[sym] = None
         return None
     schema_version = str(data.get("feature_payload_schema_version") or "").strip()
-    if schema_version and schema_version != FEATURE_PAYLOAD_SCHEMA_VERSION:
+    if schema_version and schema_version not in FEATURE_PAYLOAD_SCHEMA_COMPAT:
         _TABULAR_MODEL_CACHE[sym] = None
         return None
 
     artifact: Dict[str, Any] = {
-        "feature_dim": int(data.get("feature_dim", 26) or 26),
+        "feature_dim": int(data.get("feature_dim", len(LIQUID_FEATURE_KEYS)) or len(LIQUID_FEATURE_KEYS)),
         "x_mean": np.array(data.get("x_mean", []), dtype=np.float64).reshape(-1),
         "x_std": np.array(data.get("x_std", []), dtype=np.float64).reshape(-1),
     }

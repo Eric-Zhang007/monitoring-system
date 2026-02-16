@@ -32,3 +32,8 @@ def test_normalize_features_uses_stats():
     norm = {"x_mean": [8.0, 1.0, -1.0], "x_std": [2.0, 2.0, 0.5]}
     out = ModelRouter._normalize_features(x, norm)
     assert np.allclose(out, np.array([1.0, 2.0, 0.0], dtype=np.float32))
+
+
+def test_schema_compatibility_includes_previous_v22():
+    router = ModelRouter()
+    assert "v2.2" in router.compatible_feature_schemas

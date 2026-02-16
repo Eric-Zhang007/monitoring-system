@@ -92,7 +92,7 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     env.setdefault("MODEL_DIR", str(repo_root / "backend" / "models"))
     env.setdefault("FEATURE_VERSION", "feature-store-v2.1")
-    env.setdefault("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.2")
+    env.setdefault("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.3")
     env.setdefault("DATA_VERSION", "v1")
     env["LIQUID_SYMBOLS"] = str(args.symbols)
     env["LIQUID_EPOCHS"] = str(int(args.epochs))

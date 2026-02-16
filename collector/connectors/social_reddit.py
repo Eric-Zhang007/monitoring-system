@@ -7,6 +7,7 @@ import requests
 
 from connectors.base import BaseConnector, RateLimitError
 from connectors.social_common import (
+    detect_language_hint,
     estimate_engagement_score,
     extract_symbol_mentions,
     parse_datetime_to_iso_z,
@@ -186,6 +187,7 @@ class RedditConnector(BaseConnector):
             summary=combined,
             extra={
                 "subreddit": subreddit,
+                "language": detect_language_hint(combined),
                 "upvote_ratio": upvote_ratio,
                 "post_score": score,
                 "post_id": str(post.get("id") or ""),

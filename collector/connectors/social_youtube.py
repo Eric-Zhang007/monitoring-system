@@ -11,6 +11,7 @@ except Exception:  # pragma: no cover
 
 from connectors.base import BaseConnector, RateLimitError
 from connectors.social_common import (
+    detect_language_hint,
     estimate_engagement_score,
     extract_symbol_mentions,
     parse_datetime_to_iso_z,
@@ -203,6 +204,7 @@ class YouTubeConnector(BaseConnector):
             summary=text,
             extra={
                 "video_id": video_id,
+                "language": detect_language_hint(text),
                 "view_count": views,
                 "like_count": likes,
                 "comment_count": comments,

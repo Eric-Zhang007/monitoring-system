@@ -1,19 +1,32 @@
-#!/bin/bash
-# Test script for the monitoring system
+#!/usr/bin/env bash
+# Test script for the monitoring system (bash/WSL compatible)
 
-set -e
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+compose_cmd() {
+    if docker compose version >/dev/null 2>&1; then
+        docker compose "$@"
+        return
+    fi
+    if command -v docker-compose >/dev/null 2>&1; then
+        docker-compose "$@"
+        return
+    fi
+    echo "❌ Docker Compose 未安装"
+    return 127
+}
 
 echo "=========================================="
 echo "  全网信息监测系统 - 测试脚本"
 echo "=========================================="
 echo ""
 
-PROJECT_DIR="/home/admin/.openclaw/workspace/monitoring-system"
-cd "$PROJECT_DIR"
-
 # 1. Check Docker Compose configuration
 echo "📋 检查 Docker Compose 配置..."
-docker compose config > /dev/null
+compose_cmd config > /dev/null
 echo "✅ Docker Compose 配置有效"
 echo ""
 
@@ -40,7 +53,7 @@ else
 fi
 echo ""
 
-cd "$PROJECT_DIR"
+cd "$ROOT_DIR"
 
 # 4. Validate all required files exist
 echo "📁 检查必需文件..."

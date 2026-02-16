@@ -7,6 +7,7 @@
 
 ## 2. 前置条件
 - 本地（笔记本/WSL）已安装并可用：`python3`、`git`、`ssh`、`scp`（Docker 仅在备用链路需要）。
+- 运行入口固定为 WSL Bash；PowerShell / `cmd.exe` 路径不在本计划范围内。
 - 服务器已安装并可用：`python3`、`git`、`screen`、`postgresql`、`redis-server`。
 - 仓库代码与本地验证通过。
 

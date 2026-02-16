@@ -109,6 +109,17 @@ def sanitize_symbol_list(symbols: Iterable[object]) -> List[str]:
     return out
 
 
+def detect_language_hint(text: str) -> str:
+    body = str(text or "").strip()
+    if not body:
+        return "other"
+    if re.search(r"[\u4e00-\u9fff]", body):
+        return "zh"
+    if re.search(r"[A-Za-z]", body):
+        return "en"
+    return "other"
+
+
 def extract_symbol_mentions(text: str, known_symbols: Sequence[str] | None = None) -> List[str]:
     body = str(text or "")
     candidates = re.findall(r"\$?[A-Z]{2,10}", body)

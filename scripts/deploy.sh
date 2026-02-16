@@ -1,25 +1,37 @@
-#!/bin/bash
-# Deploy script for the monitoring system
+#!/usr/bin/env bash
+# Deploy script for the monitoring system (bash/WSL compatible)
 
-set -e
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+compose_cmd() {
+    if docker compose version >/dev/null 2>&1; then
+        docker compose "$@"
+        return
+    fi
+    if command -v docker-compose >/dev/null 2>&1; then
+        docker-compose "$@"
+        return
+    fi
+    echo "❌ Docker Compose 未安装"
+    return 127
+}
 
 echo "=========================================="
 echo "  全网信息监测系统 - 部署脚本"
 echo "=========================================="
 echo ""
 
-PROJECT_DIR="/home/admin/.openclaw/workspace/monitoring-system"
-cd "$PROJECT_DIR"
-
 # 1. Check Docker
 echo "📦 检查 Docker..."
-if ! command -v docker &> /dev/null; then
+if ! command -v docker >/dev/null 2>&1; then
     echo "❌ Docker 未安装"
     exit 1
 fi
 
-if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null 2>&1; then
-    echo "❌ Docker Compose 未安装"
+if ! compose_cmd version >/dev/null 2>&1; then
     exit 1
 fi
 
@@ -37,16 +49,16 @@ echo "✅ 前端构建完成"
 echo ""
 
 # 3. Build Docker images
-cd "$PROJECT_DIR"
+cd "$ROOT_DIR"
 echo "🐳 构建 Docker 镜像..."
-docker compose build
+compose_cmd build
 
 echo "✅ Docker 镜像构建完成"
 echo ""
 
 # 4. Start services
 echo "🚀 启动服务..."
-docker compose up -d
+compose_cmd up -d
 
 echo "✅ 服务已启动"
 echo ""
@@ -58,7 +70,7 @@ sleep 10
 # 6. Check service status
 echo ""
 echo "📊 服务状态："
-docker compose ps
+compose_cmd ps
 
 echo ""
 echo "=========================================="

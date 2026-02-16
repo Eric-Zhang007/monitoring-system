@@ -135,7 +135,13 @@ def main() -> int:
     ap.add_argument("--out-jsonl", default="artifacts/social_history_backfill.jsonl")
 
     ap.add_argument("--twitter-bearer-token", default=os.getenv("TWITTER_BEARER_TOKEN", ""))
-    ap.add_argument("--twitter-query", default=os.getenv("TWITTER_QUERY", "(bitcoin OR ethereum OR solana OR $BTC OR $ETH OR $SOL) lang:en -is:retweet"))
+    ap.add_argument(
+        "--twitter-query",
+        default=os.getenv(
+            "TWITTER_QUERY",
+            "(bitcoin OR ethereum OR solana OR 比特币 OR 以太坊 OR 索拉纳 OR $BTC OR $ETH OR $SOL) -is:retweet",
+        ),
+    )
     ap.add_argument("--twitter-max-results", type=int, default=int(os.getenv("TWITTER_MAX_RESULTS", "25")))
     ap.add_argument("--twitter-include-replies", action="store_true", default=_to_bool(os.getenv("TWITTER_INCLUDE_REPLIES", "0")))
 
@@ -149,7 +155,7 @@ def main() -> int:
 
     ap.add_argument("--youtube-mode", default=os.getenv("YOUTUBE_MODE", "rss"))
     ap.add_argument("--youtube-channel-ids", default=os.getenv("YOUTUBE_CHANNEL_IDS", ""))
-    ap.add_argument("--youtube-query", default=os.getenv("YOUTUBE_QUERY", "crypto bitcoin ethereum solana"))
+    ap.add_argument("--youtube-query", default=os.getenv("YOUTUBE_QUERY", "crypto bitcoin ethereum solana 比特币 以太坊 索拉纳"))
     ap.add_argument("--youtube-api-key", default=os.getenv("YOUTUBE_API_KEY", ""))
     ap.add_argument("--youtube-max-results", type=int, default=int(os.getenv("YOUTUBE_MAX_RESULTS", "20")))
 
@@ -158,6 +164,8 @@ def main() -> int:
     ap.add_argument("--liquid-symbols", default=os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"))
     ap.add_argument("--dedup", action="store_true", default=_to_bool(os.getenv("SOCIAL_DEDUP", "1"), default=True))
     ap.add_argument("--no-dedup", action="store_false", dest="dedup")
+    ap.add_argument("--llm-enrich", action="store_true", default=_to_bool(os.getenv("LLM_ENRICHMENT_ENABLED", "0")))
+    ap.add_argument("--llm-max-events", type=int, default=int(os.getenv("LLM_ENRICH_MAX_EVENTS", "0")))
     args = ap.parse_args()
 
     liquid_symbols = [s.strip().upper() for s in str(args.liquid_symbols).split(",") if s.strip()]
@@ -191,6 +199,20 @@ def main() -> int:
     if args.dedup:
         events = _dedup(events)
 
+    llm_meta = {"status": "disabled"}
+    if bool(args.llm_enrich):
+        helper_dir = Path(__file__).resolve().parent
+        if str(helper_dir) not in sys.path:
+            sys.path.insert(0, str(helper_dir))
+        from event_enrichment import apply_llm_enrichment, build_llm_enricher  # type: ignore
+
+        llm_meta = apply_llm_enrichment(
+            events,
+            enricher=build_llm_enricher(force_enable=True),
+            max_events=int(args.llm_max_events),
+        )
+        llm_meta["status"] = "enabled"
+
     out_jsonl = str(args.out_jsonl).strip()
     os.makedirs(os.path.dirname(out_jsonl) or ".", exist_ok=True)
     with open(out_jsonl, "w", encoding="utf-8") as f:
@@ -205,6 +227,7 @@ def main() -> int:
                 "counts": counts,
                 "events": len(events),
                 "failures": failures[:20],
+                "llm_enrichment": llm_meta,
                 "out_jsonl": out_jsonl,
             },
             ensure_ascii=False,

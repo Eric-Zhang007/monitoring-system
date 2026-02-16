@@ -6,6 +6,7 @@ import requests
 
 from connectors.base import BaseConnector, RateLimitError
 from connectors.social_common import (
+    detect_language_hint,
     estimate_engagement_score,
     extract_symbol_mentions,
     parse_datetime_to_iso_z,
@@ -93,6 +94,7 @@ class XTwitterConnector(BaseConnector):
             summary=text,
             extra={
                 "tweet_id": tweet_id,
+                "language": str(tweet.get("lang") or "").strip().lower() or detect_language_hint(text),
                 "retweet_count": retweets,
                 "like_count": likes,
                 "reply_count": replies,

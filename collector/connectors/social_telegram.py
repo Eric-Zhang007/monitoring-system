@@ -11,6 +11,7 @@ except Exception:  # pragma: no cover
 
 from connectors.base import BaseConnector
 from connectors.social_common import (
+    detect_language_hint,
     estimate_engagement_score,
     extract_symbol_mentions,
     parse_datetime_to_iso_z,
@@ -85,6 +86,7 @@ class TelegramConnector(BaseConnector):
             summary=text,
             extra={
                 "telegram_feed": str(raw.get("feed") or ""),
+                "language": detect_language_hint(text),
                 "telegram_mode": "rss_public_placeholder",
             },
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 from email.utils import parsedate_to_datetime
 from typing import Dict, List
+import re
 import xml.etree.ElementTree as ET
 
 import requests
@@ -12,6 +13,17 @@ except Exception:  # pragma: no cover
     feedparser = None
 
 from connectors.base import BaseConnector
+
+
+def _language_hint(text: str) -> str:
+    body = str(text or "").strip()
+    if not body:
+        return "other"
+    if re.search(r"[\u4e00-\u9fff]", body):
+        return "zh"
+    if re.search(r"[A-Za-z]", body):
+        return "en"
+    return "other"
 
 
 class RSSConnector(BaseConnector):
@@ -60,7 +72,9 @@ class RSSConnector(BaseConnector):
 
         title = entry.get("title", "Untitled")
         summary = entry.get("summary", "")
-        event_type = "funding" if "funding" in (title + summary).lower() else "market"
+        lower_text = (title + " " + summary).lower()
+        event_type = "funding" if any(k in lower_text for k in ("funding", "融资", "投资", "募资")) else "market"
+        lang = _language_hint(f"{title}\n{summary}")
 
         return {
             "event_type": event_type,
@@ -75,6 +89,6 @@ class RSSConnector(BaseConnector):
             "event_importance": 0.52,
             "novelty_score": 0.5,
             "entity_confidence": 0.35,
-            "payload": {"summary": summary[:1200]},
+            "payload": {"summary": summary[:1200], "language": lang},
             "entities": [],
         }

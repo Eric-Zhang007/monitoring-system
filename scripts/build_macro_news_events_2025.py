@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -16,9 +19,13 @@ import requests
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 DEFAULT_QUERIES = [
     "federal reserve AND rate",
+    "美联储 AND 利率",
     "bitcoin ETF",
+    "比特币 ETF",
     "crypto regulation",
+    "加密货币 监管",
     "donald trump crypto",
+    "特朗普 加密货币",
 ]
 DEFAULT_RELEASE_IDS = ["10", "53", "54"]
 
@@ -85,9 +92,25 @@ def _iter_day_windows(start: datetime, end: datetime, day_step: int) -> Iterable
         cur = nxt
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _language_hint(text: str) -> str:
+    body = str(text or "")
+    if not body.strip():
+        return "other"
+    if re.search(r"[\u4e00-\u9fff]", body):
+        return "zh"
+    if re.search(r"[A-Za-z]", body):
+        return "en"
+    return "other"
+
+
 def _classify_event(title: str, query: str) -> Tuple[str, str, bool]:
     t = f"{title} {query}".lower()
-    if any(k in t for k in ("sec", "regulation", "law", "ban", "policy", "tariff")):
+    if any(k in t for k in ("sec", "regulation", "law", "ban", "policy", "tariff", "监管", "禁令", "关税")):
         event_type = "regulatory"
     else:
         event_type = "market"
@@ -106,6 +129,11 @@ def _classify_event(title: str, query: str) -> Tuple[str, str, bool]:
             "institutional",
             "blackrock",
             "fidelity",
+            "美联储",
+            "通胀",
+            "利率",
+            "特朗普",
+            "贝莱德",
         )
     )
     market_scope = "macro" if is_macro else "crypto"
@@ -115,13 +143,13 @@ def _classify_event(title: str, query: str) -> Tuple[str, str, bool]:
 
 def _extract_entities(title: str) -> List[Dict[str, object]]:
     mapping = {
-        "BTC": ("bitcoin", "btc"),
-        "ETH": ("ethereum", "eth"),
-        "SOL": ("solana", "sol"),
+        "BTC": ("bitcoin", "btc", "比特币"),
+        "ETH": ("ethereum", "eth", "以太坊"),
+        "SOL": ("solana", "sol", "索拉纳"),
         "BNB": ("bnb", "binance coin", "binancecoin"),
         "XRP": ("xrp", "ripple"),
-        "ADA": ("ada", "cardano"),
-        "DOGE": ("doge", "dogecoin"),
+        "ADA": ("ada", "cardano", "艾达"),
+        "DOGE": ("doge", "dogecoin", "狗狗币"),
         "TRX": ("trx", "tron"),
         "AVAX": ("avax", "avalanche"),
         "LINK": ("link", "chainlink"),
@@ -172,6 +200,14 @@ def _title_is_relevant(title: str) -> bool:
         "trump",
         "sec",
         "regulation",
+        "比特币",
+        "以太坊",
+        "索拉纳",
+        "加密货币",
+        "美联储",
+        "通胀",
+        "利率",
+        "监管",
     )
     return any(k in t for k in keywords)
 
@@ -214,6 +250,7 @@ def _build_event_from_gdelt(row: Dict[str, object], query: str) -> Dict[str, obj
             "provider": "gdelt",
             "query": query,
             "language": row.get("language"),
+            "language_hint": _language_hint(f"{title}\n{query}"),
             "tone": row.get("tone"),
             "global_impact": global_impact,
             "availability_lag_minutes": round(float(lag_minutes), 3),
@@ -308,6 +345,7 @@ def _fetch_fred_events(start: datetime, end: datetime, release_ids: List[str]) -
                     "payload": {
                         "provider": "fred",
                         "release_id": rid,
+                        "language": "en",
                         "summary": (item.findtext("description") or "")[:1200],
                         "global_impact": True,
                         "availability_lag_minutes": round(float(lag_minutes), 3),
@@ -358,6 +396,8 @@ def main() -> int:
     ap.add_argument("--skip-gdelt", action="store_true")
     ap.add_argument("--include-fred", action="store_true")
     ap.add_argument("--release-ids", default="10,53,54", help="FRED release ids, comma-separated")
+    ap.add_argument("--llm-enrich", action="store_true", default=_env_flag("LLM_ENRICHMENT_ENABLED", default=False))
+    ap.add_argument("--llm-max-events", type=int, default=int(os.getenv("LLM_ENRICH_MAX_EVENTS", "0")))
     ap.add_argument("--out-jsonl", default="artifacts/server_bundle/events_2025_now.jsonl")
     args = ap.parse_args()
 
@@ -396,11 +436,23 @@ def main() -> int:
 
     deduped = _dedup_events(all_events)
     deduped.sort(key=lambda x: str(x.get("occurred_at") or ""))
+    llm_meta = {"status": "disabled"}
+    if bool(args.llm_enrich):
+        helper_dir = os.path.dirname(__file__)
+        if helper_dir not in sys.path:
+            sys.path.insert(0, helper_dir)
+        from event_enrichment import apply_llm_enrichment, build_llm_enricher  # type: ignore
+
+        llm_meta = apply_llm_enrichment(
+            deduped,
+            enricher=build_llm_enricher(force_enable=True),
+            max_events=int(args.llm_max_events),
+        )
+        llm_meta["status"] = "enabled"
 
     out_path = str(args.out_jsonl).strip()
     if not out_path:
         raise RuntimeError("out_jsonl_required")
-    import os
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -417,6 +469,7 @@ def main() -> int:
                 "windows": fetched_windows,
                 "events_raw": len(all_events),
                 "events_deduped": len(deduped),
+                "llm_enrichment": llm_meta,
                 "out_jsonl": out_path,
             },
             ensure_ascii=False,

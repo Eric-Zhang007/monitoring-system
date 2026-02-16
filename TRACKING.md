@@ -1,5 +1,37 @@
 # 代码追踪与问题清单
 
+## 🆕 2026-02-16 阶段更新（WSL-only 运维化 + 多语言/LLM 集成规划）
+
+> 说明：本阶段新增约束为 **WSL-only**。所有运维命令仅保证 `bash`/Linux 路径；PowerShell 路径为非目标。
+
+### 1) 运行约束（新增）
+- 本地与运维入口统一为 WSL Bash（Ubuntu 等）；
+- 文档与脚本不再维护 `PowerShell/cmd.exe` 分支；
+- 命令示例统一为 `bash scripts/*.sh` + Linux 路径（`/mnt/c/...`）。
+
+### 2) 本阶段完成（脚本/文档）
+- 已审计并收敛脚本入口为 bash 语义，重点修正：
+  - `scripts/deploy.sh`：移除硬编码绝对路径，改为仓库相对路径；`docker compose`/`docker-compose` 自动探测；
+  - `scripts/test.sh`：同样改为仓库相对路径与 compose 自动探测。
+- 已补充 README 的 WSL 紧凑 runbook（API keys、startup、readiness、异步长任务超时参数）。
+
+### 3) 多语言 + LLM 集成计划（新阶段）
+1. **Stage M1: 配置与密钥治理**
+   - 在 `.env` 扩展 LLM provider key（按实际选型）；
+   - 统一 secrets 加载与空值降级策略（未配置时可回退到非 LLM 路径）。
+2. **Stage M2: 多语言数据标准化**
+   - 新增中英文本归一化与语言标注字段；
+   - 保留 `occurred_at/available_at` 审计，不放宽时序约束。
+3. **Stage M3: LLM 推理接入**
+   - 将摘要/打标/情绪结果接入现有 `v2` 数据面；
+   - 增加超时、重试、成本配额与 provider fallback。
+4. **Stage M4: 可观测与门禁**
+   - 指标新增：调用延迟、失败率、token/成本、语言覆盖率；
+   - readiness 增加 LLM 子链路健康检查（可选硬门禁）。
+
+### 4) 当前执行策略
+- 继续遵循“先代码和文档收敛，再集中验证”，当前回合不执行重型测试。
+
 ## 🆕 2026-02-16 阶段更新（代码优先，no-docker）
 
 > 说明：从本阶段起，`TRACKING.md` 按“阶段成果”持续更新；历史条目可能过时，以“最新阶段块”优先。

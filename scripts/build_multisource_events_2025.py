@@ -5,6 +5,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import sys
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -19,11 +21,17 @@ import requests
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 DEFAULT_SEARCH_QUERIES = [
     "bitcoin OR ethereum OR solana OR crypto market",
+    "比特币 OR 以太坊 OR 索拉纳 OR 加密货币 市场",
     "federal reserve OR FOMC OR inflation OR CPI OR interest rate crypto",
+    "美联储 OR 通胀 OR CPI OR 利率 OR 加密货币",
     "donald trump crypto OR us election crypto policy",
+    "特朗普 加密货币 政策 OR 美国大选 加密货币",
     "SEC crypto OR ETF approval bitcoin",
+    "SEC 加密 监管 OR 比特币 ETF 批准",
     "blackrock bitcoin etf inflow",
+    "贝莱德 比特币 ETF 资金流入",
 ]
+DEFAULT_GOOGLE_LOCALES = ["US:en", "CN:zh-Hans"]
 DEFAULT_OFFICIAL_FEEDS = {
     "federal_reserve": [
         "https://www.federalreserve.gov/feeds/press_monetary.xml",
@@ -42,6 +50,10 @@ DEFAULT_OFFICIAL_FEEDS = {
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
         "https://cointelegraph.com/rss",
         "https://cryptonews.com/news/feed/",
+    ],
+    "crypto_media_zh": [
+        "https://www.binance.com/zh-CN/support/announcement/rss",
+        "https://www.binance.com/en/support/announcement/rss",
     ],
 }
 
@@ -72,6 +84,45 @@ def _iter_windows(start: datetime, end: datetime, day_step: int) -> Iterable[Tup
         cur = nxt
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _language_hint(text: str) -> str:
+    body = str(text or "")
+    if not body.strip():
+        return "other"
+    if re.search(r"[\u4e00-\u9fff]", body):
+        return "zh"
+    if re.search(r"[A-Za-z]", body):
+        return "en"
+    return "other"
+
+
+def _parse_google_locale(raw: str) -> Tuple[str, str, str]:
+    text = str(raw or "").strip()
+    if not text:
+        return "en-US", "US", "US:en"
+    if ":" in text:
+        gl, lang = text.split(":", 1)
+        gl = gl.strip().upper() or "US"
+        lang = lang.strip() or "en"
+    else:
+        gl, lang = "US", text
+    lang_lower = lang.lower()
+    if lang_lower == "en":
+        hl = "en-US"
+        ceid_lang = "en"
+    elif lang_lower.startswith("zh"):
+        hl = "zh-CN"
+        ceid_lang = "zh-Hans"
+    else:
+        hl = lang
+        ceid_lang = lang
+    return hl, gl, f"{gl}:{ceid_lang}"
+
+
 def _normalize_title_source(title: str) -> Tuple[str, str]:
     t = str(title or "").strip()
     if " - " in t:
@@ -83,13 +134,13 @@ def _normalize_title_source(title: str) -> Tuple[str, str]:
 def _extract_entities(text: str) -> List[Dict[str, object]]:
     t = str(text or "").lower()
     mapping = {
-        "BTC": ("bitcoin", "btc"),
-        "ETH": ("ethereum", "eth"),
-        "SOL": ("solana", "sol"),
+        "BTC": ("bitcoin", "btc", "比特币"),
+        "ETH": ("ethereum", "eth", "以太坊"),
+        "SOL": ("solana", "sol", "索拉纳"),
         "BNB": ("bnb", "binance"),
         "XRP": ("xrp", "ripple"),
-        "ADA": ("ada", "cardano"),
-        "DOGE": ("doge", "dogecoin"),
+        "ADA": ("ada", "cardano", "艾达"),
+        "DOGE": ("doge", "dogecoin", "狗狗币"),
         "TRX": ("trx", "tron"),
         "AVAX": ("avax", "avalanche"),
         "LINK": ("link", "chainlink"),
@@ -123,7 +174,7 @@ def _extract_entities(text: str) -> List[Dict[str, object]]:
 
 def _classify(title: str, query: str = "") -> Tuple[str, str, bool]:
     t = f"{title} {query}".lower()
-    if any(k in t for k in ("sec", "regulation", "policy", "ban", "law", "enforcement")):
+    if any(k in t for k in ("sec", "regulation", "policy", "ban", "law", "enforcement", "监管", "禁令", "执法")):
         event_type = "regulatory"
     else:
         event_type = "market"
@@ -143,6 +194,12 @@ def _classify(title: str, query: str = "") -> Tuple[str, str, bool]:
             "fidelity",
             "treasury",
             "fed",
+            "美联储",
+            "通胀",
+            "利率",
+            "特朗普",
+            "大选",
+            "贝莱德",
         )
     )
     return event_type, ("macro" if is_macro else "crypto"), bool(is_macro)
@@ -167,6 +224,15 @@ def _is_relevant(title: str, summary: str = "") -> bool:
         "sec",
         "regulation",
         "stablecoin",
+        "比特币",
+        "以太坊",
+        "索拉纳",
+        "加密货币",
+        "美联储",
+        "通胀",
+        "利率",
+        "监管",
+        "稳定币",
     )
     return any(k in t for k in keys)
 
@@ -198,6 +264,7 @@ def _build_event(
     query: str,
     summary: str,
     source_tier: int,
+    language_hint: str = "other",
 ) -> Dict[str, object]:
     event_type, market_scope, global_impact = _classify(title=title, query=query)
     confidence = 0.7 if market_scope == "macro" else 0.65
@@ -233,6 +300,7 @@ def _build_event(
             "provider": provider,
             "query": query,
             "description": summary[:1200],
+            "language": language_hint,
             "global_impact": global_impact,
             "availability_lag_minutes": round(float(lag_minutes), 3),
             "availability_model": "provider_tier_hash_v1",
@@ -284,30 +352,36 @@ def _collect_google_news(
     start: datetime,
     end: datetime,
     queries: List[str],
+    locales: List[str],
     day_step: int,
     sleep_sec: float,
 ) -> List[Dict[str, object]]:
     events: List[Dict[str, object]] = []
     for w_start, w_end in _iter_windows(start, end, day_step):
         for q in queries:
-            qq = f"{q} after:{w_start.date().isoformat()} before:{w_end.date().isoformat()}"
-            url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(qq) + "&hl=en-US&gl=US&ceid=US:en"
-            try:
-                items = _rss_items(sess, url)
-            except Exception:
-                items = []
-            for it in items:
-                raw_title = str(it.get("title") or "")
-                title, src_tail = _normalize_title_source(raw_title)
-                summary = str(it.get("description") or "")
-                if not _is_relevant(title, summary):
-                    continue
+            for locale in locales:
+                hl, gl, ceid = _parse_google_locale(locale)
+                qq = f"{q} after:{w_start.date().isoformat()} before:{w_end.date().isoformat()}"
+                url = (
+                    "https://news.google.com/rss/search?q="
+                    + urllib.parse.quote(qq)
+                    + f"&hl={urllib.parse.quote(hl)}&gl={urllib.parse.quote(gl)}&ceid={urllib.parse.quote(ceid)}"
+                )
                 try:
-                    ts = parsedate_to_datetime(str(it.get("pubDate") or "")).astimezone(timezone.utc)
+                    items = _rss_items(sess, url)
                 except Exception:
-                    continue
-                events.append(
-                    _build_event(
+                    items = []
+                for it in items:
+                    raw_title = str(it.get("title") or "")
+                    title, src_tail = _normalize_title_source(raw_title)
+                    summary = str(it.get("description") or "")
+                    if not _is_relevant(title, summary):
+                        continue
+                    try:
+                        ts = parsedate_to_datetime(str(it.get("pubDate") or "")).astimezone(timezone.utc)
+                    except Exception:
+                        continue
+                    event = _build_event(
                         title=title,
                         link=str(it.get("link") or ""),
                         ts=ts,
@@ -316,10 +390,12 @@ def _collect_google_news(
                         query=q,
                         summary=summary,
                         source_tier=2,
+                        language_hint=_language_hint(f"{title}\n{summary}"),
                     )
-                )
-            if sleep_sec > 0:
-                time.sleep(sleep_sec)
+                    event["payload"]["google_locale"] = f"{gl}:{hl}"
+                    events.append(event)
+                if sleep_sec > 0:
+                    time.sleep(sleep_sec)
     return events
 
 
@@ -381,6 +457,7 @@ def _collect_gdelt(
                         query=q,
                         summary=str((row or {}).get("socialimage") or ""),
                         source_tier=2,
+                        language_hint=_language_hint(f"{title}\n{str((row or {}).get('socialimage') or '')}"),
                     )
                 )
             if sleep_sec > 0:
@@ -434,6 +511,7 @@ def _collect_official_rss(
                         query=source_group,
                         summary=summary,
                         source_tier=tier_map.get(source_group, 2),
+                        language_hint=_language_hint(f"{title}\n{summary}"),
                     )
                 )
             if sleep_sec > 0:
@@ -567,6 +645,7 @@ def main() -> int:
     ap.add_argument("--end", default="")
     ap.add_argument("--day-step", type=int, default=7)
     ap.add_argument("--queries", default="||".join(DEFAULT_SEARCH_QUERIES), help="split by ||")
+    ap.add_argument("--google-locales", default=",".join(DEFAULT_GOOGLE_LOCALES), help="e.g. US:en,CN:zh-Hans")
     ap.add_argument("--gdelt-max-records", type=int, default=50)
     ap.add_argument("--sleep-sec", type=float, default=0.2)
     ap.add_argument("--disable-google", action="store_true")
@@ -575,6 +654,8 @@ def main() -> int:
     ap.add_argument("--disable-source-balance", action="store_true")
     ap.add_argument("--max-google-share", type=float, default=0.68)
     ap.add_argument("--min-google-events", type=int, default=2500)
+    ap.add_argument("--llm-enrich", action="store_true", default=_env_flag("LLM_ENRICHMENT_ENABLED", default=False))
+    ap.add_argument("--llm-max-events", type=int, default=int(os.getenv("LLM_ENRICH_MAX_EVENTS", "0")))
     ap.add_argument("--out-jsonl", default="artifacts/server_bundle/events_multisource_2025_now.jsonl")
     args = ap.parse_args()
 
@@ -583,6 +664,7 @@ def main() -> int:
     if end_dt <= start_dt:
         raise RuntimeError("invalid_time_range_end_must_be_gt_start")
     queries = [q.strip() for q in str(args.queries).split("||") if q.strip()] or list(DEFAULT_SEARCH_QUERIES)
+    locales = [x.strip() for x in str(args.google_locales).split(",") if x.strip()] or list(DEFAULT_GOOGLE_LOCALES)
 
     sess = requests.Session()
     all_events: List[Dict[str, object]] = []
@@ -594,6 +676,7 @@ def main() -> int:
             start=start_dt,
             end=end_dt,
             queries=queries,
+            locales=locales,
             day_step=int(args.day_step),
             sleep_sec=float(args.sleep_sec),
         )
@@ -637,6 +720,19 @@ def main() -> int:
             min_keep=int(args.min_google_events),
         )
     provider_counts_after = _provider_counts(deduped)
+    llm_meta: Dict[str, object] = {"status": "disabled"}
+    if bool(args.llm_enrich):
+        helper_dir = os.path.dirname(__file__)
+        if helper_dir not in sys.path:
+            sys.path.insert(0, helper_dir)
+        from event_enrichment import apply_llm_enrichment, build_llm_enricher  # type: ignore
+
+        llm_meta = apply_llm_enrichment(
+            deduped,
+            enricher=build_llm_enricher(force_enable=True),
+            max_events=int(args.llm_max_events),
+        )
+        llm_meta["status"] = "enabled"
 
     out_path = str(args.out_jsonl).strip()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -658,6 +754,8 @@ def main() -> int:
                 "provider_counts_before_balance": provider_counts_before,
                 "provider_counts_after_balance": provider_counts_after,
                 "source_balance": source_balance_meta,
+                "google_locales": locales,
+                "llm_enrichment": llm_meta,
                 "out_jsonl": out_path,
             },
             ensure_ascii=False,

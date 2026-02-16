@@ -33,6 +33,7 @@ from connectors import (
 )
 from connectors.base import RateLimitError
 from entity_linking import extract_entities
+from llm_enrichment import LLMEnricher
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,11 +120,19 @@ class DataCollectorV2:
         self.liquid_symbols = {s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK").split(",") if s.strip()}
         self.connector_state: Dict[str, Dict[str, float]] = {}
         self._http = self._build_http_session()
+        self.llm_enricher = LLMEnricher()
 
         rss_feeds = [
             "https://feeds.finance.yahoo.com/rss/2.0/headline",
             "https://www.prnewswire.com/rss/financial-services-latest-news/financial-services-latest-news-list.rss",
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",
+            "https://cointelegraph.com/rss",
+            "https://www.binance.com/en/support/announcement/rss",
+            "https://www.binance.com/zh-CN/support/announcement/rss",
         ]
+        extra_rss_feeds = [s.strip() for s in os.getenv("RSS_EXTRA_FEEDS", "").split(",") if s.strip()]
+        if extra_rss_feeds:
+            rss_feeds.extend(extra_rss_feeds)
         sec_ciks = ["320193", "1045810", "789019"]  # Apple/NVDA/MSFT
         alpha_key = os.getenv("ALPHAVANTAGE_API_KEY", "")
         coingecko_ids = [
@@ -136,7 +145,7 @@ class DataCollectorV2:
         ]
 
         self.connectors = [
-            GDELTConnector(query="venture capital startup funding OR IPO", max_records=25),
+            GDELTConnector(query="venture capital startup funding OR IPO OR 比特币 OR 以太坊 OR 加密货币", max_records=25),
             RSSConnector(feeds=rss_feeds),
             SECSubmissionsConnector(cik_list=sec_ciks),
             MacroFREDConnector(),
@@ -146,6 +155,12 @@ class DataCollectorV2:
             self.connectors.append(EarningsAlphaVantageConnector(api_key=alpha_key, horizon=os.getenv("EARNINGS_HORIZON", "3month")))
         self.connectors.extend(self._build_social_connectors())
         logger.info("collector connectors enabled=%s", [c.name for c in self.connectors])
+        logger.info(
+            "llm enrichment enabled=%s provider=%s model=%s",
+            bool(self.llm_enricher.enabled),
+            self.llm_enricher.provider,
+            self.llm_enricher.model,
+        )
         try:
             start_http_server(self.metrics_port)
             logger.info("collector metrics server started on :%s", self.metrics_port)
@@ -203,7 +218,7 @@ class DataCollectorV2:
         if "twitter" in selected or "x" in selected:
             twitter_query = os.getenv(
                 "TWITTER_QUERY",
-                "(bitcoin OR ethereum OR solana OR $BTC OR $ETH OR $SOL) lang:en -is:retweet",
+                "(bitcoin OR ethereum OR solana OR 比特币 OR 以太坊 OR 索拉纳 OR $BTC OR $ETH OR $SOL) -is:retweet",
             )
             if not self._env_flag("TWITTER_INCLUDE_REPLIES", default=False):
                 twitter_query += " -is:reply"
@@ -245,7 +260,7 @@ class DataCollectorV2:
                         for c in os.getenv("YOUTUBE_CHANNEL_IDS", "").split(",")
                         if c.strip()
                     ],
-                    query=os.getenv("YOUTUBE_QUERY", "crypto bitcoin ethereum solana"),
+                    query=os.getenv("YOUTUBE_QUERY", "crypto bitcoin ethereum solana 比特币 以太坊 索拉纳"),
                     api_key=os.getenv("YOUTUBE_API_KEY", ""),
                     max_results=int(os.getenv("YOUTUBE_MAX_RESULTS", "20")),
                 )
@@ -392,6 +407,47 @@ class DataCollectorV2:
                 )
         return out
 
+    @staticmethod
+    def _entity_dedup_key(entity: Dict[str, Any]) -> str:
+        entity_type = str(entity.get("entity_type") or "").strip().lower()
+        symbol = str(entity.get("symbol") or "").strip().upper()
+        name = str(entity.get("name") or "").strip().lower()
+        if symbol:
+            return f"{entity_type}:{symbol}"
+        return f"{entity_type}:{name}"
+
+    @staticmethod
+    def _llm_entities_to_canonical(llm_entities: Any) -> List[Dict[str, Any]]:
+        if not isinstance(llm_entities, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for raw in llm_entities[:20]:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                continue
+            entity_type = str(raw.get("entity_type") or "company").strip().lower()
+            if entity_type not in {"asset", "company", "investor"}:
+                entity_type = "company"
+            symbol = str(raw.get("symbol") or "").strip().upper().replace("$", "")
+            if entity_type != "asset":
+                symbol = ""
+            out.append(
+                {
+                    "entity_type": entity_type,
+                    "name": name[:120],
+                    "symbol": symbol or None,
+                    "country": None,
+                    "sector": "crypto" if entity_type == "asset" else None,
+                    "metadata": {
+                        "source": "llm_enrichment",
+                        "confidence": float(raw.get("confidence", 0.5) or 0.5),
+                    },
+                }
+            )
+        return out
+
     def publish_event(self, event: Dict, connector_name: str, fetch_status: str):
         state = self._state(connector_name)
         occurred_at = event["occurred_at"]
@@ -409,6 +465,17 @@ class DataCollectorV2:
             COLLECTOR_SOURCE_PUBLISH_TO_INGEST_SECONDS.labels(connector=connector_name).observe(float(latency_ms) / 1000.0)
 
         event_payload = self._normalize_social_payload(dict(event.get("payload", {})))
+        llm_enrichment = self.llm_enricher.enrich_event(event)
+        event_payload["llm_enrichment"] = llm_enrichment
+        event_payload["llm_sentiment"] = float(llm_enrichment.get("sentiment", 0.0) or 0.0)
+        event_payload["llm_confidence"] = float(llm_enrichment.get("confidence", 0.0) or 0.0)
+        llm_lang = str(llm_enrichment.get("language") or "").strip().lower()
+        if llm_lang in {"zh", "en"}:
+            event_payload["language"] = llm_lang
+        if not str(event_payload.get("summary") or "").strip():
+            fallback_summary = str(llm_enrichment.get("summary") or "").strip()
+            if fallback_summary:
+                event_payload["summary"] = fallback_summary[:1200]
         event_payload["collector_ingested_at"] = datetime.utcnow().isoformat() + "Z"
         event_payload["ingest_dedup_key"] = dedup_key
         event_payload["source_fetch_status"] = fetch_status
@@ -427,6 +494,15 @@ class DataCollectorV2:
             event.get("title", ""),
             str(event_payload.get("summary", "")),
         )
+        llm_entities = self._llm_entities_to_canonical(llm_enrichment.get("entities"))
+        if llm_entities:
+            existing_keys = {self._entity_dedup_key(e) for e in enriched_entities if isinstance(e, dict)}
+            for llm_entity in llm_entities:
+                key = self._entity_dedup_key(llm_entity)
+                if key in existing_keys:
+                    continue
+                enriched_entities.append(llm_entity)
+                existing_keys.add(key)
         enriched_entities = self._normalize_entities(enriched_entities, market_scope=market_scope)
         if market_scope == "crypto":
             existing = {str((e or {}).get("symbol") or "").strip().upper() for e in enriched_entities if isinstance(e, dict)}

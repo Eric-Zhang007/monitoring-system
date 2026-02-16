@@ -444,6 +444,33 @@ dist/assets/index.js            181.76 kB │ gzip: 54.96 kB
 
 ## 🚀 快速开始
 
+### 0. WSL-only 紧凑 Runbook（运维入口）
+
+- 运行约束：所有命令仅在 **WSL Bash**（如 Ubuntu）执行；`PowerShell/cmd.exe` 路径不在维护范围内。
+- 路径约定：统一使用 Linux 风格路径（示例：`/mnt/c/Users/<you>/monitoring-system`）。
+
+```bash
+# 1) API keys / secrets
+cp .env.example .env
+# 必填：DATABASE_URL, REDIS_URL, POSTGRES_PASSWORD, GF_SECURITY_ADMIN_PASSWORD
+# 可选：BITGET_API_KEY/BITGET_API_SECRET/BITGET_API_PASSPHRASE
+# 多语言+LLM（建议）：
+#   ENABLE_SOCIAL_CONNECTORS=1
+#   LLM_ENRICHMENT_ENABLED=1
+#   LLM_API_KEY=<your key>
+#   LLM_API_BASE_URL=https://api.openai.com/v1
+#   LLM_MODEL=gpt-4o-mini
+
+# 2) startup（no-docker）
+bash scripts/server_nodocker_up.sh
+
+# 3) readiness（含异步任务闭环）
+bash scripts/server_readiness_nodocker.sh
+
+# 4) async 长任务（避免短超时误判）
+TASK_MAX_WAIT_SEC=1800 TASK_STALL_TIMEOUT_SEC=300 bash scripts/server_readiness_nodocker.sh
+```
+
 ### 1. 无 Docker 启动（目标服务器默认）
 ```bash
 cd /path/to/monitoring-system
@@ -452,6 +479,7 @@ cd /path/to/monitoring-system
 cp .env.example .env
 
 # 编辑 .env（至少设置 DATABASE_URL/POSTGRES_PASSWORD/GF_SECURITY_ADMIN_PASSWORD）
+# 若启用 LLM 增强，还需设置 LLM_API_KEY（API 不可用时 collector 会 fail-soft，不阻断入库）
 
 # 安全基线校验（含 CORS allowlist 校验）
 bash scripts/validate_security_hardening.sh
@@ -492,6 +520,12 @@ tail -f /tmp/collector_screen.log
 
 # 运行 no-docker readiness（可重复执行）
 bash scripts/server_readiness_nodocker.sh
+
+# 生成多语种（zh/en）新闻事件并启用 LLM 增强（可选，批量任务）
+python3 scripts/build_multisource_events_2025.py --google-locales US:en,CN:zh-Hans --llm-enrich
+
+# 生成社交历史（zh/en 查询）并启用 LLM 增强（可选，批量任务）
+python3 scripts/backfill_social_history.py --llm-enrich
 
 # 本地一键安装依赖并运行 backend 单元测试
 ./scripts/dev_test.sh

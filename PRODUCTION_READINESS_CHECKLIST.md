@@ -2,6 +2,8 @@
 
 This checklist is for production deployments that run non-training paths only on target nodes where Docker is unavailable.
 
+WSL constraint: run all commands from WSL Bash (Linux shell). PowerShell and `cmd.exe` paths are out of scope.
+
 ## 1. Environment Baseline
 
 - `python3`, `git`, `screen`, `awk`, `sed`, `df`, `curl` are available on target host.

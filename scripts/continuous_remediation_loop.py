@@ -372,8 +372,8 @@ def _fallback_candidate(args: argparse.Namespace) -> Dict[str, Any]:
         "position_max_weight_base": float(getattr(args, "fallback_base_weight", 0.08)),
         "position_max_weight_high_vol_mult": float(getattr(args, "fallback_high_vol_mult", 0.35)),
         "cost_penalty_lambda": float(getattr(args, "fallback_cost_lambda", 1.0)),
-        "fee_bps": float(getattr(args, "fee_bps", 0.5)),
-        "slippage_bps": float(getattr(args, "slippage_bps", 0.2)),
+        "fee_bps": float(getattr(args, "fee_bps", 5.0)),
+        "slippage_bps": float(getattr(args, "slippage_bps", 3.0)),
         "signal_polarity_mode": str(getattr(args, "signal_polarity_mode", "auto_train_ic")),
         "score": 0.0,
         "pnl_after_cost": 0.0,
@@ -388,8 +388,8 @@ def main() -> int:
     ap.add_argument("--green-windows", type=int, default=3)
     ap.add_argument("--sleep-sec", type=float, default=5.0)
     ap.add_argument("--batch-runs", type=int, default=6)
-    ap.add_argument("--fee-bps", type=float, default=0.5)
-    ap.add_argument("--slippage-bps", type=float, default=0.2)
+    ap.add_argument("--fee-bps", type=float, default=5.0)
+    ap.add_argument("--slippage-bps", type=float, default=3.0)
     ap.add_argument("--alignment-mode", default="strict_asof", choices=["strict_asof", "legacy_index"])
     ap.add_argument("--alignment-version", default="strict_asof_v1")
     ap.add_argument("--max-feature-staleness-hours", type=int, default=24 * 14)

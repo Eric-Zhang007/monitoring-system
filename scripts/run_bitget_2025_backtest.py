@@ -296,7 +296,13 @@ def _build_feature_rows(candles: List[Candle], event_points: Optional[List[Event
             "orderbook_missing_flag": 1.0,
             "funding_missing_flag": 1.0,
             "onchain_missing_flag": 1.0,
-            "feature_payload_schema_version": "v2.1",
+            "social_post_sentiment": 0.0,
+            "social_comment_sentiment": 0.0,
+            "social_engagement_norm": 0.0,
+            "social_influence_norm": 0.0,
+            "social_event_ratio": 0.0,
+            "social_buzz": 0.0,
+            "feature_payload_schema_version": "v2.2",
         }
         rows.append((candles[i].ts_ms, feat))
     return rows

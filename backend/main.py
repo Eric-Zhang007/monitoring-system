@@ -18,6 +18,7 @@ from contextlib import suppress
 from gpu_manager import GPUManager
 from nim_integration import get_nim_cache
 from redis_streams import get_redis_consumer
+from security_config import build_cors_settings
 from v2_router import router as v2_router
 from metrics import (
     CONTENT_TYPE_LATEST,
@@ -38,8 +39,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
+CORS_SETTINGS = build_cors_settings()
 
 # Global instances
 gpu_mgr = None
@@ -182,6 +184,110 @@ def get_redis():
         raise HTTPException(status_code=500, detail="Redis connection failed")
 
 
+def _split_table_name(table_fqn: str) -> tuple[str, str]:
+    if "." in table_fqn:
+        schema, table = table_fqn.split(".", 1)
+        return schema, table
+    return "public", table_fqn
+
+
+def _table_exists(cursor, table_fqn: str) -> bool:
+    cursor.execute("SELECT to_regclass(%s) AS regclass", (table_fqn,))
+    row = cursor.fetchone() or {}
+    regclass = row.get("regclass") if isinstance(row, dict) else row[0]
+    return regclass is not None
+
+
+def _table_columns(cursor, schema: str, table: str) -> Set[str]:
+    cursor.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND table_name = %s
+        """,
+        (schema, table),
+    )
+    rows = cursor.fetchall() or []
+    out: Set[str] = set()
+    for row in rows:
+        if isinstance(row, dict):
+            val = row.get("column_name")
+        else:
+            val = row[0] if row else None
+        if val:
+            out.add(str(val))
+    return out
+
+
+def _safe_recent_count(
+    cursor,
+    *,
+    table_fqn: str,
+    time_columns: tuple[str, ...],
+    lookback_hours: int,
+) -> tuple[Optional[int], Optional[str]]:
+    schema, table = _split_table_name(table_fqn)
+    try:
+        if not _table_exists(cursor, table_fqn):
+            return None, f"optional probe skipped: {table_fqn} table missing"
+        columns = _table_columns(cursor, schema, table)
+    except Exception as exc:
+        return None, f"optional probe skipped: {table_fqn} metadata lookup failed ({exc})"
+    time_col = next((c for c in time_columns if c in columns), None)
+    if not time_col:
+        return None, (
+            f"optional probe skipped: {table_fqn} missing time column "
+            f"(expected one of {','.join(time_columns)})"
+        )
+    query = (
+        f'SELECT COUNT(*) AS count FROM "{schema}"."{table}" '
+        f'WHERE "{time_col}" > NOW() - make_interval(hours => %s)'
+    )
+    try:
+        cursor.execute(query, (max(1, int(lookback_hours)),))
+        row = cursor.fetchone() or {}
+        value = row.get("count") if isinstance(row, dict) else row[0]
+        return int(value or 0), None
+    except Exception as exc:
+        return None, f"optional probe failed: {table_fqn} ({exc})"
+
+
+def _safe_recent_distinct_count(
+    cursor,
+    *,
+    table_fqn: str,
+    distinct_columns: tuple[str, ...],
+    time_columns: tuple[str, ...],
+    lookback_hours: int,
+) -> tuple[Optional[int], Optional[str]]:
+    schema, table = _split_table_name(table_fqn)
+    try:
+        if not _table_exists(cursor, table_fqn):
+            return None, f"optional probe skipped: {table_fqn} table missing"
+        columns = _table_columns(cursor, schema, table)
+    except Exception as exc:
+        return None, f"optional probe skipped: {table_fqn} metadata lookup failed ({exc})"
+    time_col = next((c for c in time_columns if c in columns), None)
+    distinct_col = next((c for c in distinct_columns if c in columns), None)
+    if not time_col or not distinct_col:
+        return None, (
+            f"optional probe skipped: {table_fqn} missing required columns "
+            f"(time={','.join(time_columns)} distinct={','.join(distinct_columns)})"
+        )
+    query = (
+        f'SELECT COUNT(DISTINCT "{distinct_col}") AS count FROM "{schema}"."{table}" '
+        f'WHERE "{time_col}" > NOW() - make_interval(hours => %s)'
+    )
+    try:
+        cursor.execute(query, (max(1, int(lookback_hours)),))
+        row = cursor.fetchone() or {}
+        value = row.get("count") if isinstance(row, dict) else row[0]
+        return int(value or 0), None
+    except Exception as exc:
+        return None, f"optional probe failed: {table_fqn} ({exc})"
+
+
 async def consume_redis_messages():
     """后台任务：消费Redis Streams消息"""
     consumer = get_redis_consumer()
@@ -282,10 +388,10 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_SETTINGS["allow_origins"],
+    allow_credentials=CORS_SETTINGS["allow_credentials"],
+    allow_methods=CORS_SETTINGS["allow_methods"],
+    allow_headers=CORS_SETTINGS["allow_headers"],
 )
 app.include_router(v2_router)
 
@@ -340,18 +446,48 @@ async def get_system_status():
     try:
         gpu_status = gpu_mgr.get_status() if gpu_mgr else {}
 
-        # 获取数据库中的符号数量
+        warnings: List[str] = []
+
+        # 获取数据库中的符号数量（market_bars 优先，兼容历史 prices）
         conn = get_postgres()
         cursor = conn.cursor()
+        active_symbols, active_symbols_warning = _safe_recent_distinct_count(
+            cursor,
+            table_fqn="public.market_bars",
+            distinct_columns=("symbol", "target"),
+            time_columns=("timestamp", "created_at", "ts"),
+            lookback_hours=24,
+        )
+        if active_symbols is None:
+            active_symbols, prices_warning = _safe_recent_distinct_count(
+                cursor,
+                table_fqn="public.prices",
+                distinct_columns=("symbol", "target"),
+                time_columns=("timestamp", "created_at", "ts"),
+                lookback_hours=24,
+            )
+            if prices_warning:
+                warnings.append(prices_warning)
+        if active_symbols_warning:
+            warnings.append(active_symbols_warning)
 
-        cursor.execute("SELECT COUNT(DISTINCT symbol) FROM prices WHERE timestamp > NOW() - INTERVAL '24 hours'")
-        active_symbols = cursor.fetchone()['count'] or 0
+        recent_news, news_warning = _safe_recent_count(
+            cursor,
+            table_fqn="public.events",
+            time_columns=("created_at", "timestamp", "occurred_at"),
+            lookback_hours=24,
+        )
+        if news_warning:
+            warnings.append(news_warning)
 
-        cursor.execute("SELECT COUNT(*) FROM events WHERE created_at > NOW() - INTERVAL '24 hours'")
-        recent_news = cursor.fetchone()['count'] or 0
-
-        cursor.execute("SELECT COUNT(*) FROM predictions_v2 WHERE created_at > NOW() - INTERVAL '1 hour'")
-        recent_predictions = cursor.fetchone()['count'] or 0
+        recent_predictions, pred_warning = _safe_recent_count(
+            cursor,
+            table_fqn="public.predictions_v2",
+            time_columns=("created_at", "timestamp", "ts"),
+            lookback_hours=1,
+        )
+        if pred_warning:
+            warnings.append(pred_warning)
 
         cursor.close()
         conn.close()
@@ -371,7 +507,8 @@ async def get_system_status():
                 "backend": "running",
                 "redis_consumer": "running",
                 "websocket_broadcaster": "running"
-            }
+            },
+            "warnings": warnings,
         }
     except Exception as e:
         logger.error(f"❌ Failed to get system status: {e}")

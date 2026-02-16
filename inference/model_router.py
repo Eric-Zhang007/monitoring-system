@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -15,7 +16,17 @@ try:
 except Exception:
     HAS_LGB = False
 
-MODEL_DIR = "/app/models"
+def _default_model_dir() -> str:
+    env_path = str(os.getenv("MODEL_DIR", "")).strip()
+    if env_path:
+        return env_path
+    local_models = Path(__file__).resolve().parents[1] / "backend" / "models"
+    if local_models.exists():
+        return str(local_models)
+    return "/app/models"
+
+
+MODEL_DIR = _default_model_dir()
 
 
 class TinyVCModel(nn.Module):
@@ -88,7 +99,7 @@ class ModelRouter:
         self.torch_cache: Dict[str, Dict[str, Any]] = {}
         self.tabular_cache: Dict[str, Dict[str, Any]] = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.expected_feature_schema = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.1")
+        self.expected_feature_schema = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.2")
         self.expected_data_version = os.getenv("DATA_VERSION", "v1")
 
     @staticmethod

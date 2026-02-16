@@ -3,8 +3,13 @@ from __future__ import annotations
 import datetime as dt
 from email.utils import parsedate_to_datetime
 from typing import Dict, List
+import xml.etree.ElementTree as ET
 
-import feedparser
+import requests
+try:
+    import feedparser  # type: ignore
+except Exception:  # pragma: no cover
+    feedparser = None
 
 from connectors.base import BaseConnector
 
@@ -18,9 +23,29 @@ class RSSConnector(BaseConnector):
     def fetch(self) -> List[Dict]:
         rows: List[Dict] = []
         for feed_url in self.feeds:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:20]:
-                rows.append({"feed": feed_url, "entry": entry})
+            if feedparser is not None:
+                feed = feedparser.parse(feed_url)
+                for entry in feed.entries[:20]:
+                    rows.append({"feed": feed_url, "entry": entry})
+                continue
+            try:
+                resp = requests.get(feed_url, timeout=20)
+                resp.raise_for_status()
+                root = ET.fromstring(resp.text)
+            except Exception:
+                continue
+            for item in root.findall(".//item")[:20]:
+                rows.append(
+                    {
+                        "feed": feed_url,
+                        "entry": {
+                            "title": (item.findtext("title") or "").strip(),
+                            "summary": (item.findtext("description") or "").strip(),
+                            "link": (item.findtext("link") or "").strip(),
+                            "published": (item.findtext("pubDate") or "").strip(),
+                        },
+                    }
+                )
         return rows
 
     def normalize(self, raw: Dict) -> Dict:

@@ -29,8 +29,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
+      - DATABASE_URL=postgresql://monitor:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:3001,http://127.0.0.1:3001}
+      - CORS_ALLOW_CREDENTIALS=${CORS_ALLOW_CREDENTIALS:-1}
       - GPU_DEVICE=0
       - FEATURE_VERSION=feature-store-v2.1
       - MODEL_VERSION=v2.0
@@ -60,9 +62,9 @@ services:
       - BITGET_TIMEOUT_SEC=6
       - BITGET_RECV_WINDOW_MS=5000
       - BITGET_DEFAULT_MARGIN_COIN=USDT
-      - BITGET_API_KEY=
-      - BITGET_API_SECRET=
-      - BITGET_API_PASSPHRASE=
+      - BITGET_API_KEY=${BITGET_API_KEY:-}
+      - BITGET_API_SECRET=${BITGET_API_SECRET:-}
+      - BITGET_API_PASSPHRASE=${BITGET_API_PASSPHRASE:-}
       - BACKEND_UVICORN_WORKERS=8
     depends_on:
       - redis
@@ -118,7 +120,7 @@ services:
     build: ./inference
     profiles: ["gpu"]
     environment:
-      - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
+      - DATABASE_URL=postgresql://monitor:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=0
       - LIQUID_SYMBOLS=BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK
@@ -148,7 +150,7 @@ services:
     build: ./training
     profiles: ["gpu"]
     environment:
-      - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
+      - DATABASE_URL=postgresql://monitor:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - GPU_DEVICE=1
       - LIQUID_SYMBOLS=BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK
@@ -191,7 +193,7 @@ services:
     environment:
       - POSTGRES_DB=monitor
       - POSTGRES_USER=monitor
-      - POSTGRES_PASSWORD=change_me_please
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set in .env}
     restart: unless-stopped
     deploy:
       resources:
@@ -268,7 +270,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:?set in .env}
     restart: unless-stopped
     deploy:
       resources:
@@ -335,7 +337,7 @@ services:
     build: ./backend
     command: python /app/monitoring/task_worker.py
     environment:
-      - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
+      - DATABASE_URL=postgresql://monitor:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/monitor
       - REDIS_URL=redis://redis:6379
       - TASK_WORKER_POLL_TIMEOUT_SEC=5
     volumes:
@@ -382,7 +384,7 @@ services:
       bash -lc "alembic -c alembic.ini upgrade head &&
       python -c 'print(\"v2 migrations applied\")'"
     environment:
-      - DATABASE_URL=postgresql://monitor:change_me_please@postgres:5432/monitor
+      - DATABASE_URL=postgresql://monitor:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/monitor
     depends_on:
       - postgres
     restart: "no"

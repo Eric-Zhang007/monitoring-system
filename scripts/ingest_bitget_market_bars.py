@@ -5,9 +5,12 @@ import argparse
 import csv
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+import random
+import time
+from typing import Dict, List, Tuple
 
 import psycopg2
 from psycopg2.extras import execute_values
@@ -18,7 +21,7 @@ from urllib3.util.retry import Retry
 BITGET_PERP_URL = "https://api.bitget.com/api/v2/mix/market/history-candles"
 BITGET_SPOT_URL = "https://api.bitget.com/api/v2/spot/market/history-candles"
 COINGECKO_MARKET_CHART_URL = "https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
 
 
 @dataclass
@@ -29,6 +32,51 @@ class Bar:
     low: float
     close: float
     volume: float
+
+
+def _timeframe_minutes(tf: str) -> int:
+    t = str(tf or "1h").strip().lower()
+    if t.endswith("m"):
+        return max(1, int(t[:-1] or "1"))
+    if t.endswith("h"):
+        return max(1, int(t[:-1] or "1")) * 60
+    if t.endswith("d"):
+        return max(1, int(t[:-1] or "1")) * 1440
+    raise ValueError(f"unsupported_timeframe:{tf}")
+
+
+def _bitget_granularity(tf: str, market: str) -> str:
+    t = str(tf or "1h").strip().lower()
+    if market == "spot":
+        spot_map = {
+            "1m": "1min",
+            "3m": "3min",
+            "5m": "5min",
+            "15m": "15min",
+            "30m": "30min",
+            "1h": "1h",
+            "4h": "4h",
+            "6h": "6h",
+            "12h": "12h",
+            "1d": "1day",
+        }
+        if t in spot_map:
+            return spot_map[t]
+    mix_map = {
+        "1m": "1m",
+        "3m": "3m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "1H",
+        "4h": "4H",
+        "6h": "6H",
+        "12h": "12H",
+        "1d": "1D",
+    }
+    if t in mix_map:
+        return mix_map[t]
+    raise ValueError(f"unsupported_bitget_timeframe:{tf}")
 
 
 def _parse_symbol_map(raw: str, *, upper_value: bool = True) -> Dict[str, str]:
@@ -46,6 +94,19 @@ def _parse_symbol_map(raw: str, *, upper_value: bool = True) -> Dict[str, str]:
         dst = (src[:-4] if src.endswith("USDT") else src) if upper_value else part
         out[src] = dst
     return out
+
+
+def _parse_dt_utc(raw: str) -> datetime:
+    s = str(raw or "").strip()
+    if not s:
+        raise ValueError("empty_datetime")
+    norm = s.replace(" ", "T")
+    if norm.endswith("Z"):
+        norm = norm[:-1] + "+00:00"
+    dt_obj = datetime.fromisoformat(norm)
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+    return dt_obj.astimezone(timezone.utc)
 
 
 def _build_session(proxy: str = "") -> requests.Session:
@@ -67,9 +128,18 @@ def _build_session(proxy: str = "") -> requests.Session:
     return sess
 
 
-def _fetch_bitget(sess: requests.Session, symbol: str, market: str, start_ms: int, end_ms: int, limit: int = 200) -> List[Bar]:
+def _fetch_bitget(
+    sess: requests.Session,
+    symbol: str,
+    market: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 200,
+) -> List[Bar]:
     cursor = int(start_ms)
-    step_ms = 60 * 60 * 1000
+    step_ms = _timeframe_minutes(timeframe) * 60 * 1000
+    granularity = _bitget_granularity(timeframe, market)
     seen = set()
     out: List[Bar] = []
     while cursor <= end_ms:
@@ -77,7 +147,7 @@ def _fetch_bitget(sess: requests.Session, symbol: str, market: str, start_ms: in
         if market == "spot":
             params = {
                 "symbol": symbol,
-                "granularity": "1h",
+                "granularity": granularity,
                 "startTime": str(cursor),
                 "endTime": str(req_end),
                 "limit": str(limit),
@@ -87,7 +157,7 @@ def _fetch_bitget(sess: requests.Session, symbol: str, market: str, start_ms: in
             params = {
                 "symbol": symbol,
                 "productType": "USDT-FUTURES",
-                "granularity": "1H",
+                "granularity": granularity,
                 "startTime": str(cursor),
                 "endTime": str(req_end),
                 "limit": str(limit),
@@ -163,6 +233,58 @@ def _fetch_coingecko(sess: requests.Session, coin_id: str, days: int) -> List[Ba
     return bars
 
 
+def _fetch_one_symbol(
+    *,
+    src_symbol: str,
+    target_symbol: str,
+    market: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    fallback_source: str,
+    coingecko_map: Dict[str, str],
+    proxy: str,
+    source_label: str,
+    days_for_fallback: int,
+    max_retries: int,
+    retry_backoff_sec: float,
+) -> Tuple[str, List[Bar], str]:
+    sess = _build_session(proxy=proxy)
+    used_source = str(source_label)
+    bars: List[Bar] | None = None
+    last_err: Exception | None = None
+    for attempt in range(1, max(1, int(max_retries)) + 1):
+        try:
+            bars = _fetch_bitget(
+                sess,
+                src_symbol,
+                market,
+                timeframe=str(timeframe),
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+            break
+        except Exception as exc:
+            last_err = exc
+            if attempt >= max(1, int(max_retries)):
+                break
+            sleep_s = min(90.0, float(retry_backoff_sec) * (2 ** (attempt - 1)) * (1.0 + random.uniform(0.0, 0.25)))
+            time.sleep(max(0.1, sleep_s))
+    if bars is None:
+        if str(fallback_source) != "coingecko":
+            if last_err is not None:
+                raise last_err
+            raise RuntimeError(f"bitget_fetch_failed symbol={src_symbol}")
+        if str(timeframe).strip().lower() != "1h":
+            raise RuntimeError("coingecko_fallback_only_supports_1h")
+        coin_id = str(coingecko_map.get(src_symbol) or "").strip().lower()
+        if not coin_id:
+            raise RuntimeError(f"bitget_fetch_failed_and_no_coingecko_map symbol={src_symbol}")
+        bars = _fetch_coingecko(sess, coin_id=coin_id, days=int(days_for_fallback))
+        used_source = "coingecko_api"
+    return target_symbol, bars, used_source
+
+
 def _upsert_market_bars(db_url: str, target_symbol: str, timeframe: str, bars: List[Bar], source: str) -> int:
     if not bars:
         return 0
@@ -218,6 +340,8 @@ def main() -> int:
     )
     ap.add_argument("--market", choices=["perp", "spot"], default="perp")
     ap.add_argument("--days", type=int, default=120)
+    ap.add_argument("--start", default="", help="inclusive UTC start time, e.g. 2025-01-01T00:00:00Z")
+    ap.add_argument("--end", default="", help="inclusive UTC end time, default now")
     ap.add_argument("--timeframe", default="1h")
     ap.add_argument("--fallback-source", choices=["none", "coingecko"], default="coingecko")
     ap.add_argument(
@@ -229,66 +353,112 @@ def main() -> int:
     ap.add_argument("--skip-db", action="store_true", help="fetch only, do not write database")
     ap.add_argument("--database-url", default=DATABASE_URL)
     ap.add_argument("--source", default="bitget_api")
+    ap.add_argument("--workers", type=int, default=max(1, int(os.getenv("INGEST_WORKERS", "4"))))
+    ap.add_argument("--max-fetch-retries", type=int, default=max(1, int(os.getenv("INGEST_MAX_FETCH_RETRIES", "4"))))
+    ap.add_argument("--retry-backoff-sec", type=float, default=float(os.getenv("INGEST_RETRY_BACKOFF_SEC", "1.0")))
+    ap.add_argument("--allow-partial", action="store_true", help="continue if some symbols fail")
     args = ap.parse_args()
 
-    now = datetime.now(timezone.utc)
-    start_dt = now - timedelta(days=max(1, int(args.days)))
+    end_dt = _parse_dt_utc(args.end) if str(args.end).strip() else datetime.now(timezone.utc)
+    if str(args.start).strip():
+        start_dt = _parse_dt_utc(args.start)
+    else:
+        start_dt = end_dt - timedelta(days=max(1, int(args.days)))
+    if end_dt <= start_dt:
+        raise RuntimeError("invalid_time_range_end_must_be_gt_start")
     start_ms = int(start_dt.timestamp() * 1000)
-    end_ms = int(now.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
     symbol_map = _parse_symbol_map(args.symbol_map, upper_value=True)
     coingecko_map = _parse_symbol_map(args.coingecko_map, upper_value=False)
     req_symbols = [s.strip().upper() for s in str(args.symbols).split(",") if s.strip()]
-    sess = _build_session(proxy=str(args.proxy))
-    csv_rows: List[Dict[str, object]] = []
-
     summary: Dict[str, Dict[str, object]] = {}
-    for src_symbol in req_symbols:
-        target = symbol_map.get(src_symbol) or (src_symbol[:-4] if src_symbol.endswith("USDT") else src_symbol)
-        used_source = str(args.source)
-        try:
-            bars = _fetch_bitget(sess, src_symbol, args.market, start_ms=start_ms, end_ms=end_ms)
-        except Exception:
-            if str(args.fallback_source) != "coingecko":
-                raise
-            coin_id = str(coingecko_map.get(src_symbol) or "").strip().lower()
-            if not coin_id:
-                raise RuntimeError(f"bitget_fetch_failed_and_no_coingecko_map symbol={src_symbol}")
-            bars = _fetch_coingecko(sess, coin_id=coin_id, days=int(args.days))
-            used_source = "coingecko_api"
-        if str(args.out_csv).strip():
-            for bar in bars:
-                csv_rows.append(
-                    {
-                        "symbol": target,
-                        "timeframe": str(args.timeframe),
-                        "ts": datetime.fromtimestamp(bar.ts_ms / 1000.0, tz=timezone.utc).isoformat(),
-                        "open": float(bar.open),
-                        "high": float(bar.high),
-                        "low": float(bar.low),
-                        "close": float(bar.close),
-                        "volume": float(bar.volume),
-                        "trades_count": 0,
-                        "source": used_source,
-                    }
-                )
-        if bool(args.skip_db):
-            count = int(len(bars))
-        else:
-            count = _upsert_market_bars(args.database_url, target_symbol=target, timeframe=str(args.timeframe), bars=bars, source=used_source)
-        summary[target] = {"rows": int(count), "source": used_source}
-
     out_csv = str(args.out_csv).strip()
+    csv_file = None
+    csv_writer = None
     if out_csv:
         os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
-        with open(out_csv, "w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(
-                f,
-                fieldnames=["symbol", "timeframe", "ts", "open", "high", "low", "close", "volume", "trades_count", "source"],
-            )
-            w.writeheader()
-            w.writerows(csv_rows)
+        csv_file = open(out_csv, "w", encoding="utf-8", newline="")
+        csv_writer = csv.DictWriter(
+            csv_file,
+            fieldnames=["symbol", "timeframe", "ts", "open", "high", "low", "close", "volume", "trades_count", "source"],
+        )
+        csv_writer.writeheader()
 
-    print(json.dumps({"status": "ok", "market": args.market, "days": int(args.days), "inserted": summary}, ensure_ascii=False))
+    failed: List[Dict[str, str]] = []
+    workers = max(1, int(args.workers))
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {}
+            for src_symbol in req_symbols:
+                target = symbol_map.get(src_symbol) or (src_symbol[:-4] if src_symbol.endswith("USDT") else src_symbol)
+                fut = ex.submit(
+                    _fetch_one_symbol,
+                    src_symbol=src_symbol,
+                    target_symbol=target,
+                    market=str(args.market),
+                    timeframe=str(args.timeframe),
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    fallback_source=str(args.fallback_source),
+                    coingecko_map=coingecko_map,
+                    proxy=str(args.proxy),
+                    source_label=str(args.source),
+                    days_for_fallback=int(args.days),
+                    max_retries=int(args.max_fetch_retries),
+                    retry_backoff_sec=float(args.retry_backoff_sec),
+                )
+                futs[fut] = {"src_symbol": src_symbol, "target_symbol": target}
+            for fut in as_completed(futs):
+                meta = futs[fut]
+                src_symbol = str(meta.get("src_symbol") or "")
+                target = str(meta.get("target_symbol") or "")
+                try:
+                    target, bars, used_source = fut.result()
+                    if csv_writer is not None:
+                        for bar in bars:
+                            csv_writer.writerow(
+                                {
+                                    "symbol": target,
+                                    "timeframe": str(args.timeframe),
+                                    "ts": datetime.fromtimestamp(bar.ts_ms / 1000.0, tz=timezone.utc).isoformat(),
+                                    "open": float(bar.open),
+                                    "high": float(bar.high),
+                                    "low": float(bar.low),
+                                    "close": float(bar.close),
+                                    "volume": float(bar.volume),
+                                    "trades_count": 0,
+                                    "source": used_source,
+                                }
+                            )
+                    if bool(args.skip_db):
+                        count = int(len(bars))
+                    else:
+                        count = _upsert_market_bars(args.database_url, target_symbol=target, timeframe=str(args.timeframe), bars=bars, source=used_source)
+                    summary[target] = {"rows": int(count), "source": used_source}
+                except Exception as exc:
+                    failed.append({"src_symbol": src_symbol, "target_symbol": target, "error": str(exc)})
+                    summary[target or src_symbol] = {"rows": 0, "source": "failed", "error": str(exc)}
+    finally:
+        if csv_file is not None:
+            csv_file.close()
+
+    if failed and not bool(args.allow_partial):
+        raise RuntimeError(json.dumps({"failed_symbols": failed}, ensure_ascii=False))
+
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "market": args.market,
+                "days": int(args.days),
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+                "failed": failed,
+                "inserted": summary,
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

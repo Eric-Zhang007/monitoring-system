@@ -696,20 +696,68 @@ class V2Repository:
                     return True
                 return True
 
-    def load_price_history(self, symbol: str, lookback_days: int = 90) -> List[Dict[str, Any]]:
+    def load_price_history(
+        self,
+        symbol: str,
+        lookback_days: int = 90,
+        timeframe: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        primary_tf = str(timeframe or os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m")).strip().lower() or "5m"
+        fallback_tf = str(os.getenv("LIQUID_PRICE_FALLBACK_TIMEFRAME", primary_tf)).strip().lower() or primary_tf
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT symbol, price::float AS price, volume::float AS volume, timestamp
-                    FROM prices
-                    WHERE symbol = UPPER(%s)
-                      AND timestamp > NOW() - make_interval(days => %s)
-                    ORDER BY timestamp ASC
-                    """,
-                    (symbol, lookback_days),
-                )
-                return [dict(r) for r in cur.fetchall()]
+                market_rows: List[Dict[str, Any]] = []
+                try:
+                    cur.execute(
+                        """
+                        SELECT symbol, close::float AS price, volume::float AS volume, ts AS timestamp
+                        FROM market_bars
+                        WHERE symbol = UPPER(%s)
+                          AND timeframe = %s
+                          AND ts > NOW() - make_interval(days => %s)
+                        ORDER BY ts ASC
+                        """,
+                        (symbol, primary_tf, lookback_days),
+                    )
+                    market_rows = [dict(r) for r in cur.fetchall()]
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    market_rows = []
+                if market_rows:
+                    for row in market_rows:
+                        row["price_source"] = "market_bars"
+                        row["source_used"] = "market_bars"
+                        row["timeframe_used"] = primary_tf
+                        row["price_fallback_used"] = False
+                    return market_rows
+
+                try:
+                    cur.execute(
+                        """
+                        SELECT symbol, price::float AS price, volume::float AS volume, timestamp
+                        FROM prices
+                        WHERE symbol = UPPER(%s)
+                          AND timestamp > NOW() - make_interval(days => %s)
+                        ORDER BY timestamp ASC
+                        """,
+                        (symbol, lookback_days),
+                    )
+                    price_rows = [dict(r) for r in cur.fetchall()]
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    return []
+                for row in price_rows:
+                    row["price_source"] = "prices_fallback"
+                    row["source_used"] = "prices_fallback"
+                    row["timeframe_used"] = fallback_tf
+                    row["price_fallback_used"] = True
+                return price_rows
 
     def latest_prediction(self, track: str, target: str, horizon: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:

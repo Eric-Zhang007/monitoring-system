@@ -115,6 +115,15 @@ def test_extended_request_models():
     assert bt.run_source == "prod"
     assert bt.alignment_mode == "strict_asof"
     assert bt.alignment_version == "strict_asof_v1"
+    assert bt.fee_bps == 5.0
+    assert bt.slippage_bps == 3.0
+
+
+def test_default_model_dir_prefers_repo_path_in_nodocker(monkeypatch):
+    monkeypatch.delenv("MODEL_DIR", raising=False)
+    path = router_mod._default_model_dir()
+    assert path.name == "models"
+    assert "backend" in str(path).replace("\\", "/")
 
 
 def test_risk_check_kill_switch_violation_code_is_consistent(monkeypatch):

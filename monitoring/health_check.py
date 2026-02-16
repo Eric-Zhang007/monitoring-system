@@ -7,19 +7,26 @@ import asyncio
 import aiohttp
 import psycopg2
 import redis
+import shutil
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # Configuration
+API_BASE = os.getenv('API_BASE', 'http://localhost:8000').rstrip('/')
+PROMETHEUS_BASE = os.getenv('PROMETHEUS_BASE_URL', 'http://localhost:9090').rstrip('/')
+GRAFANA_BASE = os.getenv('GRAFANA_BASE_URL', 'http://localhost:3000').rstrip('/')
+HTTP_TIMEOUT_SEC = float(os.getenv('HEALTHCHECK_HTTP_TIMEOUT_SEC', '10'))
+COLLECTOR_HTTP_TIMEOUT_SEC = float(os.getenv('HEALTHCHECK_COLLECTOR_TIMEOUT_SEC', '8'))
+
 SERVICES = {
-    'backend': 'http://localhost:8000/health',
-    'metrics': 'http://localhost:8000/metrics',
+    'backend': os.getenv('BACKEND_HEALTH_URL', f'{API_BASE}/health'),
+    'metrics': os.getenv('BACKEND_METRICS_URL', f'{API_BASE}/metrics'),
     'collector_metrics': os.getenv('COLLECTOR_METRICS_URL', 'http://localhost:9101/metrics'),
-    'redis': 'redis://localhost:6379',
-    'postgres': 'postgresql://monitor:change_me_please@localhost:5432/monitor',
-    'prometheus': 'http://localhost:9090/-/healthy',
-    'prometheus_query': os.getenv('PROMETHEUS_QUERY_URL', 'http://localhost:9090/api/v1/query'),
-    'grafana': 'http://localhost:3000/api/health',
+    'redis': os.getenv('REDIS_URL', 'redis://localhost:6379'),
+    'postgres': os.getenv('DATABASE_URL', 'postgresql://monitor@localhost:5432/monitor'),
+    'prometheus': os.getenv('PROMETHEUS_HEALTH_URL', f'{PROMETHEUS_BASE}/-/healthy'),
+    'prometheus_query': os.getenv('PROMETHEUS_QUERY_URL', f'{PROMETHEUS_BASE}/api/v1/query'),
+    'grafana': os.getenv('GRAFANA_HEALTH_URL', f'{GRAFANA_BASE}/api/health'),
 }
 
 # Color codes for terminal output
@@ -47,17 +54,22 @@ def log_info(message: str):
     print(f"{Colors.BOLD}{message}{Colors.RESET}")
 
 
-async def check_backend() -> Tuple[bool, Dict]:
-    """Check backend service health"""
+async def _http_json(session: aiohttp.ClientSession, url: str, *, timeout_sec: float) -> Tuple[bool, Dict]:
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(SERVICES['backend'], timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return True, data
+        async with session.get(url, timeout=timeout_sec) as response:
+            if response.status != 200:
                 return False, {"error": f"HTTP {response.status}"}
+            try:
+                return True, await response.json()
+            except Exception:
+                return True, {"status": "ok"}
     except Exception as e:
         return False, {"error": str(e)}
+
+
+async def check_backend(session: aiohttp.ClientSession) -> Tuple[bool, Dict]:
+    """Check backend service health"""
+    return await _http_json(session, SERVICES['backend'], timeout_sec=HTTP_TIMEOUT_SEC)
 
 
 async def check_redis() -> Tuple[bool, Dict]:
@@ -75,79 +87,156 @@ async def check_redis() -> Tuple[bool, Dict]:
         return False, {"error": str(e)}
 
 
-def check_postgres() -> Tuple[bool, Dict]:
-    """Check PostgreSQL connection"""
+def _split_table_name(table_fqn: str) -> Tuple[str, str]:
+    if "." in table_fqn:
+        schema, table = table_fqn.split(".", 1)
+        return schema, table
+    return "public", table_fqn
+
+
+def _table_exists(cursor, table_fqn: str) -> bool:
+    cursor.execute("SELECT to_regclass(%s);", (table_fqn,))
+    row = cursor.fetchone()
+    return bool(row and row[0] is not None)
+
+
+def _table_columns(cursor, schema: str, table: str) -> Set[str]:
+    cursor.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND table_name = %s
+        """,
+        (schema, table),
+    )
+    return {str(row[0]) for row in cursor.fetchall() if row and row[0]}
+
+
+def _safe_recent_count(
+    cursor,
+    *,
+    table_fqn: str,
+    time_columns: Tuple[str, ...],
+    lookback_hours: int,
+) -> Tuple[Optional[int], Optional[str]]:
+    schema, table = _split_table_name(table_fqn)
+    try:
+        if not _table_exists(cursor, table_fqn):
+            return None, f"optional probe skipped: {table_fqn} table missing"
+    except Exception as exc:
+        return None, f"optional probe skipped: {table_fqn} lookup failed ({exc})"
+
+    try:
+        columns = _table_columns(cursor, schema, table)
+    except Exception as exc:
+        return None, f"optional probe skipped: {table_fqn} columns lookup failed ({exc})"
+    time_col = next((c for c in time_columns if c in columns), None)
+    if not time_col:
+        return None, (
+            f"optional probe skipped: {table_fqn} missing time column "
+            f"(expected one of {','.join(time_columns)})"
+        )
+
+    # identifiers are static/internal; quoting avoids reserved-word collisions (e.g. "timestamp")
+    query = (
+        f'SELECT COUNT(*) FROM "{schema}"."{table}" '
+        f'WHERE "{time_col}" > NOW() - make_interval(hours => %s);'
+    )
+    try:
+        cursor.execute(query, (max(1, int(lookback_hours)),))
+        row = cursor.fetchone()
+        return int(row[0] if row else 0), None
+    except Exception as exc:
+        return None, f"optional probe failed: {table_fqn} ({exc})"
+
+
+def _check_postgres_sync() -> Tuple[bool, Dict]:
+    """Check PostgreSQL connectivity and optional recency probes."""
+    conn = None
     try:
         conn = psycopg2.connect(SERVICES['postgres'])
         cursor = conn.cursor()
         cursor.execute("SELECT version();")
         version = cursor.fetchone()
-        
-        # Check recent records
-        cursor.execute("SELECT COUNT(*) FROM predictions_v2 WHERE created_at > NOW() - make_interval(hours => 1);")
-        recent_predictions = cursor.fetchone()[0]
 
-        cursor.execute("SELECT COUNT(*) FROM semantic_features WHERE timestamp > NOW() - make_interval(hours => 6);")
-        recent_features = cursor.fetchone()[0]
-        
-        conn.close()
-        return True, {
-            "version": version[0],
+        warnings: List[str] = []
+        recent_predictions, pred_warning = _safe_recent_count(
+            cursor,
+            table_fqn="public.predictions_v2",
+            time_columns=("created_at", "timestamp", "ts"),
+            lookback_hours=1,
+        )
+        if pred_warning:
+            warnings.append(pred_warning)
+
+        recent_features, feat_warning = _safe_recent_count(
+            cursor,
+            table_fqn="public.semantic_features",
+            time_columns=("timestamp", "created_at", "feature_ts"),
+            lookback_hours=6,
+        )
+        if feat_warning:
+            warnings.append(feat_warning)
+
+        out = {
+            "version": version[0] if version else "unknown",
             "recent_predictions": recent_predictions,
             "recent_features": recent_features,
         }
+        if warnings:
+            out["warnings"] = warnings
+        return True, out
     except Exception as e:
         return False, {"error": str(e)}
+    finally:
+        if conn is not None:
+            conn.close()
 
 
-async def check_grafana() -> Tuple[bool, Dict]:
+async def check_postgres() -> Tuple[bool, Dict]:
+    """Check PostgreSQL connectivity and optional probes."""
+    return _check_postgres_sync()
+
+
+async def check_grafana(session: aiohttp.ClientSession) -> Tuple[bool, Dict]:
     """Check Grafana health"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(SERVICES['grafana'], timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return True, data
-                return False, {"error": f"HTTP {response.status}"}
-    except Exception as e:
-        return False, {"error": str(e)}
+    return await _http_json(session, SERVICES['grafana'], timeout_sec=HTTP_TIMEOUT_SEC)
 
 
-async def check_prometheus() -> Tuple[bool, Dict]:
+async def check_prometheus(session: aiohttp.ClientSession) -> Tuple[bool, Dict]:
     """Check Prometheus health"""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(SERVICES['prometheus'], timeout=10) as response:
-                if response.status == 200:
-                    return True, {"status": "healthy"}
-                return False, {"error": f"HTTP {response.status}"}
+        async with session.get(SERVICES['prometheus'], timeout=HTTP_TIMEOUT_SEC) as response:
+            if response.status == 200:
+                return True, {"status": "healthy"}
+            return False, {"error": f"HTTP {response.status}"}
     except Exception as e:
         return False, {"error": str(e)}
 
 
-async def check_metrics() -> Tuple[bool, Dict]:
+async def check_metrics(session: aiohttp.ClientSession) -> Tuple[bool, Dict]:
     """Check backend Prometheus metrics endpoint"""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(SERVICES['metrics'], timeout=10) as response:
-                if response.status != 200:
-                    return False, {"error": f"HTTP {response.status}"}
-                txt = await response.text()
-                required = [
-                    "ms_http_requests_total",
-                    "ms_execution_orders_total",
-                    "ms_signal_latency_seconds_bucket",
-                    "ms_execution_latency_seconds_bucket",
-                    "ms_execution_reject_rate",
-                    "ms_data_freshness_seconds",
-                    "ms_model_drift_events_total",
-                    "ms_risk_hard_blocks_total",
-                ]
-                found = all(k in txt for k in required)
-                if not found:
-                    return False, {"error": "required metrics not found"}
-                slo = evaluate_slo_from_metrics(txt)
-                return True, {"status": "ok", "slo": slo}
+        async with session.get(SERVICES['metrics'], timeout=HTTP_TIMEOUT_SEC) as response:
+            if response.status != 200:
+                return False, {"error": f"HTTP {response.status}"}
+            txt = await response.text()
+            required = [
+                "ms_http_requests_total",
+                "ms_execution_orders_total",
+                "ms_signal_latency_seconds_bucket",
+                "ms_execution_latency_seconds_bucket",
+                "ms_execution_reject_rate",
+                "ms_data_freshness_seconds",
+                "ms_model_drift_events_total",
+                "ms_risk_hard_blocks_total",
+            ]
+            found = all(k in txt for k in required)
+            if not found:
+                return False, {"error": "required metrics not found"}
+            slo = evaluate_slo_from_metrics(txt)
+            return True, {"status": "ok", "slo": slo}
     except Exception as e:
         return False, {"error": str(e)}
 
@@ -370,7 +459,7 @@ def evaluate_collector_slo_from_metrics(metrics_text: str) -> Dict[str, Dict[str
     }
 
 
-async def check_collector_metrics() -> Tuple[bool, Dict]:
+async def check_collector_metrics(session: aiohttp.ClientSession) -> Tuple[bool, Dict]:
     """Check collector Prometheus metrics endpoint with Prometheus fallback."""
     required = [
         "ms_collector_connector_fetch_total",
@@ -379,43 +468,41 @@ async def check_collector_metrics() -> Tuple[bool, Dict]:
     ]
     endpoint_error = None
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(SERVICES['collector_metrics'], timeout=8) as response:
-                if response.status == 200:
-                    txt = await response.text()
-                    missing = [k for k in required if k not in txt]
-                    if missing:
-                        return False, {"error": f"collector metrics missing keys: {','.join(missing)}"}
-                    slo = evaluate_collector_slo_from_metrics(txt)
-                    return True, {"status": "ok", "source": "collector_endpoint", "slo": slo}
-                endpoint_error = f"collector endpoint HTTP {response.status}"
+        async with session.get(SERVICES['collector_metrics'], timeout=COLLECTOR_HTTP_TIMEOUT_SEC) as response:
+            if response.status == 200:
+                txt = await response.text()
+                missing = [k for k in required if k not in txt]
+                if missing:
+                    return False, {"error": f"collector metrics missing keys: {','.join(missing)}"}
+                slo = evaluate_collector_slo_from_metrics(txt)
+                return True, {"status": "ok", "source": "collector_endpoint", "slo": slo}
+            endpoint_error = f"collector endpoint HTTP {response.status}"
     except Exception as e:
         endpoint_error = str(e)
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                SERVICES["prometheus_query"],
-                params={"query": 'up{job="collector"}'},
-                timeout=8,
-            ) as response:
-                if response.status != 200:
-                    return False, {"error": f"{endpoint_error}; prometheus query HTTP {response.status}"}
-                data = await response.json()
-                result = (((data or {}).get("data") or {}).get("result") or [])
-                is_up = False
-                for item in result:
-                    value = item.get("value") if isinstance(item, dict) else None
-                    if isinstance(value, list) and len(value) >= 2 and str(value[1]) == "1":
-                        is_up = True
-                        break
-                if is_up:
-                    return True, {
-                        "status": "ok",
-                        "source": "prometheus_up_fallback",
-                        "warning": f"collector endpoint unreachable: {endpoint_error}",
-                    }
-                return False, {"error": f"{endpoint_error}; collector up metric not healthy"}
+        async with session.get(
+            SERVICES["prometheus_query"],
+            params={"query": 'up{job="collector"}'},
+            timeout=COLLECTOR_HTTP_TIMEOUT_SEC,
+        ) as response:
+            if response.status != 200:
+                return False, {"error": f"{endpoint_error}; prometheus query HTTP {response.status}"}
+            data = await response.json()
+            result = (((data or {}).get("data") or {}).get("result") or [])
+            is_up = False
+            for item in result:
+                value = item.get("value") if isinstance(item, dict) else None
+                if isinstance(value, list) and len(value) >= 2 and str(value[1]) == "1":
+                    is_up = True
+                    break
+            if is_up:
+                return True, {
+                    "status": "ok",
+                    "source": "prometheus_up_fallback",
+                    "warning": f"collector endpoint unreachable: {endpoint_error}",
+                }
+            return False, {"error": f"{endpoint_error}; collector up metric not healthy"}
     except Exception as e:
         return False, {"error": f"{endpoint_error}; prometheus query failed: {e}"}
 
@@ -423,6 +510,13 @@ async def check_collector_metrics() -> Tuple[bool, Dict]:
 def check_docker_services():
     """Check Docker container status"""
     import subprocess
+    if os.getenv("CHECK_DOCKER_SERVICES", "auto").lower() in {"0", "false", "no", "off"}:
+        log_info("\n🐳 Docker Container Status (skipped by CHECK_DOCKER_SERVICES)")
+        return
+    if shutil.which("docker") is None:
+        log_info("\n🐳 Docker Container Status (docker command not found, skipped)")
+        return
+
     services = [
         'monitoring-system-backend-1',
         'monitoring-system-inference-1',
@@ -458,96 +552,100 @@ async def run_health_checks():
     
     all_healthy = True
     
-    # Check Backend
-    log_info("\n📡 Checking Backend Service...")
-    healthy, data = await check_backend()
-    if healthy:
-        log_success('backend', f"Healthy - GPU: {data.get('gpu', {}).get('available_gpus', 'N/A')}")
-    else:
-        log_error('backend', data.get('error', 'Unknown error'))
-        all_healthy = False
-    
-    # Check Redis
-    log_info("\n📦 Checking Redis...")
-    healthy, data = await check_redis()
-    if healthy:
-        log_success('redis', f"Connected - Version {data.get('version')}, Memory: {data.get('memory')}")
-    else:
-        log_error('redis', data.get('error', 'Connection failed'))
-        all_healthy = False
-    
-    # Check PostgreSQL
-    log_info("\n🗄️  Checking PostgreSQL...")
-    healthy, data = await check_postgres()
-    if healthy:
-        log_success('postgres', f"Connected - Recent predictions: {data.get('recent_predictions')}, Features: {data.get('recent_features')}")
-    else:
-        log_error('postgres', data.get('error', 'Connection failed'))
-        all_healthy = False
-    
-    # Check Grafana
-    log_info("\n📊 Checking Grafana...")
-    healthy, data = await check_grafana()
-    if healthy:
-        log_success('grafana', "Healthy")
-    else:
-        log_warning('grafana', data.get('error', 'Connection failed (may not be critical)'))
+    timeout = aiohttp.ClientTimeout(total=max(1.0, HTTP_TIMEOUT_SEC + 2.0))
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Check Backend
+        log_info("\n📡 Checking Backend Service...")
+        healthy, data = await check_backend(session)
+        if healthy:
+            log_success('backend', f"Healthy - GPU: {data.get('gpu', {}).get('available_gpus', 'N/A')}")
+        else:
+            log_error('backend', data.get('error', 'Unknown error'))
+            all_healthy = False
 
-    # Check Prometheus
-    log_info("\n📉 Checking Prometheus...")
-    healthy, data = await check_prometheus()
-    if healthy:
-        log_success('prometheus', "Healthy")
-    else:
-        log_warning('prometheus', data.get('error', 'Connection failed (may not be critical)'))
+        # Check Redis
+        log_info("\n📦 Checking Redis...")
+        healthy, data = await check_redis()
+        if healthy:
+            log_success('redis', f"Connected - Version {data.get('version')}, Memory: {data.get('memory')}")
+        else:
+            log_error('redis', data.get('error', 'Connection failed'))
+            all_healthy = False
 
-    # Check Metrics
-    log_info("\n📈 Checking Prometheus Metrics...")
-    healthy, data = await check_metrics()
-    if healthy:
-        log_success('metrics', "Endpoint healthy")
-        slo = data.get("slo", {})
-        s = slo.get("signal_latency", {})
-        e = slo.get("execution_latency", {})
-        a = slo.get("api_availability", {})
-        print(f"  SLO(signal p95<150ms): status={s.get('status')} p50={s.get('p50_seconds')} p95={s.get('p95_seconds')} p99={s.get('p99_seconds')}")
-        print(f"  SLO(execution p95<300ms): status={e.get('status')} p50={e.get('p50_seconds')} p95={e.get('p95_seconds')} p99={e.get('p99_seconds')}")
-        print(
-            f"  SLO(api availability>=99.9%): status={a.get('status')} "
-            f"value={a.get('value')} 5m={a.get('availability_5m')} 1h={a.get('availability_1h')}"
-        )
-        print(
-            f"  SLO(overall): {slo.get('overall', {}).get('status')} "
-            f"reason={slo.get('overall', {}).get('slo_blocking_reason')}"
-        )
-    else:
-        log_warning('metrics', data.get('error', 'Metrics endpoint unhealthy'))
+        # Check PostgreSQL
+        log_info("\n🗄️  Checking PostgreSQL...")
+        healthy, data = await check_postgres()
+        if healthy:
+            log_success('postgres', f"Connected - Recent predictions: {data.get('recent_predictions')}, Features: {data.get('recent_features')}")
+            for warning in data.get("warnings") or []:
+                log_warning("postgres", warning)
+        else:
+            log_error('postgres', data.get('error', 'Connection failed'))
+            all_healthy = False
 
-    # Check Collector Metrics
-    log_info("\n🛰️  Checking Collector Metrics...")
-    healthy, data = await check_collector_metrics()
-    if healthy:
-        log_success('collector_metrics', f"Healthy ({data.get('source', 'unknown')})")
-        if data.get("warning"):
-            print(f"  warning: {data.get('warning')}")
-        collector_slo = data.get("slo", {})
-        if collector_slo:
-            c = collector_slo.get("connector_success_rate", {})
-            p = collector_slo.get("source_publish_to_ingest", {})
+        # Check Grafana
+        log_info("\n📊 Checking Grafana...")
+        healthy, data = await check_grafana(session)
+        if healthy:
+            log_success('grafana', "Healthy")
+        else:
+            log_warning('grafana', data.get('error', 'Connection failed (may not be critical)'))
+
+        # Check Prometheus
+        log_info("\n📉 Checking Prometheus...")
+        healthy, data = await check_prometheus(session)
+        if healthy:
+            log_success('prometheus', "Healthy")
+        else:
+            log_warning('prometheus', data.get('error', 'Connection failed (may not be critical)'))
+
+        # Check Metrics
+        log_info("\n📈 Checking Prometheus Metrics...")
+        healthy, data = await check_metrics(session)
+        if healthy:
+            log_success('metrics', "Endpoint healthy")
+            slo = data.get("slo", {})
+            s = slo.get("signal_latency", {})
+            e = slo.get("execution_latency", {})
+            a = slo.get("api_availability", {})
+            print(f"  SLO(signal p95<150ms): status={s.get('status')} p50={s.get('p50_seconds')} p95={s.get('p95_seconds')} p99={s.get('p99_seconds')}")
+            print(f"  SLO(execution p95<300ms): status={e.get('status')} p50={e.get('p50_seconds')} p95={e.get('p95_seconds')} p99={e.get('p99_seconds')}")
             print(
-                f"  SLO(connector success>=95%): status={c.get('status')} "
-                f"rate={c.get('success_rate')} attempts={c.get('attempts')}"
+                f"  SLO(api availability>=99.9%): status={a.get('status')} "
+                f"value={a.get('value')} 5m={a.get('availability_5m')} 1h={a.get('availability_1h')}"
             )
             print(
-                f"  SLO(source->ingest p95<120s): status={p.get('status')} "
-                f"p95={p.get('p95_seconds')}"
+                f"  SLO(overall): {slo.get('overall', {}).get('status')} "
+                f"reason={slo.get('overall', {}).get('slo_blocking_reason')}"
             )
-            print(
-                f"  SLO(collector overall): {collector_slo.get('overall', {}).get('status')} "
-                f"reason={collector_slo.get('overall', {}).get('slo_blocking_reason')}"
-            )
-    else:
-        log_warning('collector_metrics', data.get('error', 'Collector metrics unhealthy'))
+        else:
+            log_warning('metrics', data.get('error', 'Metrics endpoint unhealthy'))
+
+        # Check Collector Metrics
+        log_info("\n🛰️  Checking Collector Metrics...")
+        healthy, data = await check_collector_metrics(session)
+        if healthy:
+            log_success('collector_metrics', f"Healthy ({data.get('source', 'unknown')})")
+            if data.get("warning"):
+                print(f"  warning: {data.get('warning')}")
+            collector_slo = data.get("slo", {})
+            if collector_slo:
+                c = collector_slo.get("connector_success_rate", {})
+                p = collector_slo.get("source_publish_to_ingest", {})
+                print(
+                    f"  SLO(connector success>=95%): status={c.get('status')} "
+                    f"rate={c.get('success_rate')} attempts={c.get('attempts')}"
+                )
+                print(
+                    f"  SLO(source->ingest p95<120s): status={p.get('status')} "
+                    f"p95={p.get('p95_seconds')}"
+                )
+                print(
+                    f"  SLO(collector overall): {collector_slo.get('overall', {}).get('status')} "
+                    f"reason={collector_slo.get('overall', {}).get('slo_blocking_reason')}"
+                )
+        else:
+            log_warning('collector_metrics', data.get('error', 'Collector metrics unhealthy'))
     
     # Check Docker
     check_docker_services()

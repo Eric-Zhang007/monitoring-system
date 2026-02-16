@@ -11,6 +11,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query
+try:
+    import lightgbm as lgb  # type: ignore
+
+    HAS_LGB = True
+except Exception:
+    lgb = None  # type: ignore[assignment]
+    HAS_LGB = False
 
 from schemas_v2 import (
     AsyncTaskSubmitResponse,
@@ -80,13 +87,30 @@ from metrics import (
 from v2_repository import V2Repository
 from task_queue import enqueue_task, get_task
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
 FEATURE_VERSION = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
+FEATURE_PAYLOAD_SCHEMA_VERSION = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.2")
+DATA_VERSION = os.getenv("DATA_VERSION", "v1")
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 repo = V2Repository(DATABASE_URL)
 exec_engine = ExecutionEngine()
 DEFAULT_LIQUID_SYMBOLS = "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"
+_TABULAR_MODEL_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _default_model_dir() -> Path:
+    env_path = str(os.getenv("MODEL_DIR", "")).strip()
+    if env_path:
+        return Path(env_path)
+    local_models = Path(__file__).resolve().parent / "models"
+    if local_models.exists():
+        return local_models
+    return Path("/app/models")
 
 
 def _sigmoid(x: float) -> float:
@@ -373,6 +397,14 @@ def _data_regime_filters() -> List[str]:
 def _score_source_filter(value: Optional[str]) -> str:
     v = str(value or "").strip().lower()
     return "heuristic" if v == "heuristic" else "model"
+
+
+def _strict_asof_hard_fail_enabled() -> bool:
+    return _env_flag("BACKTEST_STRICT_ASOF_HARD_FAIL", "0")
+
+
+def _take_profit_hard_block_enabled() -> bool:
+    return _env_flag("RISK_TAKE_PROFIT_HARD_BLOCK", "0")
 
 
 def _position_map(positions: List[RebalancePosition]) -> Dict[Tuple[str, str], float]:
@@ -786,6 +818,12 @@ def _feature_signal_score(payload: Dict[str, Any]) -> float:
     event_decay = float(payload.get("event_decay", 0.0) or 0.0)
     source_tier_weight = float(payload.get("source_tier_weight", 0.0) or 0.0)
     source_confidence = float(payload.get("source_confidence", 0.0) or 0.0)
+    social_post_sentiment = float(payload.get("social_post_sentiment", 0.0) or 0.0)
+    social_comment_sentiment = float(payload.get("social_comment_sentiment", 0.0) or 0.0)
+    social_engagement_norm = float(payload.get("social_engagement_norm", 0.0) or 0.0)
+    social_influence_norm = float(payload.get("social_influence_norm", 0.0) or 0.0)
+    social_event_ratio = float(payload.get("social_event_ratio", 0.0) or 0.0)
+    social_buzz = float(payload.get("social_buzz", 0.0) or 0.0)
     vol_penalty = abs(vol_12) + abs(vol_48) + abs(vol_96)
     trend_bias = 0.6 * ret_12 + 0.4 * ret_48
     score = (
@@ -800,9 +838,16 @@ def _feature_signal_score(payload: Dict[str, Any]) -> float:
         + 0.05 * event_decay
         + 0.04 * source_tier_weight
         + 0.03 * source_confidence
+        + 0.04 * social_post_sentiment
+        + 0.03 * social_comment_sentiment
+        + 0.02 * social_engagement_norm
+        + 0.01 * social_influence_norm
+        + 0.02 * social_event_ratio
+        + 0.02 * social_buzz
         - 0.01 * vol_penalty
     )
-    return float(-score)
+    # Keep native score polarity; downstream auto-polarity logic can explicitly invert when justified.
+    return float(score)
 
 
 def _to_utc_datetime(value: Any) -> Optional[datetime]:
@@ -852,6 +897,7 @@ def _align_feature_price_rows(
     alignment_mode: str,
     max_feature_staleness_hours: int,
     alignment_version: str,
+    allow_legacy_fallback: bool = True,
 ) -> Dict[str, Any]:
     prices = np.array([float(r.get("price") or 0.0) for r in price_rows], dtype=np.float64)
     vols = np.array([float(r.get("volume") or 0.0) for r in price_rows], dtype=np.float64)
@@ -899,6 +945,30 @@ def _align_feature_price_rows(
         if len(rets) >= 2 and len(feature_rows) >= 2:
             n = min(len(feature_rows), len(rets))
             step_vols = [float(vols[i + 1] if i + 1 < len(vols) else vols[-1]) for i in range(n)] if n > 0 else []
+            if not allow_legacy_fallback:
+                return {
+                    "feature_rows": [],
+                    "feature_indices": [],
+                    "rets": np.array([], dtype=np.float64),
+                    "vols": np.array([], dtype=np.float64),
+                    "step_timestamps": [],
+                    "audit": {
+                        "alignment_mode_requested": mode,
+                        "alignment_mode_applied": "strict_asof",
+                        "alignment_version": alignment_version,
+                        "total_price_steps": int(len(rets)),
+                        "aligned_steps": 0,
+                        "dropped_missing_feature": int(max(0, len(rets) - n)),
+                        "dropped_stale_feature": 0,
+                        "dropped_missing_timestamps": int(dropped_price_ts + len(feature_rows)),
+                        "leakage_violations": 0,
+                        "max_feature_age_hours": None,
+                        "min_feature_age_hours": None,
+                        "fail_fast": True,
+                        "fail_fast_reason": "missing_price_timestamps",
+                        "legacy_candidate_steps": int(n),
+                    },
+                }
             return {
                 "feature_rows": list(feature_rows[:n]),
                 "feature_indices": list(range(n)),
@@ -951,6 +1021,30 @@ def _align_feature_price_rows(
         if len(rets) >= 2 and len(feature_rows) >= 2:
             n = min(len(feature_rows), len(rets))
             step_vols = [float(vols[i + 1] if i + 1 < len(vols) else vols[-1]) for i in range(n)] if n > 0 else []
+            if not allow_legacy_fallback:
+                return {
+                    "feature_rows": [],
+                    "feature_indices": [],
+                    "rets": np.array([], dtype=np.float64),
+                    "vols": np.array([], dtype=np.float64),
+                    "step_timestamps": [],
+                    "audit": {
+                        "alignment_mode_requested": mode,
+                        "alignment_mode_applied": "strict_asof",
+                        "alignment_version": alignment_version,
+                        "total_price_steps": int(len(rets)),
+                        "aligned_steps": 0,
+                        "dropped_missing_feature": int(max(0, len(rets) - n)),
+                        "dropped_stale_feature": 0,
+                        "dropped_missing_timestamps": int(dropped_price_ts + len(feature_rows)),
+                        "leakage_violations": 0,
+                        "max_feature_age_hours": None,
+                        "min_feature_age_hours": None,
+                        "fail_fast": True,
+                        "fail_fast_reason": "missing_feature_timestamps",
+                        "legacy_candidate_steps": int(n),
+                    },
+                }
             return {
                 "feature_rows": list(feature_rows[:n]),
                 "feature_indices": list(range(n)),
@@ -1061,6 +1155,7 @@ def _run_model_replay_backtest(
     max_feature_staleness_hours: int = 24 * 14,
     alignment_version: str = "strict_asof_v1",
     aligned_bundle: Optional[Dict[str, Any]] = None,
+    strict_asof_fail_fast: bool = False,
 ) -> Dict[str, Any]:
     cfg = _cost_model_settings()
     sizing = _position_sizing_settings()
@@ -1103,6 +1198,7 @@ def _run_model_replay_backtest(
         alignment_mode=alignment_mode,
         max_feature_staleness_hours=max_feature_staleness_hours,
         alignment_version=alignment_version,
+        allow_legacy_fallback=not strict_asof_fail_fast,
     )
     aligned_features: List[Dict[str, Any]] = list(alignment.get("feature_rows") or [])
     rets_obj = alignment.get("rets")
@@ -1112,6 +1208,27 @@ def _run_model_replay_backtest(
     aligned_idx = [int(x) for x in (alignment.get("feature_indices") or [])]
     aligned_step_ts = list(alignment.get("step_timestamps") or [])
     alignment_audit = dict(alignment.get("audit") or {})
+    if bool(alignment_audit.get("fail_fast", False)):
+        fail_reason = str(alignment_audit.get("fail_fast_reason") or "alignment_unavailable")
+        return {
+            "status": "failed",
+            "reason": f"strict_asof_legacy_fallback_blocked:{fail_reason}",
+            "samples": 0,
+            "ic": 0.0,
+            "hit_rate": 0.0,
+            "turnover": 0.0,
+            "pnl_after_cost": 0.0,
+            "max_drawdown": 0.0,
+            "lineage_coverage": 0.0,
+            "alignment_audit": alignment_audit,
+            "leakage_checks": {
+                "passed": False,
+                "leakage_violations": int(alignment_audit.get("leakage_violations", 0) or 0),
+                "alignment_mode": str(alignment_audit.get("alignment_mode_applied") or alignment_mode),
+                "alignment_version": str(alignment_audit.get("alignment_version") or alignment_version),
+            },
+            "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
+        }
     n = int(min(len(aligned_features), aligned_rets.shape[0], aligned_vols.shape[0]))
     if n < 8:
         return {
@@ -1227,7 +1344,9 @@ def _run_model_replay_backtest(
 
     for i in range(n):
         f = aligned_features[i].get("feature_payload") or {}
-        unique_lineages.add(str(aligned_features[i].get("lineage_id") or ""))
+        lineage_id = str(aligned_features[i].get("lineage_id") or "").strip()
+        if lineage_id:
+            unique_lineages.add(lineage_id)
         raw = float(dynamic_scale * raw_series[i])
         vol_proxy = abs(float(f.get("vol_12", 0.0) or 0.0)) + abs(float(f.get("vol_48", 0.0) or 0.0))
         vol_bucket = "high" if vol_proxy > 0.015 else "normal"
@@ -1389,59 +1508,107 @@ def _feature_vector_from_payload(payload: Dict[str, Any]) -> np.ndarray:
         "orderbook_missing_flag",
         "funding_missing_flag",
         "onchain_missing_flag",
+        "source_tier_weight",
+        "source_confidence",
+        "social_post_sentiment",
+        "social_comment_sentiment",
+        "social_engagement_norm",
+        "social_influence_norm",
+        "social_event_ratio",
+        "social_buzz",
     ]
     return np.array([float(payload.get(k, 0.0) or 0.0) for k in keys], dtype=np.float64)
 
 
-def _load_tabular_model_weights(target: str) -> Optional[Dict[str, np.ndarray]]:
+def _align_feature_dim(x: np.ndarray, dim: int, pad_value: float = 0.0) -> np.ndarray:
+    if x.shape[0] < dim:
+        return np.concatenate([x, np.full((dim - x.shape[0],), float(pad_value), dtype=np.float64)], axis=0)
+    if x.shape[0] > dim:
+        return x[:dim]
+    return x
+
+
+def _load_tabular_model_artifact(target: str) -> Optional[Dict[str, Any]]:
     target = str(target or "").strip().upper()
     if not target:
         return None
     sym = target.split("_")[0].lower()
-    path = Path(f"/app/models/liquid_{sym}_lgbm_baseline_v2.json")
+    if sym in _TABULAR_MODEL_CACHE:
+        return _TABULAR_MODEL_CACHE[sym]
+    path = _default_model_dir() / f"liquid_{sym}_lgbm_baseline_v2.json"
     if not path.exists():
+        _TABULAR_MODEL_CACHE[sym] = None
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
+        _TABULAR_MODEL_CACHE[sym] = None
         return None
     if not isinstance(data, dict):
+        _TABULAR_MODEL_CACHE[sym] = None
         return None
-    weights = data.get("weights")
-    if not isinstance(weights, list) or not weights:
+    if str(data.get("track") or "").strip().lower() not in {"", "liquid"}:
+        _TABULAR_MODEL_CACHE[sym] = None
         return None
-    w = np.array(weights, dtype=np.float64).reshape(-1)
-    x_mean = np.array(data.get("x_mean", []), dtype=np.float64).reshape(-1)
-    x_std = np.array(data.get("x_std", []), dtype=np.float64).reshape(-1)
-    return {"weights": w, "x_mean": x_mean, "x_std": x_std}
+    if str(data.get("feature_version") or "").strip() not in {"", FEATURE_VERSION}:
+        _TABULAR_MODEL_CACHE[sym] = None
+        return None
+    if str(data.get("data_version") or "").strip() not in {"", DATA_VERSION}:
+        _TABULAR_MODEL_CACHE[sym] = None
+        return None
+    schema_version = str(data.get("feature_payload_schema_version") or "").strip()
+    if schema_version and schema_version != FEATURE_PAYLOAD_SCHEMA_VERSION:
+        _TABULAR_MODEL_CACHE[sym] = None
+        return None
+
+    artifact: Dict[str, Any] = {
+        "feature_dim": int(data.get("feature_dim", 26) or 26),
+        "x_mean": np.array(data.get("x_mean", []), dtype=np.float64).reshape(-1),
+        "x_std": np.array(data.get("x_std", []), dtype=np.float64).reshape(-1),
+    }
+    if isinstance(data.get("weights"), list):
+        artifact["weights"] = np.array(data.get("weights", []), dtype=np.float64).reshape(-1)
+    if (
+        str(data.get("model") or "").strip().lower() == "lightgbm"
+        and HAS_LGB
+        and isinstance(data.get("booster_model"), str)
+        and str(data.get("booster_model")).strip()
+    ):
+        try:
+            artifact["booster"] = lgb.Booster(model_str=str(data["booster_model"]))
+        except Exception:
+            pass
+    if "weights" not in artifact and "booster" not in artifact:
+        _TABULAR_MODEL_CACHE[sym] = None
+        return None
+    _TABULAR_MODEL_CACHE[sym] = artifact
+    return artifact
 
 
 def _predict_expected_return_tabular(target: str, payload: Dict[str, Any]) -> Optional[float]:
-    model = _load_tabular_model_weights(target)
+    model = _load_tabular_model_artifact(target)
     if model is None:
         return None
     x = _feature_vector_from_payload(payload)
-    w = model["weights"]
-    dim = int(w.shape[0])
-    if x.shape[0] < dim:
-        x = np.concatenate([x, np.zeros((dim - x.shape[0],), dtype=np.float64)], axis=0)
-    elif x.shape[0] > dim:
-        x = x[:dim]
+    dim = int(model.get("feature_dim", x.shape[0]) or x.shape[0])
+    x = _align_feature_dim(x, dim, pad_value=0.0)
     x_mean = model["x_mean"]
     x_std = model["x_std"]
     if x_mean.size > 0 and x_std.size > 0:
-        if x_mean.shape[0] != dim:
-            if x_mean.shape[0] < dim:
-                x_mean = np.concatenate([x_mean, np.zeros((dim - x_mean.shape[0],), dtype=np.float64)], axis=0)
-            else:
-                x_mean = x_mean[:dim]
-        if x_std.shape[0] != dim:
-            if x_std.shape[0] < dim:
-                x_std = np.concatenate([x_std, np.ones((dim - x_std.shape[0],), dtype=np.float64)], axis=0)
-            else:
-                x_std = x_std[:dim]
+        x_mean = _align_feature_dim(x_mean, dim, pad_value=0.0)
+        x_std = _align_feature_dim(x_std, dim, pad_value=1.0)
         x = (x - x_mean) / np.clip(x_std, 1e-6, None)
-    return float(x @ w)
+    booster = model.get("booster")
+    if booster is not None:
+        pred = booster.predict(x.reshape(1, -1))
+        arr = np.array(pred, dtype=np.float64).reshape(-1)
+        if arr.size > 0 and np.isfinite(arr[0]):
+            return float(arr[0])
+    w = model.get("weights")
+    if isinstance(w, np.ndarray) and w.size > 0:
+        ww = _align_feature_dim(w.reshape(-1), dim, pad_value=0.0)
+        return float(x @ ww)
+    return None
 
 
 def _run_model_inference_backtest(
@@ -1456,6 +1623,7 @@ def _run_model_inference_backtest(
     alignment_mode: str = "strict_asof",
     max_feature_staleness_hours: int = 24 * 14,
     alignment_version: str = "strict_asof_v1",
+    strict_asof_fail_fast: bool = False,
 ) -> Dict[str, Any]:
     alignment = _align_feature_price_rows(
         feature_rows=feature_rows,
@@ -1463,6 +1631,7 @@ def _run_model_inference_backtest(
         alignment_mode=alignment_mode,
         max_feature_staleness_hours=max_feature_staleness_hours,
         alignment_version=alignment_version,
+        allow_legacy_fallback=not strict_asof_fail_fast,
     )
     aligned_features = list(alignment.get("feature_rows") or [])
     n = int(len(aligned_features))
@@ -1479,6 +1648,7 @@ def _run_model_inference_backtest(
             max_feature_staleness_hours=max_feature_staleness_hours,
             alignment_version=alignment_version,
             aligned_bundle=alignment,
+            strict_asof_fail_fast=strict_asof_fail_fast,
         )
         replay["model_inference_coverage"] = 0.0
         replay["fallback_used"] = False
@@ -1509,6 +1679,7 @@ def _run_model_inference_backtest(
         max_feature_staleness_hours=max_feature_staleness_hours,
         alignment_version=alignment_version,
         aligned_bundle=alignment,
+        strict_asof_fail_fast=strict_asof_fail_fast,
     )
     replay["model_inference_coverage"] = round(float(predicted / max(1, n)), 6)
     replay["fallback_used"] = bool(predicted < n)
@@ -1681,6 +1852,8 @@ def _evaluate_gate(
     score_source: str = "model",
 ) -> Tuple[bool, str, Dict[str, float], int]:
     score_source = _score_source_filter(score_source)
+    require_leakage_pass = _env_flag("GATE_REQUIRE_LEAKAGE_PASS", "1")
+    allow_degraded_runs = _env_flag("GATE_ALLOW_DEGRADED_RUNS", "0")
     include_sources, exclude_sources = _run_source_filters()
     data_regimes = _data_regime_filters()
     runs = repo.list_recent_backtest_runs(
@@ -1690,13 +1863,24 @@ def _evaluate_gate(
         exclude_sources=exclude_sources,
         data_regimes=data_regimes,
     )
-    usable = [
-        r
-        for r in runs
-        if isinstance(r.get("metrics"), dict)
-        and r["metrics"].get("status") == "completed"
-        and _score_source_filter((r.get("config") or {}).get("score_source")) == score_source
-    ]
+    usable: List[Dict[str, Any]] = []
+    for r in runs:
+        metrics = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
+        if not metrics:
+            continue
+        if r.get("superseded_by_run_id") is not None:
+            continue
+        if str(metrics.get("status") or "").lower() != "completed":
+            continue
+        if _score_source_filter((r.get("config") or {}).get("score_source")) != score_source:
+            continue
+        leakage_passed = bool((metrics.get("leakage_checks") or {}).get("passed", False))
+        degraded = bool(metrics.get("degraded", False))
+        if require_leakage_pass and not leakage_passed:
+            continue
+        if (not allow_degraded_runs) and degraded:
+            continue
+        usable.append(r)
     if len(usable) < windows:
         return False, "insufficient_windows", {"ic": 0.0, "pnl_after_cost": 0.0, "max_drawdown": 1.0}, len(usable)
 
@@ -1952,6 +2136,10 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
         data_regime = "mixed"
     if data_regime == "prod_live" and payload.run_source != "prod":
         data_regime = "mixed"
+    strict_asof_fail_fast = bool(
+        str(payload.alignment_mode).strip().lower() == "strict_asof"
+        and _strict_asof_hard_fail_enabled()
+    )
     config["score_source"] = score_source
     config["data_regime"] = data_regime
     config["targets"] = targets
@@ -1959,6 +2147,8 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
         config["universe_resolve"] = universe_resolve
     config["fee_bps"] = effective_fee_bps
     config["slippage_bps"] = effective_slippage_bps
+    config["strict_asof_hard_fail"] = bool(strict_asof_fail_fast)
+    config["strict_asof_gate_mode"] = "hard" if strict_asof_fail_fast else "soft"
     run_id = repo.create_backtest_run(run_name=run_name, track=payload.track, config=config, run_source=payload.run_source)
     model_name = payload.model_name or _default_model_by_track(payload.track)[0]
     model_version = payload.model_version or _default_model_by_track(payload.track)[1]
@@ -1973,14 +2163,22 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
         sizing_override["high_vol_mult"] = float(payload.position_max_weight_high_vol_mult)
     if payload.cost_penalty_lambda is not None:
         sizing_override["cost_lambda"] = float(payload.cost_penalty_lambda)
-    if score_source == "model" and payload.require_model_artifact and not repo.model_artifact_exists(
-        model_name=model_name,
-        track=payload.track,
-        model_version=model_version,
-    ):
+    missing_model_targets: List[str] = []
+    model_artifact_ok = True
+    if score_source == "model" and payload.require_model_artifact:
+        if payload.track == "liquid":
+            missing_model_targets = [t for t in targets if _load_tabular_model_artifact(t) is None]
+            model_artifact_ok = len(missing_model_targets) == 0
+        else:
+            model_artifact_ok = repo.model_artifact_exists(
+                model_name=model_name,
+                track=payload.track,
+                model_version=model_version,
+            )
+    if score_source == "model" and payload.require_model_artifact and not model_artifact_ok:
         agg = {
             "status": "failed",
-            "reason": "model_artifact_invalid",
+            "reason": "model_artifact_missing",
             "run_source": payload.run_source,
             "data_regime": data_regime,
             "score_source": score_source,
@@ -1999,6 +2197,10 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
             "gate_passed": False,
             "universe_resolve": universe_resolve,
+            "strict_asof_fail_fast": bool(strict_asof_fail_fast),
+            "degraded": False,
+            "degraded_reasons": [],
+            "missing_model_targets": missing_model_targets[:50],
         }
         repo.finish_backtest_run(run_id, agg)
         BACKTEST_FAILED_RUNS_TOTAL.labels(track=payload.track, reason=str(agg["reason"])).inc()
@@ -2036,6 +2238,7 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
                 alignment_mode=payload.alignment_mode,
                 max_feature_staleness_hours=payload.max_feature_staleness_hours,
                 alignment_version=payload.alignment_version,
+                strict_asof_fail_fast=strict_asof_fail_fast,
             )
         else:
             m = _run_model_replay_backtest(
@@ -2049,6 +2252,7 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
                 alignment_mode=payload.alignment_mode,
                 max_feature_staleness_hours=payload.max_feature_staleness_hours,
                 alignment_version=payload.alignment_version,
+                strict_asof_fail_fast=strict_asof_fail_fast,
             )
             m["score_source"] = "heuristic"
             m["model_inference_coverage"] = 0.0
@@ -2057,14 +2261,33 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
         all_metrics.append(m)
 
     samples = sum(int(m.get("samples", 0)) for m in all_metrics)
+    alignment_modes = sorted(
+        {
+            str((m.get("alignment_audit") or {}).get("alignment_mode_applied") or "").strip()
+            for m in all_metrics
+            if str((m.get("alignment_audit") or {}).get("alignment_mode_applied") or "").strip()
+        }
+    )
+    if not alignment_modes:
+        alignment_mode_applied = str(payload.alignment_mode)
+    elif len(alignment_modes) == 1:
+        alignment_mode_applied = alignment_modes[0]
+    else:
+        alignment_mode_applied = f"mixed:{','.join(alignment_modes)}"
     if samples == 0:
+        failed_reasons = [str(m.get("reason") or "") for m in all_metrics if str(m.get("reason") or "").strip()]
+        strict_fail = next((r for r in failed_reasons if r.startswith("strict_asof_legacy_fallback_blocked:")), "")
+        if strict_fail:
+            agg_reason = strict_fail
+        elif any(r == "insufficient_aligned_samples" for r in failed_reasons):
+            agg_reason = "insufficient_aligned_samples"
+        elif any(r == "insufficient_features" for r in failed_reasons):
+            agg_reason = "insufficient_features"
+        else:
+            agg_reason = "insufficient_prices"
         agg = {
             "status": "failed",
-            "reason": (
-                "insufficient_aligned_samples"
-                if any(str(m.get("reason") or "") == "insufficient_aligned_samples" for m in all_metrics)
-                else ("insufficient_features" if any(str(m.get("reason") or "") == "insufficient_features" for m in all_metrics) else "insufficient_prices")
-            ),
+            "reason": agg_reason,
             "run_source": payload.run_source,
             "data_regime": data_regime,
             "score_source": score_source,
@@ -2081,9 +2304,38 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             "model_inference_coverage": 0.0,
             "fallback_used": False,
             "cost_breakdown": {"fee": 0.0, "slippage": 0.0, "impact": 0.0},
+            "strict_asof_fail_fast": bool(strict_asof_fail_fast),
+            "failed_target_reasons": failed_reasons[:20],
+            "alignment_audit": {
+                "alignment_mode_requested": payload.alignment_mode,
+                "alignment_mode_applied": alignment_mode_applied,
+                "alignment_version": payload.alignment_version,
+                "total_price_steps": int(sum(int((m.get("alignment_audit") or {}).get("total_price_steps", 0) or 0) for m in all_metrics)),
+                "aligned_steps": int(sum(int((m.get("alignment_audit") or {}).get("aligned_steps", 0) or 0) for m in all_metrics)),
+                "dropped_missing_feature": int(sum(int((m.get("alignment_audit") or {}).get("dropped_missing_feature", 0) or 0) for m in all_metrics)),
+                "dropped_stale_feature": int(sum(int((m.get("alignment_audit") or {}).get("dropped_stale_feature", 0) or 0) for m in all_metrics)),
+                "dropped_missing_timestamps": int(sum(int((m.get("alignment_audit") or {}).get("dropped_missing_timestamps", 0) or 0) for m in all_metrics)),
+                "leakage_violations": int(sum(int((m.get("alignment_audit") or {}).get("leakage_violations", 0) or 0) for m in all_metrics)),
+                "fail_fast_count": int(sum(1 for m in all_metrics if bool((m.get("alignment_audit") or {}).get("fail_fast", False)))),
+            },
+            "leakage_checks": {
+                "passed": bool(all(bool((m.get("leakage_checks") or {}).get("passed", False)) for m in all_metrics)),
+                "leakage_violations": int(sum(int((m.get("leakage_checks") or {}).get("leakage_violations", 0) or 0) for m in all_metrics)),
+                "alignment_mode": alignment_mode_applied,
+                "alignment_version": payload.alignment_version,
+            },
             "gate_passed": False,
             "universe_resolve": universe_resolve,
         }
+        agg["degraded"] = bool(not agg["leakage_checks"]["passed"] or strict_asof_fail_fast)
+        agg["degraded_reasons"] = [
+            reason
+            for reason in [
+                "leakage_or_alignment_failed" if not agg["leakage_checks"]["passed"] else "",
+                "strict_asof_hard_fail_enabled" if strict_asof_fail_fast else "",
+            ]
+            if reason
+        ]
     else:
         per_target: Dict[str, Dict[str, float]] = {}
         regime_agg: Dict[str, Dict[str, float]] = {}
@@ -2141,6 +2393,7 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             "lineage_coverage": round(float(np.mean([float(m.get("lineage_coverage", 0.0)) for m in all_metrics])), 6),
             "model_inference_coverage": round(float(np.mean([float(m.get("model_inference_coverage", 0.0) or 0.0) for m in all_metrics])), 6),
             "fallback_used": bool(any(bool(m.get("fallback_used", False)) for m in all_metrics)),
+            "strict_asof_fail_fast": bool(strict_asof_fail_fast),
             "cost_breakdown": {
                 "fee": round(float(np.mean([float((m.get("cost_breakdown") or {}).get("fee", 0.0)) for m in all_metrics])), 8),
                 "slippage": round(float(np.mean([float((m.get("cost_breakdown") or {}).get("slippage", 0.0)) for m in all_metrics])), 8),
@@ -2159,7 +2412,7 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             },
             "alignment_audit": {
                 "alignment_mode_requested": payload.alignment_mode,
-                "alignment_mode_applied": "strict_asof" if payload.alignment_mode == "strict_asof" else payload.alignment_mode,
+                "alignment_mode_applied": alignment_mode_applied,
                 "alignment_version": payload.alignment_version,
                 "total_price_steps": int(sum(int((m.get("alignment_audit") or {}).get("total_price_steps", 0) or 0) for m in all_metrics)),
                 "aligned_steps": int(sum(int((m.get("alignment_audit") or {}).get("aligned_steps", 0) or 0) for m in all_metrics)),
@@ -2171,11 +2424,22 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             "leakage_checks": {
                 "passed": bool(all(bool((m.get("leakage_checks") or {}).get("passed", False)) for m in all_metrics)),
                 "leakage_violations": int(sum(int((m.get("leakage_checks") or {}).get("leakage_violations", 0) or 0) for m in all_metrics)),
-                "alignment_mode": payload.alignment_mode,
+                "alignment_mode": alignment_mode_applied,
                 "alignment_version": payload.alignment_version,
             },
             "universe_resolve": universe_resolve,
         }
+        degraded_reasons: List[str] = []
+        if bool(agg.get("fallback_used", False)):
+            degraded_reasons.append("legacy_or_heuristic_fallback_used")
+        if not bool((agg.get("leakage_checks") or {}).get("passed", False)):
+            degraded_reasons.append("leakage_or_alignment_failed")
+        if float(agg.get("model_inference_coverage", 0.0) or 0.0) < 1.0:
+            degraded_reasons.append("model_inference_partial_coverage")
+        if "fallback" in alignment_mode_applied.lower():
+            degraded_reasons.append("strict_asof_fallback_applied")
+        agg["degraded"] = bool(degraded_reasons)
+        agg["degraded_reasons"] = sorted(set(degraded_reasons))
         agg["gate_passed"] = bool(
             agg["ic"] > 0
             and agg["pnl_after_cost"] > 0
@@ -2526,11 +2790,12 @@ async def risk_check(payload: RiskCheckRequest) -> RiskCheckResponse:
         )
     kill_block = _kill_switch_block_reason(track, strategy_id)
     kill_switch_state = "triggered" if kill_block else "armed"
+    soft_only_violations = {"single_trade_take_profit_reached"}
     if kill_block:
         approved = False
         if kill_block not in violations:
             violations = [*violations, kill_block]
-    elif violations:
+    elif any(v not in soft_only_violations for v in violations):
         approved = False
     risk_budget_used = round(float(gross), 6)
     if hard_block:
@@ -2937,10 +3202,11 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
                 decision_id=f"risk-precheck-{uuid.uuid4().hex[:12]}",
                 severity="warning",
                 code=code,
-                message="execution take-profit precheck blocked",
+                message="execution take-profit precheck triggered",
                 payload={"decision_id": payload.decision_id, "edge_ratio": best_edge_ratio, "track": tp_track},
             )
-            raise HTTPException(status_code=423, detail=f"risk_blocked:{code}")
+            if _take_profit_hard_block_enabled():
+                raise HTTPException(status_code=423, detail=f"risk_blocked:{code}")
     # enforce risk check before execution; execution is blocked if risk fails.
     inferred_positions = []
     for o in scaled_orders:

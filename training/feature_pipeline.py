@@ -12,7 +12,36 @@ import numpy as np
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
+LIQUID_FEATURE_SCHEMA_VERSION = "v2.2"
+LIQUID_FEATURE_KEYS: List[str] = [
+    "ret_1",
+    "ret_3",
+    "ret_12",
+    "ret_48",
+    "vol_3",
+    "vol_12",
+    "vol_48",
+    "vol_96",
+    "log_volume",
+    "vol_z",
+    "volume_impact",
+    "orderbook_imbalance",
+    "funding_rate",
+    "onchain_norm",
+    "event_decay",
+    "orderbook_missing_flag",
+    "funding_missing_flag",
+    "onchain_missing_flag",
+    "source_tier_weight",
+    "source_confidence",
+    "social_post_sentiment",
+    "social_comment_sentiment",
+    "social_engagement_norm",
+    "social_influence_norm",
+    "social_event_ratio",
+    "social_buzz",
+]
 
 
 @dataclass
@@ -144,7 +173,7 @@ class FeaturePipeline:
                     row = {"total_rows": 0, "missing_rows": 0, "invalid_price_rows": 0, "duplicate_rows": 0, "stale_gap_rows": 0}
                 if int(row.get("total_rows") or 0) <= 0:
                     if self._table_exists(cur, "prices"):
-                        source_used = "prices"
+                        source_used = "prices_fallback"
                         fallback_gap = int(max(stale_gap_seconds, float(os.getenv("DQ_PRICE_STALE_GAP_SECONDS", "10800"))))
                         cur.execute(
                             """
@@ -199,6 +228,7 @@ class FeaturePipeline:
             "total_rows": float(total),
             "required_rows": float(required_rows),
             "source_used": source_used,
+            "fallback_used": bool(source_used == "prices_fallback"),
             "timeframe_used": str(timeframe),
             "missing_rate": missing_rate,
             "invalid_price_rate": invalid_rate,
@@ -251,6 +281,8 @@ class FeaturePipeline:
         event_rows: List[Dict] = []
         global_event_rows: List[Dict] = []
         effective_timeframe = str(timeframe)
+        source_used = "none"
+        source_fallback_used = False
         with self._connect() as conn:
             with conn.cursor() as cur:
                 has_market_bars = self._table_exists(cur, "market_bars")
@@ -274,95 +306,10 @@ class FeaturePipeline:
                         (symbol, timeframe, limit),
                     )
                     rows = [dict(r) for r in cur.fetchall()]
-                if has_orderbook:
-                    cur.execute(
-                        """
-                        SELECT ts AS timestamp, imbalance::float AS imbalance
-                        FROM orderbook_l2
-                        WHERE symbol = UPPER(%s)
-                        ORDER BY ts ASC
-                        LIMIT %s
-                        """,
-                        (symbol, limit * 2),
-                    )
-                    orderbook_rows = [dict(r) for r in cur.fetchall()]
-                if has_funding:
-                    cur.execute(
-                        """
-                        SELECT ts AS timestamp, funding_rate::float AS funding_rate
-                        FROM funding_rates
-                        WHERE symbol = UPPER(%s)
-                        ORDER BY ts ASC
-                        LIMIT %s
-                        """,
-                        (symbol, max(200, limit // 4)),
-                    )
-                    funding_rows = [dict(r) for r in cur.fetchall()]
-                if has_onchain:
-                    cur.execute(
-                        """
-                        SELECT ts AS timestamp, metric_value::float AS metric_value
-                        FROM onchain_signals
-                        WHERE asset_symbol = UPPER(%s)
-                          AND metric_name IN ('netflow','exchange_netflow','net_inflow')
-                        ORDER BY ts ASC
-                        LIMIT %s
-                        """,
-                        (symbol, limit * 2),
-                    )
-                    onchain_rows = [dict(r) for r in cur.fetchall()]
-                if has_events and has_event_links and has_entities:
-                    try:
-                        cur.execute(
-                            """
-                            SELECT COALESCE(e.available_at, e.occurred_at) AS timestamp, e.source_tier, e.confidence_score, 1.0::double precision AS scope_weight
-                            FROM events e
-                            JOIN event_links el ON el.event_id = e.id
-                            JOIN entities en ON en.id = el.entity_id
-                            WHERE UPPER(en.symbol) = UPPER(%s)
-                              AND COALESCE(en.metadata->>'synthetic_link', 'false') <> 'true'
-                            ORDER BY COALESCE(e.available_at, e.occurred_at) ASC
-                            LIMIT %s
-                            """,
-                            (symbol, limit * 2),
-                        )
-                    except Exception:
-                        cur.execute(
-                            """
-                            SELECT e.occurred_at AS timestamp, e.source_tier, e.confidence_score, 1.0::double precision AS scope_weight
-                            FROM events e
-                            JOIN event_links el ON el.event_id = e.id
-                            JOIN entities en ON en.id = el.entity_id
-                            WHERE UPPER(en.symbol) = UPPER(%s)
-                              AND COALESCE(en.metadata->>'synthetic_link', 'false') <> 'true'
-                            ORDER BY e.occurred_at ASC
-                            LIMIT %s
-                            """,
-                            (symbol, limit * 2),
-                        )
-                    event_rows = [dict(r) for r in cur.fetchall()]
-                if has_events:
-                    try:
-                        cur.execute(
-                            """
-                            SELECT
-                                COALESCE(e.available_at, e.occurred_at) AS timestamp,
-                                e.source_tier,
-                                e.confidence_score,
-                                0.7::double precision AS scope_weight
-                            FROM events e
-                            WHERE e.market_scope = 'macro'
-                               OR COALESCE(e.payload->>'global_impact', 'false') = 'true'
-                            ORDER BY COALESCE(e.available_at, e.occurred_at) ASC
-                            LIMIT %s
-                            """,
-                            (max(50, limit // 8),),
-                        )
-                        global_event_rows = [dict(r) for r in cur.fetchall()]
-                    except Exception:
-                        global_event_rows = []
+                if rows:
+                    source_used = "market_bars"
                 if not rows and has_prices:
-                    effective_timeframe = os.getenv("LIQUID_PRICE_FALLBACK_TIMEFRAME", "1h")
+                    effective_timeframe = os.getenv("LIQUID_PRICE_FALLBACK_TIMEFRAME", str(timeframe))
                     cur.execute(
                         """
                         SELECT symbol, price::float AS price, volume::float AS volume, timestamp
@@ -374,15 +321,140 @@ class FeaturePipeline:
                         (symbol, limit),
                     )
                     rows = [dict(r) for r in cur.fetchall()]
-
-        rows = sorted(rows, key=lambda r: r["timestamp"])
+                    if rows:
+                        source_used = "prices_fallback"
+                        source_fallback_used = True
+                rows = sorted(rows, key=lambda r: r["timestamp"])
+                if rows:
+                    for row in rows:
+                        row["source_used"] = source_used
+                        row["timeframe_used"] = str(effective_timeframe)
+                        row["price_fallback_used"] = bool(source_fallback_used)
+                if rows:
+                    range_end = rows[-1]["timestamp"]
+                    range_start = rows[0]["timestamp"] - timedelta(hours=48)
+                    if has_orderbook:
+                        cur.execute(
+                            """
+                            SELECT ts AS timestamp, imbalance::float AS imbalance
+                            FROM orderbook_l2
+                            WHERE symbol = UPPER(%s)
+                              AND ts >= %s
+                              AND ts <= %s
+                            ORDER BY ts DESC
+                            LIMIT %s
+                            """,
+                            (symbol, range_start, range_end, max(limit * 8, 2000)),
+                        )
+                        orderbook_rows = [dict(r) for r in cur.fetchall()]
+                        orderbook_rows.sort(key=lambda r: r["timestamp"])
+                    if has_funding:
+                        cur.execute(
+                            """
+                            SELECT ts AS timestamp, funding_rate::float AS funding_rate
+                            FROM funding_rates
+                            WHERE symbol = UPPER(%s)
+                              AND ts >= %s
+                              AND ts <= %s
+                            ORDER BY ts DESC
+                            LIMIT %s
+                            """,
+                            (symbol, range_start, range_end, max(limit * 4, 1200)),
+                        )
+                        funding_rows = [dict(r) for r in cur.fetchall()]
+                        funding_rows.sort(key=lambda r: r["timestamp"])
+                    if has_onchain:
+                        cur.execute(
+                            """
+                            SELECT ts AS timestamp, metric_value::float AS metric_value
+                            FROM onchain_signals
+                            WHERE asset_symbol = UPPER(%s)
+                              AND metric_name IN ('netflow','exchange_netflow','net_inflow')
+                              AND ts >= %s
+                              AND ts <= %s
+                            ORDER BY ts DESC
+                            LIMIT %s
+                            """,
+                            (symbol, range_start, range_end, max(limit * 8, 2000)),
+                        )
+                        onchain_rows = [dict(r) for r in cur.fetchall()]
+                        onchain_rows.sort(key=lambda r: r["timestamp"])
+                    if has_events and has_event_links and has_entities:
+                        try:
+                            cur.execute(
+                                """
+                                SELECT
+                                    COALESCE(e.available_at, e.occurred_at) AS timestamp,
+                                    e.source_tier,
+                                    e.confidence_score,
+                                    e.payload,
+                                    1.0::double precision AS scope_weight
+                                FROM events e
+                                JOIN event_links el ON el.event_id = e.id
+                                JOIN entities en ON en.id = el.entity_id
+                                WHERE UPPER(en.symbol) = UPPER(%s)
+                                  AND COALESCE(en.metadata->>'synthetic_link', 'false') <> 'true'
+                                  AND COALESCE(e.available_at, e.occurred_at) >= %s
+                                  AND COALESCE(e.available_at, e.occurred_at) <= %s
+                                ORDER BY COALESCE(e.available_at, e.occurred_at) DESC
+                                LIMIT %s
+                                """,
+                                (symbol, range_start, range_end, max(limit * 8, 2000)),
+                            )
+                        except Exception:
+                            cur.execute(
+                                """
+                                SELECT
+                                    e.occurred_at AS timestamp,
+                                    e.source_tier,
+                                    e.confidence_score,
+                                    e.payload,
+                                    1.0::double precision AS scope_weight
+                                FROM events e
+                                JOIN event_links el ON el.event_id = e.id
+                                JOIN entities en ON en.id = el.entity_id
+                                WHERE UPPER(en.symbol) = UPPER(%s)
+                                  AND COALESCE(en.metadata->>'synthetic_link', 'false') <> 'true'
+                                  AND e.occurred_at >= %s
+                                  AND e.occurred_at <= %s
+                                ORDER BY e.occurred_at DESC
+                                LIMIT %s
+                                """,
+                                (symbol, range_start, range_end, max(limit * 8, 2000)),
+                            )
+                        event_rows = [dict(r) for r in cur.fetchall()]
+                        event_rows.sort(key=lambda r: r["timestamp"])
+                    if has_events:
+                        try:
+                            cur.execute(
+                                """
+                                SELECT
+                                    COALESCE(e.available_at, e.occurred_at) AS timestamp,
+                                    e.source_tier,
+                                    e.confidence_score,
+                                    e.payload,
+                                    0.7::double precision AS scope_weight
+                                FROM events e
+                                WHERE (e.market_scope = 'macro'
+                                   OR COALESCE(e.payload->>'global_impact', 'false') = 'true')
+                                  AND COALESCE(e.available_at, e.occurred_at) >= %s
+                                  AND COALESCE(e.available_at, e.occurred_at) <= %s
+                                ORDER BY COALESCE(e.available_at, e.occurred_at) DESC
+                                LIMIT %s
+                                """,
+                                (range_start, range_end, max(limit * 2, 600)),
+                            )
+                            global_event_rows = [dict(r) for r in cur.fetchall()]
+                            global_event_rows.sort(key=lambda r: r["timestamp"])
+                        except Exception:
+                            global_event_rows = []
 
         tf_minutes = self._timeframe_to_minutes(effective_timeframe)
         step_1h = max(1, int(round(60.0 / max(1, tf_minutes))))
         step_4h = max(1, step_1h * 4)
         history_len = 96
         if len(rows) < (history_len + step_4h + 2):
-            return SampleBatch(X=np.zeros((0, 18), dtype=np.float32), y=np.zeros((0,), dtype=np.float32), meta=[], extra_labels={})
+            return SampleBatch(X=np.zeros((0, len(LIQUID_FEATURE_KEYS)), dtype=np.float32), y=np.zeros((0,), dtype=np.float32), meta=[], extra_labels={})
 
         ob_ts = [r["timestamp"] for r in orderbook_rows]
         ob_vals = [float(r.get("imbalance") or 0.0) for r in orderbook_rows]
@@ -399,12 +471,25 @@ class FeaturePipeline:
             conf = float(r.get("confidence_score") or 0.0)
             if conf < min_event_conf or tier > max_event_tier:
                 continue
+            payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+            social_platform = str(payload.get("social_platform") or "").strip().lower() if isinstance(payload, dict) else ""
+            is_social = bool(social_platform and social_platform not in {"none", "unknown"})
+            post_sent = float(payload.get("post_sentiment", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
+            comment_sent = float(payload.get("comment_sentiment", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
+            engagement = float(payload.get("engagement_score", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
+            followers = float(payload.get("author_followers", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
             ev_rows.append(
                 {
                     "timestamp": r["timestamp"],
                     "tier": tier,
+                    "raw_confidence": conf,
                     "confidence": conf * float(r.get("scope_weight") or 1.0),
                     "tier_weight": float(tier_weights.get(tier, 0.1)),
+                    "is_social": is_social,
+                    "post_sentiment": float(np.clip(post_sent, -1.0, 1.0)),
+                    "comment_sentiment": float(np.clip(comment_sent, -1.0, 1.0)),
+                    "engagement_score": max(0.0, engagement),
+                    "author_followers": max(0.0, followers),
                 }
             )
         ev_ts = [r["timestamp"] for r in ev_rows]
@@ -456,6 +541,15 @@ class FeaturePipeline:
                 left_idx = bisect_right(ev_ts, ts - timedelta(hours=24))
                 num = 0.0
                 den = 0.0
+                tier_sum = 0.0
+                conf_sum = 0.0
+                cnt = 0
+                social_cnt = 0
+                social_den = 0.0
+                social_post = 0.0
+                social_comment = 0.0
+                social_engage = 0.0
+                social_followers = 0.0
                 for j in range(left_idx, evt_idx + 1):
                     evt = ev_rows[j]
                     evt_ts = evt["timestamp"]
@@ -464,9 +558,35 @@ class FeaturePipeline:
                     ew = float(evt["tier_weight"]) * float(evt["confidence"])
                     num += ew * decay
                     den += ew
+                    tier_sum += float(evt["tier_weight"])
+                    conf_sum += float(evt["raw_confidence"])
+                    cnt += 1
+                    if bool(evt.get("is_social")):
+                        social_cnt += 1
+                        social_den += ew
+                        social_post += ew * float(evt.get("post_sentiment", 0.0))
+                        social_comment += ew * float(evt.get("comment_sentiment", 0.0))
+                        social_engage += ew * float(np.log1p(float(evt.get("engagement_score", 0.0))))
+                        social_followers += ew * float(np.log1p(float(evt.get("author_followers", 0.0))))
                 event_decay = float(num / max(1e-9, den))
+                source_tier_weight = float(tier_sum / max(1, cnt))
+                source_confidence = float(conf_sum / max(1, cnt))
+                social_post_sentiment = float(social_post / max(1e-9, social_den)) if social_den > 0 else 0.0
+                social_comment_sentiment = float(social_comment / max(1e-9, social_den)) if social_den > 0 else 0.0
+                social_engagement_norm = float(np.tanh((social_engage / max(1e-9, social_den)) / 6.0)) if social_den > 0 else 0.0
+                social_influence_norm = float(np.tanh((social_followers / max(1e-9, social_den)) / 14.0)) if social_den > 0 else 0.0
+                social_event_ratio = float(social_cnt / max(1, cnt))
+                social_buzz = float(np.tanh(social_den))
             else:
                 event_decay = 0.0
+                source_tier_weight = 0.0
+                source_confidence = 0.0
+                social_post_sentiment = 0.0
+                social_comment_sentiment = 0.0
+                social_engagement_norm = 0.0
+                social_influence_norm = 0.0
+                social_event_ratio = 0.0
+                social_buzz = 0.0
             orderbook_missing_flag = 0.0 if ob_ts else 1.0
             funding_missing_flag = 0.0 if fr_ts else 1.0
             onchain_missing_flag = 0.0 if oc_ts else 1.0
@@ -490,6 +610,14 @@ class FeaturePipeline:
                     orderbook_missing_flag,
                     funding_missing_flag,
                     onchain_missing_flag,
+                    source_tier_weight,
+                    source_confidence,
+                    social_post_sentiment,
+                    social_comment_sentiment,
+                    social_engagement_norm,
+                    social_influence_norm,
+                    social_event_ratio,
+                    social_buzz,
                 ]
             )
 

@@ -27,9 +27,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
 LIQUID_SYMBOLS = [s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK").split(",") if s.strip()]
+LIQUID_PRIMARY_TIMEFRAME = str(os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m")).strip().lower() or "5m"
 INFER_INTERVAL_SEC = int(os.getenv("INFER_INTERVAL_SEC", "60"))
 
 
@@ -42,6 +43,7 @@ class InferenceServiceV2:
         self.active_model_ttl_sec = int(os.getenv("ACTIVE_MODEL_TTL_SEC", "30"))
         self.feature_version = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
         self.data_version = os.getenv("DATA_VERSION", "v1")
+        self.feature_payload_schema_version = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.2")
 
     @staticmethod
     def _source_tier_weights() -> Dict[int, float]:
@@ -81,12 +83,24 @@ class InferenceServiceV2:
             age_hours = max(0.0, (now - ts_utc.astimezone(timezone.utc)).total_seconds() / 3600.0)
             decay = float(np.exp(-age_hours / 12.0))
             tier_w = float(tier_weights.get(tier, 0.1))
+            payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+            social_platform = str(payload.get("social_platform") or "").strip().lower() if isinstance(payload, dict) else ""
+            is_social = bool(social_platform and social_platform not in {"none", "unknown"})
+            post_sent = float(payload.get("post_sentiment", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
+            comment_sent = float(payload.get("comment_sentiment", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
+            engagement = float(payload.get("engagement_score", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
+            followers = float(payload.get("author_followers", 0.0) or 0.0) if isinstance(payload, dict) else 0.0
             accepted.append(
                 {
                     "decay": decay,
                     "tier_weight": tier_w,
                     "confidence": conf,
                     "joint_weight": tier_w * conf,
+                    "is_social": 1.0 if is_social else 0.0,
+                    "post_sentiment": float(np.clip(post_sent, -1.0, 1.0)),
+                    "comment_sentiment": float(np.clip(comment_sent, -1.0, 1.0)),
+                    "engagement_score": max(0.0, engagement),
+                    "author_followers": max(0.0, followers),
                 }
             )
             tier_key = str(tier)
@@ -96,6 +110,12 @@ class InferenceServiceV2:
                 "event_decay": 0.0,
                 "source_tier_weight": 0.0,
                 "source_confidence": 0.0,
+                "social_post_sentiment": 0.0,
+                "social_comment_sentiment": 0.0,
+                "social_engagement_norm": 0.0,
+                "social_influence_norm": 0.0,
+                "social_event_ratio": 0.0,
+                "social_buzz": 0.0,
                 "source_tiers": {},
                 "missing_markers": ["event_quality_unavailable"],
             }
@@ -103,10 +123,32 @@ class InferenceServiceV2:
         event_decay = float(sum(a["joint_weight"] * a["decay"] for a in accepted) / max(1e-9, den))
         tier_weight = float(sum(a["tier_weight"] for a in accepted) / max(1, len(accepted)))
         conf_mean = float(sum(a["confidence"] for a in accepted) / max(1, len(accepted)))
+        social_den = float(sum(a["joint_weight"] for a in accepted if a.get("is_social", 0.0) > 0.5))
+        social_cnt = int(sum(1 for a in accepted if a.get("is_social", 0.0) > 0.5))
+        social_post = float(sum(a["joint_weight"] * a.get("post_sentiment", 0.0) for a in accepted if a.get("is_social", 0.0) > 0.5))
+        social_comment = float(sum(a["joint_weight"] * a.get("comment_sentiment", 0.0) for a in accepted if a.get("is_social", 0.0) > 0.5))
+        social_engage = float(
+            sum(a["joint_weight"] * float(np.log1p(float(a.get("engagement_score", 0.0)))) for a in accepted if a.get("is_social", 0.0) > 0.5)
+        )
+        social_followers = float(
+            sum(a["joint_weight"] * float(np.log1p(float(a.get("author_followers", 0.0)))) for a in accepted if a.get("is_social", 0.0) > 0.5)
+        )
+        social_post_sentiment = float(social_post / max(1e-9, social_den)) if social_den > 0 else 0.0
+        social_comment_sentiment = float(social_comment / max(1e-9, social_den)) if social_den > 0 else 0.0
+        social_engagement_norm = float(np.tanh((social_engage / max(1e-9, social_den)) / 6.0)) if social_den > 0 else 0.0
+        social_influence_norm = float(np.tanh((social_followers / max(1e-9, social_den)) / 14.0)) if social_den > 0 else 0.0
+        social_event_ratio = float(social_cnt / max(1, len(accepted)))
+        social_buzz = float(np.tanh(social_den))
         return {
             "event_decay": event_decay,
             "source_tier_weight": tier_weight,
             "source_confidence": conf_mean,
+            "social_post_sentiment": social_post_sentiment,
+            "social_comment_sentiment": social_comment_sentiment,
+            "social_engagement_norm": social_engagement_norm,
+            "social_influence_norm": social_influence_norm,
+            "social_event_ratio": social_event_ratio,
+            "social_buzz": social_buzz,
             "source_tiers": {k: float(v) for k, v in sorted(tier_counts.items())},
             "missing_markers": [],
         }
@@ -161,11 +203,11 @@ class InferenceServiceV2:
                     """
                     SELECT symbol, close::float AS price, volume::float AS volume, ts AS timestamp
                     FROM market_bars
-                    WHERE symbol = UPPER(%s) AND timeframe = '5m'
+                    WHERE symbol = UPPER(%s) AND timeframe = %s
                     ORDER BY ts DESC
                     LIMIT %s
                     """,
-                    (symbol, limit),
+                    (symbol, LIQUID_PRIMARY_TIMEFRAME, limit),
                 )
                 rows = [dict(r) for r in cur.fetchall()]
             except Exception:
@@ -259,7 +301,7 @@ class InferenceServiceV2:
                 cur.execute(
                     """
                     SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier,
-                           e.occurred_at, e.available_at, e.market_scope
+                           e.occurred_at, e.available_at, e.market_scope, e.payload
                     FROM events e
                     LEFT JOIN event_links el ON el.event_id = e.id
                     LEFT JOIN entities en ON en.id = el.entity_id
@@ -273,6 +315,7 @@ class InferenceServiceV2:
                 cur.execute(
                     """
                     SELECT e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at
+                           , e.payload
                     FROM events e
                     LEFT JOIN event_links el ON el.event_id = e.id
                     LEFT JOIN entities en ON en.id = el.entity_id
@@ -296,7 +339,7 @@ class InferenceServiceV2:
                         SELECT
                             COALESCE(UPPER(en.symbol), en.name) AS target_key,
                             e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier,
-                            e.occurred_at, e.available_at, e.market_scope,
+                            e.occurred_at, e.available_at, e.market_scope, e.payload,
                             ROW_NUMBER() OVER (
                                 PARTITION BY COALESCE(UPPER(en.symbol), en.name)
                                 ORDER BY COALESCE(e.available_at, e.occurred_at) DESC
@@ -306,7 +349,7 @@ class InferenceServiceV2:
                         LEFT JOIN entities en ON en.id = el.entity_id
                         WHERE UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s)
                     )
-                    SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at, available_at, market_scope
+                    SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at, available_at, market_scope, payload
                     FROM linked
                     WHERE rn <= %s
                     ORDER BY target_key, COALESCE(available_at, occurred_at) DESC
@@ -320,7 +363,7 @@ class InferenceServiceV2:
                     WITH linked AS (
                         SELECT
                             COALESCE(UPPER(en.symbol), en.name) AS target_key,
-                            e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at,
+                            e.id, e.event_type, e.title, e.source_url, e.confidence_score, e.source_tier, e.occurred_at, e.payload,
                             ROW_NUMBER() OVER (
                                 PARTITION BY COALESCE(UPPER(en.symbol), en.name)
                                 ORDER BY e.occurred_at DESC
@@ -330,7 +373,7 @@ class InferenceServiceV2:
                         LEFT JOIN entities en ON en.id = el.entity_id
                         WHERE UPPER(en.symbol) = ANY(%s) OR en.name = ANY(%s)
                     )
-                    SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at
+                    SELECT target_key, id, event_type, title, source_url, confidence_score, source_tier, occurred_at, payload
                     FROM linked
                     WHERE rn <= %s
                     ORDER BY target_key, occurred_at DESC
@@ -348,7 +391,7 @@ class InferenceServiceV2:
             try:
                 cur.execute(
                     """
-                    SELECT id, event_type, title, source_url, confidence_score, source_tier, occurred_at, available_at, market_scope
+                    SELECT id, event_type, title, source_url, confidence_score, source_tier, occurred_at, available_at, market_scope, payload
                     FROM events
                     WHERE market_scope = 'macro'
                        OR COALESCE(payload->>'global_impact', 'false') = 'true'
@@ -577,6 +620,7 @@ class InferenceServiceV2:
             price = float(row["price"])
             volume = float(row.get("volume") or 0.0)
             history = self.get_recent_prices(symbol, limit=144)
+            price_history_degraded = False
             if len(history) >= 97:
                 prices = np.array([float(h.get("price") or price) for h in history], dtype=np.float64)
                 vols = np.array([float(h.get("volume") or 0.0) for h in history], dtype=np.float64)
@@ -596,6 +640,7 @@ class InferenceServiceV2:
                 vol_3 = vol_12 = vol_48 = vol_96 = 0.0
                 vol_z = 0.0
                 volume_impact = 0.0
+                price_history_degraded = True
 
             orderbook_imbalance = float(orderbook_map.get(symbol, 0.0))
             funding_rate = float(funding_map.get(symbol, 0.0))
@@ -606,6 +651,14 @@ class InferenceServiceV2:
             onchain_missing_flag = 0.0 if symbol in onchain_map else 1.0
 
             event_decay = float(source_profile.get("event_decay") or 0.0)
+            source_tier_weight = float(source_profile.get("source_tier_weight") or 0.0)
+            source_confidence = float(source_profile.get("source_confidence") or 0.0)
+            social_post_sentiment = float(source_profile.get("social_post_sentiment") or 0.0)
+            social_comment_sentiment = float(source_profile.get("social_comment_sentiment") or 0.0)
+            social_engagement_norm = float(source_profile.get("social_engagement_norm") or 0.0)
+            social_influence_norm = float(source_profile.get("social_influence_norm") or 0.0)
+            social_event_ratio = float(source_profile.get("social_event_ratio") or 0.0)
+            social_buzz = float(source_profile.get("social_buzz") or 0.0)
 
             feature = np.array(
                 [
@@ -627,6 +680,14 @@ class InferenceServiceV2:
                     orderbook_missing_flag,
                     funding_missing_flag,
                     onchain_missing_flag,
+                    source_tier_weight,
+                    source_confidence,
+                    social_post_sentiment,
+                    social_comment_sentiment,
+                    social_engagement_norm,
+                    social_influence_norm,
+                    social_event_ratio,
+                    social_buzz,
                 ],
                 dtype=np.float32,
             )
@@ -656,14 +717,33 @@ class InferenceServiceV2:
                     "orderbook_missing_flag": float(feature[15]),
                     "funding_missing_flag": float(feature[16]),
                     "onchain_missing_flag": float(feature[17]),
-                    "source_tier_weight": float(source_profile.get("source_tier_weight") or 0.0),
-                    "source_confidence": float(source_profile.get("source_confidence") or 0.0),
-                    "feature_payload_schema_version": "v2.1",
+                    "source_tier_weight": float(feature[18]),
+                    "source_confidence": float(feature[19]),
+                    "social_post_sentiment": float(feature[20]),
+                    "social_comment_sentiment": float(feature[21]),
+                    "social_engagement_norm": float(feature[22]),
+                    "social_influence_norm": float(feature[23]),
+                    "social_event_ratio": float(feature[24]),
+                    "social_buzz": float(feature[25]),
+                    "feature_payload_schema_version": self.feature_payload_schema_version,
                 },
                 lineage_id=infer_lineage_id,
                 event_time=latest_event_time,
             )
             out = self.router.predict_liquid(symbol, feature, model_name=active_model["name"])
+            degraded_reasons: List[str] = []
+            if price_history_degraded:
+                degraded_reasons.append("insufficient_price_history")
+            if orderbook_missing_flag > 0:
+                degraded_reasons.append("orderbook_missing")
+            if funding_missing_flag > 0:
+                degraded_reasons.append("funding_missing")
+            if onchain_missing_flag > 0:
+                degraded_reasons.append("onchain_missing")
+            if degraded_reasons:
+                out["signal_confidence"] = float(max(0.2, float(out.get("signal_confidence") or 0.0) * 0.7))
+                out["degraded"] = True
+                out["degraded_reasons"] = sorted(set(degraded_reasons))
 
             feature_contribs = [
                 {"feature": "ret_12", "value": round(float(feature[2]), 6), "contribution": round(float(feature[2]), 6)},
@@ -671,12 +751,7 @@ class InferenceServiceV2:
                 {"feature": "orderbook_imbalance", "value": round(float(feature[11]), 6), "contribution": round(float(feature[11]) * 0.5, 6)},
             ]
             missing_markers = list(source_profile.get("missing_markers") or [])
-            if orderbook_missing_flag > 0:
-                missing_markers.append("orderbook_missing")
-            if funding_missing_flag > 0:
-                missing_markers.append("funding_missing")
-            if onchain_missing_flag > 0:
-                missing_markers.append("onchain_missing")
+            missing_markers.extend(degraded_reasons)
             exp = build_explanation(
                 f"{active_model['name']}-{active_model['version']}",
                 self.feature_version,

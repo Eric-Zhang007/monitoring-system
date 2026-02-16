@@ -444,10 +444,32 @@ dist/assets/index.js            181.76 kB │ gzip: 54.96 kB
 
 ## 🚀 快速开始
 
-### 1. 一键部署
+### 1. 无 Docker 启动（目标服务器默认）
 ```bash
-cd /home/admin/.openclaw/workspace/monitoring-system
-./scripts/deploy.sh
+cd /path/to/monitoring-system
+
+# 复制安全环境模板并填写真实密钥/密码
+cp .env.example .env
+
+# 编辑 .env（至少设置 DATABASE_URL/POSTGRES_PASSWORD/GF_SECURITY_ADMIN_PASSWORD）
+
+# 安全基线校验（含 CORS allowlist 校验）
+bash scripts/validate_security_hardening.sh
+
+# 预检（no-docker + no-gpu）
+bash scripts/server_preflight_nodocker.sh
+
+# 启动核心服务（backend + collector + task_worker + model_ops）
+bash scripts/server_nodocker_up.sh
+
+# 完整 readiness 验收（异步任务闭环 + 健康检查）
+bash scripts/server_readiness_nodocker.sh
+
+# 若任务较重，可放宽 readiness 的异步任务等待窗口（避免短超时误判）
+TASK_MAX_WAIT_SEC=1800 TASK_STALL_TIMEOUT_SEC=300 bash scripts/server_readiness_nodocker.sh
+
+# 停止服务
+bash scripts/server_nodocker_down.sh
 ```
 
 ### 2. 访问系统
@@ -455,24 +477,24 @@ cd /home/admin/.openclaw/workspace/monitoring-system
 - **后端 API**：http://localhost:8000
 - **API 文档**：http://localhost:8000/docs
 - **Prometheus**：http://localhost:9090
-- **Grafana 监控**：http://localhost:3000 (admin/admin)
+- **Grafana 监控**：http://localhost:3000（账号密码由 `.env` 中 `GF_SECURITY_ADMIN_PASSWORD` 配置）
 
-### 3. 常用命令
+### 3. 常用命令（无 Docker 优先）
 ```bash
-# 查看服务状态
-docker compose ps
+# 查看 screen 会话
+screen -ls
 
-# 执行数据库迁移
-docker compose run --rm orchestrator
+# 查看关键日志
+tail -f /tmp/backend_screen.log
+tail -f /tmp/task_worker_screen.log
+tail -f /tmp/model_ops_screen.log
+tail -f /tmp/collector_screen.log
 
-# 查看日志
-docker compose logs -f backend
+# 运行 no-docker readiness（可重复执行）
+bash scripts/server_readiness_nodocker.sh
 
-# 停止服务
-docker compose down
-
-# 重启服务
-docker compose restart [service_name]
+# 本地一键安装依赖并运行 backend 单元测试
+./scripts/dev_test.sh
 
 # 运行扩展版 V2 API 冒烟测试（29项）
 API_BASE=http://localhost:8000 ./scripts/test_v2_api.sh
@@ -514,7 +536,7 @@ python3 scripts/chaos_drill.py recover
 python3 scripts/rebuild_liquid_completed_backtests.py --limit 30
 
 # 严格口径批量回测（prod+model+prod_live）
-python3 scripts/run_prod_live_backtest_batch.py --api-base http://localhost:8000 --n-runs 12 --fee-bps 0.5 --slippage-bps 0.2 --signal-entry-z-min 0.08 --signal-exit-z-min 0.028 --position-max-weight-base 0.08 --cost-penalty-lambda 1.0 --signal-polarity-mode auto_train_ic
+python3 scripts/run_prod_live_backtest_batch.py --api-base http://localhost:8000 --n-runs 12 --task-max-wait-sec 1800 --task-stall-timeout-sec 300 --fee-bps 0.5 --slippage-bps 0.2 --signal-entry-z-min 0.08 --signal-exit-z-min 0.028 --position-max-weight-base 0.08 --cost-penalty-lambda 1.0 --signal-polarity-mode auto_train_ic
 
 # 清理旧 completed 样本（仅保留最近N条参与 hard gate 统计）
 python3 scripts/supersede_stale_backtests.py --track liquid --keep-latest 20
@@ -537,14 +559,16 @@ python3 scripts/continuous_remediation_loop.py --api-base http://localhost:8000 
 # 检查是否满足 GPU 切换门禁
 python3 scripts/check_gpu_cutover_readiness.py
 
-# 如需启动 GPU 推理/训练服务（默认 compose up 不启动这两个服务）
-docker compose --profile gpu up -d inference training
-
-# 本地一键安装依赖并运行 backend 单元测试
-./scripts/dev_test.sh
-
 # 每周数据质量抽样（默认200条）并导出审计清单
 python3 scripts/data_quality_weekly_audit.py --api-base http://localhost:8000 --limit 200
+```
+
+### 4. Docker 备用链路（仅可用时）
+```bash
+./scripts/deploy.sh
+docker compose ps
+docker compose logs -f backend
+docker compose down
 ```
 
 ---

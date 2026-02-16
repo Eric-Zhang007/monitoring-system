@@ -4,6 +4,7 @@ import json
 import os
 import random
 from datetime import datetime
+from pathlib import Path
 from typing import Dict
 
 import numpy as np
@@ -15,8 +16,20 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from feature_pipeline import FeaturePipeline
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
-MODEL_DIR = "/app/models"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
+
+
+def _default_model_dir() -> str:
+    env_path = str(os.getenv("MODEL_DIR", "")).strip()
+    if env_path:
+        return env_path
+    repo_models = Path(__file__).resolve().parents[1] / "backend" / "models"
+    if repo_models.exists():
+        return str(repo_models)
+    return "/app/models"
+
+
+MODEL_DIR = _default_model_dir()
 GRAD_ACC_STEPS = int(os.getenv("TRAIN_GRAD_ACC_STEPS", "4"))
 EPOCHS = int(os.getenv("VC_EPOCHS", "12"))
 BATCH_SIZE = int(os.getenv("VC_BATCH_SIZE", "128"))
@@ -24,6 +37,12 @@ SEED = int(os.getenv("TRAIN_SEED", "42"))
 VAL_RATIO = float(os.getenv("VC_VAL_RATIO", "0.2"))
 PATIENCE = int(os.getenv("VC_EARLY_STOP_PATIENCE", "3"))
 CHECKPOINT_PATH = os.getenv("VC_CHECKPOINT_PATH", os.path.join(MODEL_DIR, "vc_checkpoint.pt"))
+TRAIN_NUM_WORKERS = int(os.getenv("TRAIN_NUM_WORKERS", "4"))
+TRAIN_PREFETCH_FACTOR = int(os.getenv("TRAIN_PREFETCH_FACTOR", "4"))
+TRAIN_PIN_MEMORY = os.getenv("TRAIN_PIN_MEMORY", "1").lower() in {"1", "true", "yes", "y"}
+TRAIN_DQ_GATE_MODE = str(os.getenv("TRAIN_DQ_GATE_MODE", "soft")).strip().lower()
+VC_DQ_GATE_MODE = str(os.getenv("VC_DQ_GATE_MODE", TRAIN_DQ_GATE_MODE)).strip().lower()
+VC_DQ_HARD_BLOCK = os.getenv("VC_DQ_HARD_BLOCK", "").strip().lower() in {"1", "true", "yes", "y"}
 
 
 class TinyVCModel(nn.Module):
@@ -79,6 +98,18 @@ class VCModelTrainer:
             return torch.device(f"cuda:{self.local_rank}")
         return torch.device("cuda")
 
+    @staticmethod
+    def _loader_kwargs(device: torch.device) -> Dict[str, object]:
+        workers = max(0, int(TRAIN_NUM_WORKERS))
+        kwargs: Dict[str, object] = {
+            "num_workers": workers,
+            "pin_memory": bool(TRAIN_PIN_MEMORY and device.type == "cuda"),
+        }
+        if workers > 0:
+            kwargs["prefetch_factor"] = max(2, int(TRAIN_PREFETCH_FACTOR))
+            kwargs["persistent_workers"] = True
+        return kwargs
+
     def train(self) -> Dict:
         if self.rank != 0:
             return {
@@ -88,8 +119,22 @@ class VCModelTrainer:
             }
         self._set_seed(SEED + self.rank)
         dq = self.pipeline.check_data_quality("BTC", timeframe="5m", lookback_hours=48)
+        dq_degraded = False
         if dq.get("quality_passed", 0.0) < 0.5:
-            return {"status": "blocked_by_data_quality", "data_quality": dq}
+            gate_mode = VC_DQ_GATE_MODE if VC_DQ_GATE_MODE in {"soft", "hard"} else "soft"
+            hard_block = bool(VC_DQ_HARD_BLOCK or gate_mode == "hard")
+            if hard_block:
+                return {
+                    "status": "blocked_by_data_quality",
+                    "data_quality": dq,
+                    "dq_gate_mode": "hard",
+                }
+            dq_degraded = True
+            dq = {
+                **dq,
+                "dq_gate_mode": "soft",
+                "dq_degraded": True,
+            }
 
         batch = self.pipeline.load_vc_training_batch(limit=3000)
         if batch.X.shape[0] == 0:
@@ -131,6 +176,7 @@ class VCModelTrainer:
         train_ds = TensorDataset(x_train, y_train_t, t_train)
         val_ds = TensorDataset(x_val, y_val_t, t_val)
         train_bs = BATCH_SIZE
+        loader_kwargs = self._loader_kwargs(device)
 
         start_epoch = 0
         best_val_loss = float("inf")
@@ -143,16 +189,16 @@ class VCModelTrainer:
             best_val_loss = float(ckpt.get("best_val_loss", best_val_loss))
 
         for epoch in range(start_epoch, EPOCHS):
-            train_dl = DataLoader(train_ds, batch_size=train_bs, shuffle=True, drop_last=False)
-            val_dl = DataLoader(val_ds, batch_size=train_bs, shuffle=False, drop_last=False)
+            train_dl = DataLoader(train_ds, batch_size=train_bs, shuffle=True, drop_last=False, **loader_kwargs)
+            val_dl = DataLoader(val_ds, batch_size=train_bs, shuffle=False, drop_last=False, **loader_kwargs)
             model.train()
             opt.zero_grad(set_to_none=True)
             train_loss_sum = 0.0
             try:
                 for step, (bx, by, bt) in enumerate(train_dl, start=1):
-                    bx = bx.to(device)
-                    by = by.to(device)
-                    bt = bt.to(device)
+                    bx = bx.to(device, non_blocking=True)
+                    by = by.to(device, non_blocking=True)
+                    bt = bt.to(device, non_blocking=True)
                     with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                         logits = model(bx)
                         sup_loss = bce(logits, by)
@@ -179,9 +225,9 @@ class VCModelTrainer:
             with torch.no_grad():
                 val_losses = []
                 for bx, by, bt in val_dl:
-                    bx = bx.to(device)
-                    by = by.to(device)
-                    bt = bt.to(device)
+                    bx = bx.to(device, non_blocking=True)
+                    by = by.to(device, non_blocking=True)
+                    bt = bt.to(device, non_blocking=True)
                     logits = model(bx)
                     v = 0.8 * bce(logits, by) + 0.2 * mse(torch.sigmoid(logits), bt)
                     val_losses.append(float(v.item()))
@@ -246,6 +292,7 @@ class VCModelTrainer:
             "val_accuracy": round(acc, 6),
             "distill_gap": round(distill_gap, 6),
             "created_at": datetime.utcnow().isoformat(),
+            "dq_degraded": bool(dq_degraded),
         }
         manifest_path = os.path.join(MODEL_DIR, "vc_train_manifest_v2.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -298,6 +345,7 @@ class VCModelTrainer:
                                 "best_val_loss": round(best_val_loss, 8),
                                 "train_manifest_path": manifest_path,
                                 "data_quality": dq,
+                                "dq_degraded": bool(dq_degraded),
                             }
                         ),
                     ),
@@ -311,4 +359,5 @@ class VCModelTrainer:
             "distilled_artifact": nn_model_path,
             "distill_gap": round(distill_gap, 6),
             "data_quality": dq,
+            "dq_degraded": bool(dq_degraded),
         }

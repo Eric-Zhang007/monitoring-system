@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 import redis
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
 TASK_QUEUE_KEY = os.getenv("TASK_QUEUE_KEY", "ms:task_queue")
 TASK_RESULT_PREFIX = os.getenv("TASK_RESULT_PREFIX", "ms:task_result:")
 TASK_TTL_SECONDS = int(os.getenv("TASK_TTL_SECONDS", "86400"))

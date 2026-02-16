@@ -1,5 +1,62 @@
 # 代码追踪与问题清单
 
+## 🆕 2026-02-16 阶段更新（代码优先，no-docker）
+
+> 说明：从本阶段起，`TRACKING.md` 按“阶段成果”持续更新；历史条目可能过时，以“最新阶段块”优先。
+
+### 1) 运行约束已锁定
+- 生产目标明确为 **no-docker**（服务器不可用 Docker）；
+- 当前策略：**先修代码再集中测试**（避免在中间阶段被长耗时任务打断）；
+- GPU 训练暂缓，仅做“训练前全链路就绪”。
+
+### 2) 本阶段已完成（Codex 并行回合）
+- `brisk-nudibranch`（数据/特征一致性）完成：
+  - 统一 no-docker 下模型/特征路径默认（`MODEL_DIR` 等）；
+  - 回测默认成本与运行参数对齐（`fee_bps=5.0`, `slippage_bps=3.0`）；
+  - `strict_asof` 生产路径改为显式可观测（不再静默吞掉对齐问题）。
+- `tidy-comet`（运维可靠性）完成：
+  - `monitoring/health_check.py` 对缺表/可选依赖更健壮；
+  - `monitoring/task_worker.py` 去除每任务 `asyncio.run` 反模式，改为持久事件循环；
+  - no-docker 预检/启动/readiness 脚本链路增强（含异步任务探活）。
+- `amber-trail`（安全硬化）完成：
+  - 新增 `backend/security_config.py` 和 `.env.example`；
+  - CORS 改为可配置 allowlist，规避 `* + credentials` 风险；
+  - 增加 `scripts/validate_security_hardening.sh` 与安全配置测试。
+
+### 3) 当前进行中（全仓深扫修复）
+- `lucky-nexus`：后端/推理/训练接口全仓逻辑修复（代码优先，不先跑全集测试）；
+- `briny-tidepool`：collector/scripts/monitoring/no-docker 全仓修复（长任务可靠性、超时脆弱点）。
+
+### 4) 门禁策略调整（本阶段原则）
+- 当前优先“可运行+可观测+可迭代”，硬门禁默认不阻断主流程；
+- 对齐/质量问题先以 **degraded/warn** 可见化，硬阻断改为可配置开关（仅在需要时启用）。
+
+### 5) 下一阶段交付目标
+- 全仓代码修复收敛后，统一做一次 no-gpu 联调验收：
+  1. 采集→入库→特征→推理→回测→任务队列→监控告警链路全部跑通；
+  2. 清理/统一脚本与默认值（避免 train/serve/backtest 三套口径）；
+  3. 最终状态收敛到“仅差 GPU 神经网络训练”。
+
+### 6) 2026-02-16 第二阶段成果（已完成）
+- **代码优先修复完成（两条全仓任务）**：
+  - `lucky-nexus`：后端/推理/训练契约一致性、软/硬门禁可配置、risk precheck 行为收敛；
+  - `briny-tidepool`：collector/scripts/monitoring/no-docker 长任务可靠性、异步任务轮询、超时与会话健壮性。
+- **策略方向明确**：
+  - 硬门禁默认不阻断（soft/degraded 优先可观测），硬阻断改为显式环境变量开关；
+  - no-docker 运维脚本作为主路径，docker 仅保留本地可选。
+- **数据侧下一优先级（已确认）**：
+  - 不是削减 Google 数据，而是扩充其他公开源（新闻+社媒+评论）；
+  - 特征工程继续细化，并强化时间对齐审计；
+  - 后续窗口目标延展到更长历史（含 2018 起可行性）。
+
+### 7) 版本管理约定（本阶段起强制）
+- 每个阶段性成果：
+  1. 更新 `TRACKING.md`（以最新阶段块为准）；
+  2. 整理仓库并提交 commit；
+  3. push 到 GitHub，保持远端与本地一致。
+
+---
+
 ## 📌 当前总览（截至 2026-02-15 15:10 UTC）
 
 1. **已完成**
@@ -27,6 +84,109 @@
 3. **上线判定**
 - 当前不满足“严格 Sharpe≥1.5”硬门禁，暂不进入 AutoDL `2×A100` 生产切换；
 - 仅建议继续 `paper + maintenance/prod_live` 校准与训练迭代。
+
+## ✅ 2026-02-15 23:03 UTC 训练数据全量准备（本轮，本地待服务器导入）
+
+1. **Top10 行情扩展到 2025-01-01 至今（1h）**
+- 新增 `scripts/ingest_bitget_market_bars.py` 时间区间参数：
+  - `--start` / `--end`（可替代相对 `--days`）
+- 已生成：
+  - `artifacts/server_bundle/market_bars_top10_1h_2025_now.csv`
+  - 覆盖 `BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK`
+  - 每币 `9862` 行，总 `98621` 行（含 header）
+  - 时间范围：`2025-01-01T00:00:00Z` -> `2026-02-15T21:00:00Z`
+
+2. **多信源事件回填数据包（2025-01-01 至今）**
+- 新增脚本：
+  - `scripts/build_multisource_events_2025.py`（Google News + GDELT + 官方/媒体 RSS）
+  - `scripts/build_google_news_events.py`（Google News 历史检索）
+  - `scripts/build_macro_news_events_2025.py`（宏观/新闻补充抓取）
+- 已生成并合并去重：
+  - `artifacts/server_bundle/events_multisource_2025_now.jsonl`
+  - 总 `10530` 条
+  - provider 分布：
+    - `google_news_rss`: `10304`
+    - `gdelt`: `138`
+    - `rss:sec`: `25`
+    - `rss:crypto_media`: `63`
+  - 时间范围：`2025-01-01T08:00:00Z` -> `2026-02-15T22:58:28.580930Z`
+
+3. **时间对齐与基础质量检查**
+- 生成：
+  - `artifacts/server_bundle/events_quality_2025_now.json`
+- 检查结果：
+  - `bad_ts=0`
+  - `available_before_occurred=0`
+  - `future_occurred_rows=0`
+  - `passed_basic_time_alignment=true`
+
+4. **服务器一键导入与审计链路**
+- 新增：
+  - `scripts/import_events_jsonl.py`（直连 DB 写入 canonical events）
+  - `scripts/server_import_2025_data.sh`（上传 + 导入 + 420d 审计）
+  - `scripts/prepare_training_data_2025_now.sh`（本地一键生成行情+事件训练包）
+
+5. **当前阻塞**
+- 服务器已关机，尚未执行远端导入与 420d 训练数据绿灯复核；
+- 待开机后执行：
+  - `SSHPASS=... bash scripts/server_import_2025_data.sh`
+
+## ✅ 2026-02-15 23:22 UTC 关键质量修复（5m主频 + 时序对齐 + 社交特征）
+
+1. **5m 主频数据完成并审计**
+- 已完成 `2025-01-01` 至今 Top10 `5m` 数据包：
+  - `artifacts/server_bundle/market_bars_top10_5m_2025_now.csv`
+  - 每币 `118358` 行，时间覆盖到 `2026-02-15T23:05:00Z`
+- 缺口审计：
+  - `artifacts/server_bundle/market_bars_top10_5m_2025_now_gaps.json`
+  - `total_missing_bars=0`，`all_green=true`
+
+2. **训练特征时序错位修复（严重问题已修）**
+- `training/feature_pipeline.py`：
+  - 先取主价格窗，再按该窗口查询 orderbook/funding/onchain/events；
+  - side 特征改为按窗口过滤（`range_start/range_end`），避免“主序列最新 + 侧特征最旧”的错位；
+  - `prices` fallback 默认 timeframe 从 `1h` 调整为“请求 timeframe”（可由 `LIQUID_PRICE_FALLBACK_TIMEFRAME` 覆盖）。
+
+3. **社交细粒度特征入模**
+- 新增/接入特征（在原 18 维后追加）：
+  - `source_tier_weight`, `source_confidence`
+  - `social_post_sentiment`, `social_comment_sentiment`
+  - `social_engagement_norm`, `social_influence_norm`
+  - `social_event_ratio`, `social_buzz`
+- 新特征 schema 版本：
+  - `feature_payload_schema_version = v2.2`
+- 涉及文件：
+  - `training/feature_pipeline.py`
+  - `training/liquid_model_trainer.py`
+  - `backend/v2_router.py`
+  - `scripts/run_bitget_2025_backtest.py`
+
+4. **社交信号管线并入（subagent 交付已验收）**
+- 新增连接器：
+  - `collector/connectors/social_x.py`
+  - `collector/connectors/social_reddit.py`
+  - `collector/connectors/social_youtube.py`
+  - `collector/connectors/social_telegram.py`
+- 历史回填/导入脚本：
+  - `scripts/backfill_social_history.py`
+  - `scripts/import_social_events_jsonl.py`
+- 最小测试：
+  - `backend/tests/test_social_collector_payload.py`
+  - `backend/tests/test_social_import_script.py`
+  - 本地通过：`5 passed`（含 `test_feature_decay_consistency.py`）
+
+5. **事件链接污染修复**
+- `collector/collector.py`：
+  - 默认关闭 `broad_crypto_fallback`（需显式 `ENABLE_BROAD_CRYPTO_FALLBACK_LINKS=1` 才启用）；
+  - 对 crypto 事件优先使用 `payload.symbol_mentions` 精确补实体，替代“全币种兜底”污染。
+
+6. **连接器依赖健壮性**
+- `feedparser` 缺失时不再导致链路崩溃：
+  - `collector/connectors/rss.py`
+  - `collector/connectors/macro_fred.py`
+  - `collector/connectors/social_youtube.py`
+  - `collector/connectors/social_telegram.py`
+  - 以上均增加了 requests+xml fallback。
 
 ## ✅ 2026-02-15 Top10资产池 + as-of快照 + 训练数据审计（本轮）
 
@@ -925,6 +1085,21 @@ CREATE OR REPLACE FUNCTION generate_training_samples(...);
 ## 📝 文档说明
 - 本文件 2026-02-15 以前的“P0/MVP修复记录”保留为历史追踪，不再代表当前门禁结论。
 - 当前是否可上实盘，统一以本文件顶部“当前总览”和 `README.md` 顶部“当前门禁快照”为准。
+
+## 2026-02-16 修复批次（针对 5m+多信源+双卡训练）
+- `training/feature_pipeline.py`：修复侧特征取数的“旧数据优先”风险，`orderbook/funding/onchain/events` 改为 `DESC LIMIT` 后再按时间升序回排，保证 limit 截断时优先保留最近窗口。
+- `scripts/build_multisource_events_2025.py`：`available_at/effective_at` 改为按来源+层级的确定性延迟模型（不再固定 `+10min`）；新增 `--max-google-share/--min-google-events` 源占比约束，降低 Google 单源偏科。
+- `scripts/build_google_news_events.py`、`scripts/build_macro_news_events_2025.py`：同步接入延迟模型并写入 `payload.availability_lag_minutes`。
+- `collector/connectors/social_common.py`：情绪规则增强（否定词、强度词、反讽标记、emoji 权重），减少纯词典打分失真。
+- `training/liquid_model_trainer.py`：补齐单机多卡 DDP 路径（`DistributedSampler`、梯度同步、checkpoint 仅主卡写、worker 非主卡不重复落库），并新增 DataLoader 预取参数（`TRAIN_NUM_WORKERS/TRAIN_PREFETCH_FACTOR/TRAIN_PIN_MEMORY`）。
+- `training/vc_model_trainer.py`：补充 DataLoader 并行与 non-blocking copy，减少 CPU→GPU 传输瓶颈。
+- `scripts/prepare_training_data_2025_now.sh`、`scripts/server_import_2025_data.sh`：加入源平衡参数与社媒 backfill 上传/导入流程，服务器导入后自动输出 source mix 快照。
+- `scripts/train_gpu_stage2.py`：成本估算修正为“2*A100 总小时价”，避免重复乘 2。
+
+### 本地自测结果（2026-02-16）
+- `python3 -m py_compile`：通过（本批所有改动脚本/模块）。
+- `pytest -q backend/tests/test_build_multisource_events_quality.py backend/tests/test_social_sentiment_rules.py backend/tests/test_social_collector_payload.py backend/tests/test_social_import_script.py backend/tests/test_feature_decay_consistency.py`：`9 passed`。
+- 待服务器侧验证：2025 全年 + 2026 至今全量回测、硬指标门禁、DDP 真实吞吐与耗时。
 
 <!-- AUTO_STATUS_SNAPSHOT:BEGIN -->
 ### Auto Snapshot (2026-02-15 14:18 UTC)

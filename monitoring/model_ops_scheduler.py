@@ -5,22 +5,23 @@ Model Ops Scheduler
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
-import logging
 from datetime import datetime, timezone
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 TRACKS = [t.strip() for t in os.getenv("MODEL_OPS_TRACKS", "liquid").split(",") if t.strip()]
-DRIFT_INTERVAL_SEC = int(os.getenv("DRIFT_INTERVAL_SEC", "900"))
-GATE_INTERVAL_SEC = int(os.getenv("GATE_INTERVAL_SEC", "3600"))
-ROLLBACK_INTERVAL_SEC = int(os.getenv("ROLLBACK_INTERVAL_SEC", "900"))
-TIMEOUT_SEC = float(os.getenv("MODEL_OPS_TIMEOUT_SEC", "8"))
+DRIFT_INTERVAL_SEC = max(10, int(os.getenv("DRIFT_INTERVAL_SEC", "900")))
+GATE_INTERVAL_SEC = max(10, int(os.getenv("GATE_INTERVAL_SEC", "3600")))
+ROLLBACK_INTERVAL_SEC = max(10, int(os.getenv("ROLLBACK_INTERVAL_SEC", "900")))
 WEEKLY_GATE_MODE = os.getenv("WEEKLY_GATE_MODE", "1").lower() in {"1", "true", "yes", "y"}
 GATE_WEEKDAY = int(os.getenv("GATE_WEEKDAY", "1"))  # Monday=1
 GATE_HOUR_UTC = int(os.getenv("GATE_HOUR_UTC", "2"))
@@ -46,6 +47,30 @@ MODEL_NAME_LIQUID = os.getenv("MODEL_NAME_LIQUID", "liquid_ttm_ensemble")
 MODEL_VERSION_LIQUID = os.getenv("MODEL_VERSION_LIQUID", "v2.1")
 MODEL_NAME_VC = os.getenv("MODEL_NAME_VC", "vc_survival_model")
 MODEL_VERSION_VC = os.getenv("MODEL_VERSION_VC", "v2.1")
+HTTP_CONNECT_TIMEOUT_SEC = max(0.2, float(os.getenv("MODEL_OPS_CONNECT_TIMEOUT_SEC", "3.0")))
+HTTP_READ_TIMEOUT_SEC = max(0.5, float(os.getenv("MODEL_OPS_READ_TIMEOUT_SEC", "12.0")))
+HTTP_MAX_RETRIES = max(0, int(os.getenv("MODEL_OPS_HTTP_MAX_RETRIES", "2")))
+HTTP_BACKOFF_SEC = max(0.0, float(os.getenv("MODEL_OPS_HTTP_BACKOFF_SEC", "0.6")))
+
+
+def _http_session() -> requests.Session:
+    sess = requests.Session()
+    retry = Retry(
+        total=HTTP_MAX_RETRIES,
+        connect=HTTP_MAX_RETRIES,
+        read=HTTP_MAX_RETRIES,
+        backoff_factor=HTTP_BACKOFF_SEC,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+
+HTTP = _http_session()
 
 
 def _track_model(track: str) -> tuple[str, str]:
@@ -71,14 +96,14 @@ def _audit_log(track: str, action: str, window: dict, thresholds: dict, decision
 
 def _post(path: str, payload: dict) -> dict:
     url = f"{API_BASE}{path}"
-    resp = requests.post(url, json=payload, timeout=TIMEOUT_SEC)
+    resp = HTTP.post(url, json=payload, timeout=(HTTP_CONNECT_TIMEOUT_SEC, HTTP_READ_TIMEOUT_SEC))
     resp.raise_for_status()
     return resp.json() if resp.content else {}
 
 
 def _get(path: str, params: dict | None = None) -> dict:
     url = f"{API_BASE}{path}"
-    resp = requests.get(url, params=params or {}, timeout=TIMEOUT_SEC)
+    resp = HTTP.get(url, params=params or {}, timeout=(HTTP_CONNECT_TIMEOUT_SEC, HTTP_READ_TIMEOUT_SEC))
     resp.raise_for_status()
     return resp.json() if resp.content else {}
 
@@ -252,34 +277,50 @@ def _run_rollback(track: str):
 
 
 def main():
-    logger.info("model-ops scheduler started tracks=%s", TRACKS)
-    now = datetime.now(timezone.utc).timestamp()
-    next_drift = {track: now for track in TRACKS}
-    next_gate = {track: now for track in TRACKS}
-    gate_week_marker = {track: "" for track in TRACKS}
-    next_rollback = {track: now for track in TRACKS}
-    while True:
-        now = datetime.now(timezone.utc).timestamp()
-        for track in TRACKS:
-            if now >= next_drift[track]:
-                _run_drift(track)
-                next_drift[track] = now + DRIFT_INTERVAL_SEC
-            if now >= next_gate[track]:
-                if WEEKLY_GATE_MODE:
-                    dt = datetime.now(timezone.utc)
-                    marker = f"{dt.isocalendar().year}-W{dt.isocalendar().week}"
-                    is_gate_slot = dt.isoweekday() == GATE_WEEKDAY and dt.hour == GATE_HOUR_UTC and dt.minute < 5
-                    if is_gate_slot and gate_week_marker[track] != marker:
+    tracks = TRACKS or ["liquid"]
+    logger.info("model-ops scheduler started tracks=%s", tracks)
+
+    now_mono = time.monotonic()
+    next_drift = {track: now_mono for track in tracks}
+    next_gate = {track: now_mono for track in tracks}
+    gate_week_marker = {track: "" for track in tracks}
+    next_rollback = {track: now_mono for track in tracks}
+
+    try:
+        while True:
+            now_mono = time.monotonic()
+            next_wakeup = now_mono + 60.0
+
+            for track in tracks:
+                if now_mono >= next_drift[track]:
+                    _run_drift(track)
+                    next_drift[track] = now_mono + DRIFT_INTERVAL_SEC
+
+                if now_mono >= next_gate[track]:
+                    if WEEKLY_GATE_MODE:
+                        dt = datetime.now(timezone.utc)
+                        marker = f"{dt.isocalendar().year}-W{dt.isocalendar().week}"
+                        is_gate_slot = dt.isoweekday() == GATE_WEEKDAY and dt.hour == GATE_HOUR_UTC and dt.minute < 5
+                        if is_gate_slot and gate_week_marker[track] != marker:
+                            _run_gate(track)
+                            gate_week_marker[track] = marker
+                        next_gate[track] = now_mono + 60.0
+                    else:
                         _run_gate(track)
-                        gate_week_marker[track] = marker
-                    next_gate[track] = now + 60
-                else:
-                    _run_gate(track)
-                    next_gate[track] = now + GATE_INTERVAL_SEC
-            if now >= next_rollback[track]:
-                _run_rollback(track)
-                next_rollback[track] = now + ROLLBACK_INTERVAL_SEC
-        time.sleep(1)
+                        next_gate[track] = now_mono + GATE_INTERVAL_SEC
+
+                if now_mono >= next_rollback[track]:
+                    _run_rollback(track)
+                    next_rollback[track] = now_mono + ROLLBACK_INTERVAL_SEC
+
+                next_wakeup = min(next_wakeup, next_drift[track], next_gate[track], next_rollback[track])
+
+            sleep_for = max(0.2, min(2.0, next_wakeup - time.monotonic()))
+            time.sleep(sleep_for)
+    except KeyboardInterrupt:
+        logger.info("model-ops scheduler stopped by signal")
+    finally:
+        HTTP.close()
 
 
 if __name__ == "__main__":

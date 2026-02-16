@@ -39,7 +39,8 @@ def _check_module(module_name: str, env: Dict[str, str]) -> Dict[str, Any]:
 
 def _estimate_cost_cny(hours: float, compute_tier: str, a100_hourly_cny: float, billing_discount: float) -> float:
     if compute_tier == "a100x2":
-        return round(float(hours) * float(a100_hourly_cny) * 2.0 * float(max(0.0, billing_discount)), 2)
+        # a100_hourly_cny is interpreted as the full dual-GPU hourly bill.
+        return round(float(hours) * float(a100_hourly_cny) * float(max(0.0, billing_discount)), 2)
     return 0.0
 
 
@@ -88,6 +89,11 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
+    repo_root = Path(__file__).resolve().parents[1]
+    env.setdefault("MODEL_DIR", str(repo_root / "backend" / "models"))
+    env.setdefault("FEATURE_VERSION", "feature-store-v2.1")
+    env.setdefault("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.2")
+    env.setdefault("DATA_VERSION", "v1")
     env["LIQUID_SYMBOLS"] = str(args.symbols)
     env["LIQUID_EPOCHS"] = str(int(args.epochs))
     env["LIQUID_BATCH_SIZE"] = str(int(args.batch_size))

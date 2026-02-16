@@ -18,7 +18,7 @@ def _get_symbols() -> List[str]:
 
 
 def main() -> None:
-    db_url = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
+    db_url = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
     symbols = _get_symbols()
     conn = psycopg2.connect(db_url)
     conn.autocommit = False

@@ -5,6 +5,7 @@ import os
 import random
 import hashlib
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
@@ -13,8 +14,11 @@ from psycopg2.extras import RealDictCursor
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-from feature_pipeline import FeaturePipeline
+from feature_pipeline import FeaturePipeline, LIQUID_FEATURE_SCHEMA_VERSION
 from validation import evaluate_regression_oos, purged_kfold_slices, summarize_fold_metrics, walk_forward_slices
 
 try:
@@ -23,8 +27,20 @@ try:
 except Exception:
     HAS_LGB = False
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
-MODEL_DIR = "/app/models"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
+
+
+def _default_model_dir() -> str:
+    env_path = str(os.getenv("MODEL_DIR", "")).strip()
+    if env_path:
+        return env_path
+    repo_models = Path(__file__).resolve().parents[1] / "backend" / "models"
+    if repo_models.exists():
+        return str(repo_models)
+    return "/app/models"
+
+
+MODEL_DIR = _default_model_dir()
 GRAD_ACC_STEPS = int(os.getenv("TRAIN_GRAD_ACC_STEPS", "4"))
 EPOCHS = int(os.getenv("LIQUID_EPOCHS", "14"))
 BATCH_SIZE = int(os.getenv("LIQUID_BATCH_SIZE", "128"))
@@ -40,6 +56,13 @@ PKF_SPLITS = int(os.getenv("LIQUID_PURGED_KFOLD_SPLITS", "5"))
 PKF_PURGE_WINDOW = int(os.getenv("LIQUID_PURGED_KFOLD_PURGE", "12"))
 FEATURE_VERSION = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
 DATA_VERSION = os.getenv("DATA_VERSION", "v1")
+TRAIN_NUM_WORKERS = int(os.getenv("TRAIN_NUM_WORKERS", "4"))
+TRAIN_PREFETCH_FACTOR = int(os.getenv("TRAIN_PREFETCH_FACTOR", "4"))
+TRAIN_PIN_MEMORY = os.getenv("TRAIN_PIN_MEMORY", "1").lower() in {"1", "true", "yes", "y"}
+LIQUID_SYMBOL_DDP = os.getenv("LIQUID_SYMBOL_DDP", "1").lower() in {"1", "true", "yes", "y"}
+TRAIN_DQ_GATE_MODE = str(os.getenv("TRAIN_DQ_GATE_MODE", "soft")).strip().lower()
+LIQUID_DQ_GATE_MODE = str(os.getenv("LIQUID_DQ_GATE_MODE", TRAIN_DQ_GATE_MODE)).strip().lower()
+LIQUID_DQ_HARD_BLOCK = os.getenv("LIQUID_DQ_HARD_BLOCK", "").strip().lower() in {"1", "true", "yes", "y"}
 
 
 class MixerBlock(nn.Module):
@@ -130,10 +153,55 @@ class LiquidModelTrainer:
             return torch.device(f"cuda:{self.local_rank}")
         return torch.device("cuda")
 
+    def _is_distributed(self) -> bool:
+        return bool(self.world_size > 1 and dist.is_available() and dist.is_initialized())
+
+    def _ddp_enabled(self) -> bool:
+        return bool(self._is_distributed() and LIQUID_SYMBOL_DDP)
+
+    def _is_primary(self) -> bool:
+        return int(self.rank) == 0
+
+    def _barrier(self) -> None:
+        if not self._is_distributed():
+            return
+        if torch.cuda.is_available() and self.local_rank >= 0:
+            dist.barrier(device_ids=[self.local_rank])
+        else:
+            dist.barrier()
+
+    def _maybe_allreduce_mean(self, val: float, count: int, device: torch.device) -> float:
+        if not self._is_distributed():
+            return float(val / max(1, count))
+        total = torch.tensor(float(val), dtype=torch.float64, device=device)
+        n = torch.tensor(float(count), dtype=torch.float64, device=device)
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(n, op=dist.ReduceOp.SUM)
+        denom = float(n.item())
+        if denom <= 0:
+            return float("inf")
+        return float(total.item() / denom)
+
+    def _loader_kwargs(self, device: torch.device) -> Dict[str, object]:
+        workers = max(0, int(TRAIN_NUM_WORKERS))
+        kwargs: Dict[str, object] = {
+            "num_workers": workers,
+            "pin_memory": bool(TRAIN_PIN_MEMORY and device.type == "cuda"),
+        }
+        if workers > 0:
+            kwargs["prefetch_factor"] = max(2, int(TRAIN_PREFETCH_FACTOR))
+            kwargs["persistent_workers"] = True
+        return kwargs
+
     def _symbols_for_rank(self) -> List[str]:
-        if self.world_size <= 1:
+        if self.world_size <= 1 or self._ddp_enabled():
             return list(self.symbols)
         return [symbol for idx, symbol in enumerate(self.symbols) if idx % self.world_size == self.rank]
+
+    @staticmethod
+    def _ridge_weights(x_train: np.ndarray, y_train: np.ndarray) -> np.ndarray:
+        reg = np.eye(x_train.shape[1], dtype=np.float64) * 1e-3
+        return np.linalg.pinv(x_train.T @ x_train + reg) @ x_train.T @ y_train
 
     @staticmethod
     def _to_sequence(xn: np.ndarray) -> np.ndarray:
@@ -152,9 +220,13 @@ class LiquidModelTrainer:
         return seq.astype(np.float32)
 
     def _fit_lightgbm(self, x_train: np.ndarray, y_train: np.ndarray, x_pred: np.ndarray) -> tuple[np.ndarray, str, Dict]:
+        ridge_w = self._ridge_weights(x_train, y_train)
         if not HAS_LGB:
-            w = np.linalg.pinv(x_train.T @ x_train + np.eye(x_train.shape[1]) * 1e-3) @ x_train.T @ y_train
-            return (x_pred @ w).astype(np.float32), "ridge_fallback", {"model": "ridge_fallback", "weights": w.astype(np.float32).tolist()}
+            return (
+                (x_pred @ ridge_w).astype(np.float32),
+                "ridge_fallback",
+                {"model": "ridge_fallback", "weights": ridge_w.astype(np.float32).tolist()},
+            )
         try:
             reg = lgb.LGBMRegressor(
                 n_estimators=500,
@@ -167,10 +239,24 @@ class LiquidModelTrainer:
             )
             reg.fit(x_train, y_train)
             booster = reg.booster_.model_to_string() if hasattr(reg, "booster_") and reg.booster_ is not None else ""
-            return reg.predict(x_pred).astype(np.float32), "lightgbm", {"model": "lightgbm", "booster_model": booster}
+            return (
+                reg.predict(x_pred).astype(np.float32),
+                "lightgbm",
+                {
+                    "model": "lightgbm",
+                    "booster_model": booster,
+                    # Keep a deterministic linear surrogate so runtime/backtest can still score
+                    # when LightGBM native runtime is unavailable.
+                    "weights": ridge_w.astype(np.float32).tolist(),
+                    "runtime_fallback": "ridge_linear_surrogate",
+                },
+            )
         except Exception:
-            w = np.linalg.pinv(x_train.T @ x_train + np.eye(x_train.shape[1]) * 1e-3) @ x_train.T @ y_train
-            return (x_pred @ w).astype(np.float32), "ridge_fallback", {"model": "ridge_fallback", "weights": w.astype(np.float32).tolist()}
+            return (
+                (x_pred @ ridge_w).astype(np.float32),
+                "ridge_fallback",
+                {"model": "ridge_fallback", "weights": ridge_w.astype(np.float32).tolist()},
+            )
 
     def train_symbol(self, symbol: str) -> Dict:
         self._set_seed(SEED + self.rank)
@@ -203,15 +289,27 @@ class LiquidModelTrainer:
             dq_failed_reasons.append("duplicate_rate_exceeded")
         if float(dq.get("stale_ratio", 0.0)) > float(os.getenv("DQ_MAX_STALE_RATIO", "0.1")):
             dq_failed_reasons.append("stale_ratio_exceeded")
+        dq_degraded = False
         if dq.get("quality_passed", 0.0) < 0.5:
             if float(dq.get("total_rows", 0.0)) < float(dq.get("required_rows", 0.0)):
                 dq_failed_reasons.append("insufficient_rows")
-            return {
-                "symbol": symbol,
-                "status": "blocked_by_data_quality",
-                "reason": ",".join(dq_failed_reasons) or "quality_gate_failed",
-                "timeframe": selected_tf,
-                "data_quality": dq,
+            gate_mode = LIQUID_DQ_GATE_MODE if LIQUID_DQ_GATE_MODE in {"soft", "hard"} else "soft"
+            hard_block = bool(LIQUID_DQ_HARD_BLOCK or gate_mode == "hard")
+            if hard_block:
+                return {
+                    "symbol": symbol,
+                    "status": "blocked_by_data_quality",
+                    "reason": ",".join(dq_failed_reasons) or "quality_gate_failed",
+                    "timeframe": selected_tf,
+                    "data_quality": dq,
+                    "dq_gate_mode": "hard",
+                }
+            dq_degraded = True
+            dq = {
+                **dq,
+                "dq_gate_mode": "soft",
+                "dq_degraded": True,
+                "dq_failed_reasons": dq_failed_reasons,
             }
 
         batch = self.pipeline.load_liquid_training_batch(symbol=symbol, limit=4000, timeframe=selected_tf)
@@ -240,18 +338,27 @@ class LiquidModelTrainer:
                 "orderbook_missing_flag": float(r[15]) if len(r) > 15 else 1.0,
                 "funding_missing_flag": float(r[16]) if len(r) > 16 else 1.0,
                 "onchain_missing_flag": float(r[17]) if len(r) > 17 else 1.0,
-                "feature_payload_schema_version": "v2.1",
+                "source_tier_weight": float(r[18]) if len(r) > 18 else 0.0,
+                "source_confidence": float(r[19]) if len(r) > 19 else 0.0,
+                "social_post_sentiment": float(r[20]) if len(r) > 20 else 0.0,
+                "social_comment_sentiment": float(r[21]) if len(r) > 21 else 0.0,
+                "social_engagement_norm": float(r[22]) if len(r) > 22 else 0.0,
+                "social_influence_norm": float(r[23]) if len(r) > 23 else 0.0,
+                "social_event_ratio": float(r[24]) if len(r) > 24 else 0.0,
+                "social_buzz": float(r[25]) if len(r) > 25 else 0.0,
+                "feature_payload_schema_version": LIQUID_FEATURE_SCHEMA_VERSION,
             }
             for r in X
         ]
-        self.pipeline.save_feature_snapshots_bulk(
-            target=symbol.upper(),
-            track="liquid",
-            feature_rows=feature_rows,
-            version=FEATURE_VERSION,
-            lineage_id=train_lineage_id,
-            data_version=DATA_VERSION,
-        )
+        if (not self._ddp_enabled()) or self._is_primary():
+            self.pipeline.save_feature_snapshots_bulk(
+                target=symbol.upper(),
+                track="liquid",
+                feature_rows=feature_rows,
+                version=FEATURE_VERSION,
+                lineage_id=train_lineage_id,
+                data_version=DATA_VERSION,
+            )
         label_1h = batch.extra_labels.get("fwd_ret_1h", y) if batch.extra_labels else y
         label_4h = batch.extra_labels.get("fwd_ret_4h", y) if batch.extra_labels else y
         n = X.shape[0]
@@ -313,6 +420,13 @@ class LiquidModelTrainer:
         n_channels = int(seq.shape[2])
         device = self._resolve_device()
         model = TSMixerLiquidModel(n_tokens=n_tokens, n_channels=n_channels, n_blocks=2).to(device)
+        if self._ddp_enabled():
+            model = DDP(
+                model,
+                device_ids=[self.local_rank] if device.type == "cuda" else None,
+                output_device=self.local_rank if device.type == "cuda" else None,
+            )
+        raw_model = model.module if isinstance(model, DDP) else model
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
         mse_loss = nn.MSELoss()
         scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
@@ -325,29 +439,71 @@ class LiquidModelTrainer:
         tt = torch.tensor(teacher, dtype=torch.float32)
         train_ds = TensorDataset(x_train, y_train_t, tt[train_idx])
         val_ds = TensorDataset(x_val, y_val_t, tt[val_idx])
+        train_sampler = None
+        val_sampler = None
+        if self._ddp_enabled():
+            train_sampler = DistributedSampler(
+                train_ds,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+                drop_last=False,
+            )
+            val_sampler = DistributedSampler(
+                val_ds,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False,
+                drop_last=False,
+            )
+        loader_kwargs = self._loader_kwargs(device)
         train_bs = BATCH_SIZE
         ckpt_path = os.path.join(MODEL_DIR, f"liquid_{symbol.lower()}_checkpoint.pt")
         best_val = float("inf")
         best_epoch = 0
         bad_epochs = 0
         start_epoch = 0
-        if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(ckpt["model_state"])
-            opt.load_state_dict(ckpt["optimizer_state"])
-            start_epoch = int(ckpt.get("epoch", 0)) + 1
-            best_val = float(ckpt.get("best_val", best_val))
+        ckpt_payload = None
+        if self._ddp_enabled():
+            if self._is_primary() and os.path.exists(ckpt_path):
+                ckpt_payload = torch.load(ckpt_path, map_location=device)
+            payload_box = [ckpt_payload]
+            dist.broadcast_object_list(payload_box, src=0)
+            ckpt_payload = payload_box[0]
+        elif os.path.exists(ckpt_path):
+            ckpt_payload = torch.load(ckpt_path, map_location=device)
+        if isinstance(ckpt_payload, dict):
+            raw_model.load_state_dict(ckpt_payload["model_state"])
+            opt.load_state_dict(ckpt_payload["optimizer_state"])
+            start_epoch = int(ckpt_payload.get("epoch", 0)) + 1
+            best_val = float(ckpt_payload.get("best_val", best_val))
 
         for epoch in range(start_epoch, EPOCHS):
-            train_dl = DataLoader(train_ds, batch_size=train_bs, shuffle=False, drop_last=False)
-            val_dl = DataLoader(val_ds, batch_size=train_bs, shuffle=False, drop_last=False)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            train_dl = DataLoader(
+                train_ds,
+                batch_size=train_bs,
+                shuffle=bool(train_sampler is None),
+                sampler=train_sampler,
+                drop_last=False,
+                **loader_kwargs,
+            )
+            val_dl = DataLoader(
+                val_ds,
+                batch_size=train_bs,
+                shuffle=False,
+                sampler=val_sampler,
+                drop_last=False,
+                **loader_kwargs,
+            )
             model.train()
             opt.zero_grad(set_to_none=True)
             try:
                 for step, (bx, by, bt) in enumerate(train_dl, start=1):
-                    bx = bx.to(device)
-                    by = by.to(device)
-                    bt = bt.to(device)
+                    bx = bx.to(device, non_blocking=True)
+                    by = by.to(device, non_blocking=True)
+                    bt = bt.to(device, non_blocking=True)
                     with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                         pred = model(bx)
                         sup = mse_loss(pred, by)
@@ -373,41 +529,68 @@ class LiquidModelTrainer:
 
             model.eval()
             with torch.no_grad():
-                val_losses = []
+                val_loss_sum = 0.0
+                val_n = 0
                 for bx, by, bt in val_dl:
-                    bx = bx.to(device)
-                    by = by.to(device)
-                    bt = bt.to(device)
+                    bx = bx.to(device, non_blocking=True)
+                    by = by.to(device, non_blocking=True)
+                    bt = bt.to(device, non_blocking=True)
                     pred = model(bx)
                     lv = 0.85 * mse_loss(pred, by) + 0.15 * mse_loss(pred, bt)
-                    val_losses.append(float(lv.item()))
-                val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
+                    cur_n = int(bx.shape[0])
+                    val_loss_sum += float(lv.item()) * max(1, cur_n)
+                    val_n += max(1, cur_n)
+                val_loss = self._maybe_allreduce_mean(val_loss_sum, val_n, device=device)
                 scheduler.step(val_loss)
             if val_loss < best_val:
                 best_val = val_loss
                 best_epoch = epoch
                 bad_epochs = 0
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "best_val": best_val,
-                        "model_state": model.state_dict(),
-                        "optimizer_state": opt.state_dict(),
-                    },
-                    ckpt_path,
-                )
+                if (not self._ddp_enabled()) or self._is_primary():
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "best_val": best_val,
+                            "model_state": raw_model.state_dict(),
+                            "optimizer_state": opt.state_dict(),
+                        },
+                        ckpt_path,
+                    )
             else:
                 bad_epochs += 1
-                if bad_epochs >= PATIENCE:
-                    break
+            should_stop = int(bad_epochs >= PATIENCE)
+            if self._is_distributed():
+                stop_tensor = torch.tensor([should_stop], dtype=torch.int64, device=device)
+                dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
+                should_stop = int(stop_tensor.item())
+            if should_stop:
+                break
 
-        if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(ckpt["model_state"])
+        final_ckpt = None
+        if self._ddp_enabled():
+            if self._is_primary() and os.path.exists(ckpt_path):
+                final_ckpt = torch.load(ckpt_path, map_location=device)
+            payload_box = [final_ckpt]
+            dist.broadcast_object_list(payload_box, src=0)
+            final_ckpt = payload_box[0]
+        elif os.path.exists(ckpt_path):
+            final_ckpt = torch.load(ckpt_path, map_location=device)
+        if isinstance(final_ckpt, dict):
+            raw_model.load_state_dict(final_ckpt["model_state"])
 
-        model.eval()
+        if self._ddp_enabled() and (not self._is_primary()):
+            return {
+                "symbol": symbol,
+                "status": "ddp_worker_done",
+                "timeframe": selected_tf,
+                "samples": int(X.shape[0]),
+                "rank": self.rank,
+                "world_size": self.world_size,
+            }
+
+        raw_model.eval()
         with torch.no_grad():
-            pred_nn = model(x_val.to(device)).detach().cpu().numpy()
+            pred_nn = raw_model(x_val.to(device, non_blocking=True)).detach().cpu().numpy()
             nn_mse = float(np.mean((pred_nn - y_val) ** 2))
             distill_gap = float(np.mean(np.abs(pred_nn - teacher[val_idx])))
             directional_hit = float(np.mean(np.sign(pred_nn) == np.sign(y_val)))
@@ -451,7 +634,7 @@ class LiquidModelTrainer:
         model_version_nn = "v2.1"
         torch.save(
             {
-                "state_dict": model.state_dict(),
+                "state_dict": raw_model.state_dict(),
                 "n_tokens": n_tokens,
                 "n_channels": n_channels,
                 "trained_at": created_at,
@@ -459,7 +642,7 @@ class LiquidModelTrainer:
                 "seed": SEED,
                 "normalization": {"x_mean": x_mean.flatten().tolist(), "x_std": x_std.flatten().tolist()},
                 "ensemble_alpha": float(ensemble_alpha),
-                "feature_payload_schema_version": "v2.1",
+                "feature_payload_schema_version": LIQUID_FEATURE_SCHEMA_VERSION,
                 "feature_version": FEATURE_VERSION,
                 "data_version": DATA_VERSION,
                 "train_report_hash": "",
@@ -487,7 +670,10 @@ class LiquidModelTrainer:
             "created_at": created_at,
             "feature_version": FEATURE_VERSION,
             "data_version": DATA_VERSION,
-            "feature_payload_schema_version": "v2.1",
+            "feature_payload_schema_version": LIQUID_FEATURE_SCHEMA_VERSION,
+            "dq_degraded": bool(dq_degraded),
+            "dq_gate_mode": "hard" if (LIQUID_DQ_HARD_BLOCK or LIQUID_DQ_GATE_MODE == "hard") else "soft",
+            "dq_failed_reasons": dq_failed_reasons,
         }
         train_report_hash = hashlib.sha256(
             json.dumps(train_manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -495,7 +681,7 @@ class LiquidModelTrainer:
         train_manifest["train_report_hash"] = train_report_hash
         torch.save(
             {
-                "state_dict": model.state_dict(),
+                "state_dict": raw_model.state_dict(),
                 "n_tokens": n_tokens,
                 "n_channels": n_channels,
                 "trained_at": created_at,
@@ -503,7 +689,7 @@ class LiquidModelTrainer:
                 "seed": SEED,
                 "normalization": {"x_mean": x_mean.flatten().tolist(), "x_std": x_std.flatten().tolist()},
                 "ensemble_alpha": float(ensemble_alpha),
-                "feature_payload_schema_version": "v2.1",
+                "feature_payload_schema_version": LIQUID_FEATURE_SCHEMA_VERSION,
                 "feature_version": FEATURE_VERSION,
                 "data_version": DATA_VERSION,
                 "train_report_hash": train_report_hash,
@@ -524,7 +710,7 @@ class LiquidModelTrainer:
                     "created_at": created_at,
                     "feature_version": FEATURE_VERSION,
                     "data_version": DATA_VERSION,
-                    "feature_payload_schema_version": "v2.1",
+                    "feature_payload_schema_version": LIQUID_FEATURE_SCHEMA_VERSION,
                     "n_tokens": n_tokens,
                     "n_channels": n_channels,
                     "ensemble_alpha": float(ensemble_alpha),
@@ -563,6 +749,8 @@ class LiquidModelTrainer:
                                 "walk_forward": wf_metrics,
                                 "purged_kfold": pkf_metrics,
                                 "data_quality": dq,
+                                "dq_degraded": bool(dq_degraded),
+                                "dq_failed_reasons": dq_failed_reasons,
                             }
                         ),
                     ),
@@ -603,6 +791,8 @@ class LiquidModelTrainer:
                                 "train_report_hash": train_report_hash,
                                 "checkpoint_manifest_path": nn_manifest_path,
                                 "data_quality": dq,
+                                "dq_degraded": bool(dq_degraded),
+                                "dq_failed_reasons": dq_failed_reasons,
                             }
                         ),
                     ),
@@ -632,6 +822,8 @@ class LiquidModelTrainer:
             "train_report_hash": train_report_hash,
             "checkpoint_manifest_path": nn_manifest_path,
             "data_quality": dq,
+            "dq_degraded": bool(dq_degraded),
+            "dq_failed_reasons": dq_failed_reasons,
         }
 
     def train_all(self) -> Dict:
@@ -644,7 +836,12 @@ class LiquidModelTrainer:
                 "assigned_symbols": [],
                 "results": [],
             }
-        results = [self.train_symbol(symbol) for symbol in assigned]
+        results: List[Dict] = []
+        for symbol in assigned:
+            result = self.train_symbol(symbol)
+            if (not self._ddp_enabled()) or self._is_primary():
+                results.append(result)
+            self._barrier()
         return {
             "status": "ok",
             "rank": self.rank,

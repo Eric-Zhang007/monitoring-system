@@ -3,8 +3,13 @@ from __future__ import annotations
 import datetime as dt
 from email.utils import parsedate_to_datetime
 from typing import Dict, List
+import xml.etree.ElementTree as ET
 
-import feedparser
+import requests
+try:
+    import feedparser  # type: ignore
+except Exception:  # pragma: no cover
+    feedparser = None
 
 from connectors.base import BaseConnector
 
@@ -19,9 +24,30 @@ class MacroFREDConnector(BaseConnector):
         rows: List[Dict] = []
         for rid in self.release_ids:
             url = f"https://fred.stlouisfed.org/releases?rid={rid}&output=1"
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:20]:
-                rows.append({"rid": rid, "entry": entry, "feed_url": url})
+            if feedparser is not None:
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:20]:
+                    rows.append({"rid": rid, "entry": entry, "feed_url": url})
+                continue
+            try:
+                resp = requests.get(url, timeout=20)
+                resp.raise_for_status()
+                root = ET.fromstring(resp.text)
+            except Exception:
+                continue
+            for item in root.findall(".//item")[:20]:
+                rows.append(
+                    {
+                        "rid": rid,
+                        "feed_url": url,
+                        "entry": {
+                            "title": (item.findtext("title") or "").strip(),
+                            "summary": (item.findtext("description") or "").strip(),
+                            "link": (item.findtext("link") or "").strip(),
+                            "published": (item.findtext("pubDate") or "").strip(),
+                        },
+                    }
+                )
         return rows
 
     def normalize(self, raw: Dict) -> Dict:

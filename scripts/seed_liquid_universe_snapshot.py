@@ -9,7 +9,7 @@ from typing import List
 
 import psycopg2
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor:change_me_please@localhost:5432/monitor")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
 DEFAULT_TOP10 = "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"
 
 

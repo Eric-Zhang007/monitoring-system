@@ -63,7 +63,7 @@ def test_strict_asof_alignment_does_not_use_future_feature():
     assert out["alignment_audit"]["alignment_mode_applied"] == "strict_asof"
 
 
-def test_strict_asof_without_timestamps_falls_back_and_fails_leakage_gate():
+def test_strict_asof_without_timestamps_fails_with_alignment_audit():
     features = [{"feature_payload": {"ret_12": 0.001, "vol_12": 0.01, "vol_48": 0.01}, "lineage_id": "ln0"} for _ in range(30)]
     prices = [{"price": 100.0 + i * 0.1, "volume": 1000.0 + i} for i in range(31)]
     out = router_mod._run_model_replay_backtest(
@@ -74,12 +74,14 @@ def test_strict_asof_without_timestamps_falls_back_and_fails_leakage_gate():
         alignment_mode="strict_asof",
         alignment_version="strict_asof_v1",
     )
-    assert out["status"] == "completed"
-    assert "fallback" in str(out["alignment_audit"]["alignment_mode_applied"])
+    assert out["status"] == "failed"
+    assert out["reason"] == "insufficient_aligned_samples"
+    assert out["alignment_audit"]["fail_fast"] is True
+    assert out["alignment_audit"]["fail_fast_reason"] == "missing_price_timestamps"
     assert out["leakage_checks"]["passed"] is False
 
 
-def test_strict_asof_fail_fast_blocks_legacy_fallback():
+def test_strict_asof_fail_fast_blocks_alignment_when_timestamps_missing():
     features = [{"feature_payload": {"ret_12": 0.001, "vol_12": 0.01, "vol_48": 0.01}, "lineage_id": "ln0"} for _ in range(30)]
     prices = [{"price": 100.0 + i * 0.1, "volume": 1000.0 + i} for i in range(31)]
     out = router_mod._run_model_replay_backtest(
@@ -92,6 +94,6 @@ def test_strict_asof_fail_fast_blocks_legacy_fallback():
         strict_asof_fail_fast=True,
     )
     assert out["status"] == "failed"
-    assert str(out["reason"]).startswith("strict_asof_legacy_fallback_blocked:")
+    assert str(out["reason"]).startswith("strict_asof_alignment_fail_fast:")
     assert out["alignment_audit"]["fail_fast"] is True
     assert out["leakage_checks"]["passed"] is False

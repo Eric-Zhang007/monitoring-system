@@ -93,7 +93,7 @@ def main() -> int:
     ap.add_argument("--score-source", default="model", choices=["model", "heuristic"])
     ap.add_argument("--require-model-artifact", action="store_true")
     ap.add_argument("--signal-polarity-mode", default="auto_train_ic", choices=["normal", "auto_train_ic", "auto_train_pnl"])
-    ap.add_argument("--alignment-mode", default="strict_asof", choices=["strict_asof", "legacy_index"])
+    ap.add_argument("--alignment-mode", default="strict_asof", choices=["strict_asof"])
     ap.add_argument("--alignment-version", default="strict_asof_v1")
     ap.add_argument("--max-feature-staleness-hours", type=int, default=24 * 14)
     ap.add_argument("--targets", default="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK", help="comma-separated targets")

@@ -146,7 +146,7 @@ class BacktestRunRequest(BaseModel):
     position_max_weight_high_vol_mult: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     cost_penalty_lambda: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     signal_polarity_mode: Literal["normal", "auto_train_ic", "auto_train_pnl"] = "normal"
-    alignment_mode: Literal["strict_asof", "legacy_index"] = "strict_asof"
+    alignment_mode: Literal["strict_asof"] = "strict_asof"
     alignment_version: str = Field(default="strict_asof_v1", min_length=1, max_length=64)
     max_feature_staleness_hours: int = Field(default=24 * 14, ge=1, le=24 * 365)
 
@@ -371,7 +371,7 @@ class ExecuteOrdersRequest(BaseModel):
     max_slippage_bps: float = Field(default=20.0, ge=0.0, le=2000.0)
     venue: str = Field(default="coinbase", min_length=1, max_length=64)
     market_type: Literal["spot", "perp_usdt"] = "spot"
-    product_type: str = Field(default="USDT-FUTURES", min_length=1, max_length=64)
+    product_type: Optional[str] = Field(default=None, min_length=1, max_length=64)
     leverage: Optional[float] = Field(default=None, ge=1.0, le=125.0)
     reduce_only: bool = False
     position_mode: Literal["one_way", "hedge"] = "one_way"
@@ -380,6 +380,14 @@ class ExecuteOrdersRequest(BaseModel):
     limit_timeout_sec: float = Field(default=3.0, ge=0.1, le=30.0)
     max_retries: int = Field(default=2, ge=0, le=10)
     fee_bps: float = Field(default=5.0, ge=0.0, le=1000.0)
+    risk_equity_usd: Optional[float] = Field(default=None, gt=0.0, le=1e12)
+
+    @model_validator(mode="after")
+    def _product_type_required_for_bitget_perp(self) -> "ExecuteOrdersRequest":
+        adapter = str(self.adapter).strip().lower()
+        if adapter == "bitget_live" and self.market_type == "perp_usdt" and not str(self.product_type or "").strip():
+            raise ValueError("product_type is required when adapter=bitget_live and market_type=perp_usdt")
+        return self
 
 
 class ExecuteOrdersResponse(BaseModel):
@@ -409,12 +417,19 @@ class SubmitExecutionOrdersRequest(BaseModel):
     time_in_force: Literal["GTC", "IOC", "FOK"] = "IOC"
     max_slippage_bps: float = Field(default=20.0, ge=0.0, le=2000.0)
     market_type: Literal["spot", "perp_usdt"] = "spot"
-    product_type: str = Field(default="USDT-FUTURES", min_length=1, max_length=64)
+    product_type: Optional[str] = Field(default=None, min_length=1, max_length=64)
     leverage: Optional[float] = Field(default=None, ge=1.0, le=125.0)
     reduce_only: bool = False
     position_mode: Literal["one_way", "hedge"] = "one_way"
     margin_mode: Literal["cross", "isolated"] = "cross"
     orders: List[ExecutionOrderInput]
+
+    @model_validator(mode="after")
+    def _product_type_required_for_bitget_perp(self) -> "SubmitExecutionOrdersRequest":
+        adapter = str(self.adapter).strip().lower()
+        if adapter == "bitget_live" and self.market_type == "perp_usdt" and not str(self.product_type or "").strip():
+            raise ValueError("product_type is required when adapter=bitget_live and market_type=perp_usdt")
+        return self
 
 
 class SubmitExecutionOrdersResponse(BaseModel):

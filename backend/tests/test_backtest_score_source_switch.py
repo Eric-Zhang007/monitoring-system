@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 
@@ -9,11 +10,13 @@ import v2_router as router_mod  # noqa: E402
 
 
 def _build_feature_rows(n: int):
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
     out = []
     for i in range(n):
         out.append(
             {
                 "lineage_id": f"ln-{i}",
+                "as_of_ts": base + timedelta(hours=i),
                 "feature_payload": {
                     "ret_1": 0.001,
                     "ret_3": 0.002,
@@ -37,15 +40,16 @@ def _build_feature_rows(n: int):
 
 
 def _build_price_rows(n: int):
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
     p = 100.0
     rows = []
     for i in range(n):
         p = p * (1.0 + (0.0008 if i % 2 == 0 else -0.0006))
-        rows.append({"price": p, "volume": 1000.0 + i})
+        rows.append({"price": p, "volume": 1000.0 + i, "timestamp": base + timedelta(hours=i)})
     return rows
 
 
-def test_model_score_source_sets_coverage_and_fallback_without_artifact(monkeypatch):
+def test_model_score_source_fails_without_artifact_under_strict_model_only(monkeypatch):
     monkeypatch.setattr(router_mod, "_load_tabular_model_weights", lambda _target: None)
     out = router_mod._run_model_inference_backtest(
         target="BTC",
@@ -54,7 +58,8 @@ def test_model_score_source_sets_coverage_and_fallback_without_artifact(monkeypa
         fee_bps=5.0,
         slippage_bps=3.0,
     )
-    assert out["status"] == "completed"
+    assert out["status"] == "failed"
+    assert out["reason"] == "model_inference_incomplete"
     assert out["score_source"] == "model"
     assert out["model_inference_coverage"] == 0.0
-    assert out["fallback_used"] is True
+    assert out["fallback_used"] is False

@@ -34,6 +34,7 @@ def test_replay_backtest_emits_daily_sharpe_fields():
             feature_rows.append(
                 {
                     "lineage_id": f"ln-{i}",
+                    "as_of_ts": ts,
                     "feature_payload": {
                         "ret_1": 0.001,
                         "ret_3": 0.002,

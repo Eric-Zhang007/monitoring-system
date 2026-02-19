@@ -767,12 +767,32 @@ class BitgetLiveAdapter:
                 "fees_paid": 0.0,
                 "lifecycle": lifecycle,
             }
-        except Exception:
+        except requests.Timeout:
             return {
                 "status": "rejected",
                 "filled_qty": 0.0,
                 "avg_fill_price": None,
-                "reject_reason": "bitget_signature_error",
+                "reject_reason": "bitget_transport_error:timeout",
+                "venue_order_id": None,
+                "fees_paid": 0.0,
+                "lifecycle": lifecycle,
+            }
+        except requests.RequestException as exc:
+            return {
+                "status": "rejected",
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "reject_reason": f"bitget_transport_error:{type(exc).__name__}",
+                "venue_order_id": None,
+                "fees_paid": 0.0,
+                "lifecycle": lifecycle,
+            }
+        except Exception as exc:
+            return {
+                "status": "rejected",
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "reject_reason": f"bitget_unknown_error:{type(exc).__name__}",
                 "venue_order_id": None,
                 "fees_paid": 0.0,
                 "lifecycle": lifecycle,

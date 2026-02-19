@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 
+import pytest
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import v2_router as router_mod  # noqa: E402
@@ -97,8 +99,10 @@ def test_extended_request_models():
         time_in_force="IOC",
         max_slippage_bps=10.0,
         venue="coinbase",
+        risk_equity_usd=10000.0,
     )
     assert run.venue == "coinbase"
+    assert float(run.risk_equity_usd or 0.0) == 10000.0
     run_bitget = ExecuteOrdersRequest(
         decision_id="d2",
         adapter="bitget_live",
@@ -111,6 +115,13 @@ def test_extended_request_models():
         margin_mode="cross",
     )
     assert run_bitget.adapter == "bitget_live"
+    with pytest.raises(Exception, match="product_type is required"):
+        ExecuteOrdersRequest(
+            decision_id="d3",
+            adapter="bitget_live",
+            venue="bitget",
+            market_type="perp_usdt",
+        )
     bt = BacktestRunRequest(track="liquid", targets=["BTC"])
     assert bt.run_source == "prod"
     assert bt.alignment_mode == "strict_asof"
@@ -119,7 +130,7 @@ def test_extended_request_models():
     assert bt.slippage_bps == 3.0
 
 
-def test_default_model_dir_prefers_repo_path_in_nodocker(monkeypatch):
+def test_default_model_dir_prefers_repo_path_in_runtime(monkeypatch):
     monkeypatch.delenv("MODEL_DIR", raising=False)
     path = router_mod._default_model_dir()
     assert path.name == "models"
@@ -375,6 +386,7 @@ def test_run_execution_blocks_on_take_profit_precheck(monkeypatch):
             return None
 
     monkeypatch.setenv("RISK_SINGLE_TAKE_PROFIT_PCT", "0.03")
+    monkeypatch.setenv("RISK_TAKE_PROFIT_MODE", "hard")
     monkeypatch.setattr(router_mod, "repo", _FakeRepo())
     req = ExecuteOrdersRequest(decision_id="d1", adapter="paper", time_in_force="IOC", max_slippage_bps=10.0, venue="coinbase")
     try:
@@ -413,3 +425,14 @@ def test_execution_volatility_uses_symbol_threshold_override(monkeypatch):
     monkeypatch.setenv("RISK_MAX_ABS_RETURN_SYMBOLS", "BTC=0.20")
     out = _execution_volatility_violations([{"target": "BTC"}])
     assert out == []
+
+
+def test_infer_execution_risk_positions_uses_notional_over_equity():
+    orders = [
+        {"target": "BTC", "track": "liquid", "side": "buy", "quantity": 1.0, "est_price": 100.0},
+        {"target": "ETH", "track": "liquid", "side": "sell", "quantity": 1.0, "est_price": 50.0},
+    ]
+    out = router_mod._infer_execution_risk_positions(orders, risk_equity_usd=200.0)
+    by_target = {p.target: float(p.weight) for p in out}
+    assert abs(by_target["BTC"] - 0.5) < 1e-9
+    assert abs(by_target["ETH"] + 0.25) < 1e-9

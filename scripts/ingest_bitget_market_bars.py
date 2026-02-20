@@ -425,7 +425,7 @@ def _upsert_market_bars(db_url: str, target_symbol: str, timeframe: str, bars: L
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Ingest Bitget candles into market_bars (no-docker path)")
+    ap = argparse.ArgumentParser(description="Ingest Bitget candles into market_bars (runtime path)")
     ap.add_argument(
         "--symbols",
         default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,AVAXUSDT,LINKUSDT",

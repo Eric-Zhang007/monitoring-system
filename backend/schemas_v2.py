@@ -602,3 +602,59 @@ class LineageConsistencyResponse(BaseModel):
     mean_abs_diff: float
     mismatch_keys: List[str] = Field(default_factory=list)
     reason: str
+
+
+class SocialIngestItem(BaseModel):
+    platform: Literal["x", "twitter", "reddit", "youtube", "telegram", "other"] = "other"
+    kind: Literal["post", "comment"] = "post"
+    title: str = ""
+    text: str = ""
+    symbol: Optional[str] = None
+    occurred_at: datetime
+    published_at: Optional[datetime] = None
+    ingested_at: Optional[datetime] = None
+    available_at: Optional[datetime] = None
+    source_url: Optional[str] = None
+    author: Optional[str] = None
+    author_followers: int = Field(default=0, ge=0)
+    engagement_score: float = Field(default=0.0, ge=0.0)
+    post_sentiment: float = Field(default=0.0, ge=-1.0, le=1.0)
+    comment_sentiment: float = Field(default=0.0, ge=-1.0, le=1.0)
+    confidence_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    source_tier: int = Field(default=3, ge=1, le=5)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    entities: List[Entity] = Field(default_factory=list)
+
+
+class IngestSocialRequest(BaseModel):
+    items: List[SocialIngestItem]
+
+
+class IngestSocialResponse(BaseModel):
+    accepted: int
+    inserted: int
+    deduplicated: int
+    enriched_written: int
+    event_ids: List[int]
+
+
+class LatestFeatureSnapshotResponse(BaseModel):
+    target: str
+    track: TrackType
+    feature_version: str
+    data_version: str
+    as_of: Optional[datetime] = None
+    as_of_ts: Optional[datetime] = None
+    event_time: Optional[datetime] = None
+    feature_available_at: Optional[datetime] = None
+    lineage_id: Optional[str] = None
+    feature_payload: Dict[str, float] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class SocialCoverageResponse(BaseModel):
+    window_hours: int
+    target: Optional[str] = None
+    totals: Dict[str, float] = Field(default_factory=dict)
+    by_symbol: List[Dict[str, Any]] = Field(default_factory=list)
+    generated_at: datetime

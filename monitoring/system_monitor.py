@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 System Monitoring Script
-Monitors GPU, memory, and service health
+Monitors GPU, memory, and runtime process health
 """
 import time
 import subprocess
@@ -17,14 +17,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def check_service_health(service_name: str) -> bool:
-    """Check if a Docker service is healthy"""
+    """Check if a named process is alive"""
     try:
         result = subprocess.run(
-            ['docker', 'inspect', '--format={{.State.Health.Status}}', service_name],
+            ['screen', '-ls'],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=5,
         )
-        return result.stdout.strip() == 'healthy'
+        if result.returncode != 0:
+            return False
+        return f".{service_name}" in result.stdout
     except Exception as e:
         logger.error(f"Failed to check {service_name}: {e}")
         return False
@@ -82,7 +85,7 @@ def get_system_memory() -> dict:
 
 def monitor_loop(interval: int = 30):
     """Main monitoring loop"""
-    services = ['monitoring-system-backend-1', 'monitoring_system-frontend-1', 'monitoring-system-inference-1']
+    services = ['backend', 'collector', 'task_worker', 'model_ops', 'ops_loop']
     
     logger.info("🔍 Starting system monitoring...")
     logger.info(f"Watching services: {', '.join(services)}")

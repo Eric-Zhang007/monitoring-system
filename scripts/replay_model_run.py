@@ -4,9 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 
 import requests
+from _psql import run_psql
 
 
 def main() -> int:
@@ -21,22 +21,7 @@ def main() -> int:
         if args.run_id > 0
         else "SELECT json_build_object('id',id,'track',track,'config',config,'metrics',metrics)::text FROM backtest_runs ORDER BY id DESC LIMIT 1;"
     )
-    cmd = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        "monitor",
-        "-d",
-        "monitor",
-        "-At",
-        "-c",
-        sql,
-    ]
-    raw = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+    raw = run_psql(sql)
     if not raw:
         print(json.dumps({"status": "failed", "reason": "run_not_found"}, ensure_ascii=False))
         return 2

@@ -4,39 +4,71 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-MIN_DISK_GB="${MIN_DISK_GB:-50}"
-MIN_MEM_GB="${MIN_MEM_GB:-12}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "$PYTHON_BIN" && -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+fi
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+MIN_DISK_GB="${MIN_DISK_GB:-20}"
+MIN_MEM_GB="${MIN_MEM_GB:-8}"
+MIN_GPU_COUNT="${MIN_GPU_COUNT:-0}"
 REQUIRE_GPU="${REQUIRE_GPU:-0}"
+REQUIRE_DB="${REQUIRE_DB:-0}"
+REQUIRE_SCREEN="${REQUIRE_SCREEN:-1}"
+MODEL_DIR="${MODEL_DIR:-$ROOT_DIR/backend/models}"
+RUN_TESTS="${RUN_TESTS:-1}"
+REQUIRE_LIVE_API="${REQUIRE_LIVE_API:-0}"
+API_BASE="${API_BASE:-http://127.0.0.1:8000}"
+RUN_SECURITY_VALIDATION="${RUN_SECURITY_VALIDATION:-1}"
+ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env}"
 
-compose_cmd() {
-  if docker compose version >/dev/null 2>&1; then
-    docker compose "$@"
-    return
-  fi
-  if command -v docker-compose >/dev/null 2>&1; then
-    docker-compose "$@"
-    return
-  fi
-  echo "docker compose not found" >&2
-  return 127
-}
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
 
-need_cmds=(docker git tar gzip ssh scp awk sed)
+if [[ -n "${DATABASE_URL:-}" && ( "${DATABASE_URL}" == *"change_me_please"* || "${DATABASE_URL}" == *"REPLACE_WITH_"* ) ]]; then
+  echo "[FAIL] DATABASE_URL still uses placeholder secret; update your .env before preflight."
+  exit 2
+fi
+if [[ "$REQUIRE_DB" == "1" && -z "${DATABASE_URL:-}" ]]; then
+  echo "[FAIL] REQUIRE_DB=1 but DATABASE_URL is empty"
+  exit 2
+fi
+
+need_cmds=(git awk sed df curl)
+if [[ "$REQUIRE_SCREEN" == "1" ]]; then
+  need_cmds+=(screen)
+fi
 for c in "${need_cmds[@]}"; do
   if ! command -v "$c" >/dev/null 2>&1; then
     echo "[FAIL] missing command: $c"
     exit 2
   fi
 done
-
-if ! docker info >/dev/null 2>&1; then
-  echo "[FAIL] docker daemon unreachable"
-  exit 2
+if [[ "$PYTHON_BIN" == */* ]]; then
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "[FAIL] python interpreter not executable: $PYTHON_BIN"
+    exit 2
+  fi
+else
+  if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "[FAIL] missing command: $PYTHON_BIN"
+    exit 2
+  fi
 fi
 
-if ! compose_cmd config >/dev/null; then
-  echo "[FAIL] docker compose config invalid"
-  exit 2
+if [[ "$RUN_TESTS" == "1" ]]; then
+  if ! "$PYTHON_BIN" - <<'PY'
+import pytest  # noqa: F401
+PY
+  then
+    echo "[FAIL] pytest is required when RUN_TESTS=1"
+    exit 2
+  fi
 fi
 
 avail_disk_kb="$(df -Pk "$ROOT_DIR" | awk 'NR==2 {print $4}')"
@@ -53,20 +85,121 @@ if (( mem_gb < MIN_MEM_GB )); then
   exit 2
 fi
 
-if [[ "$REQUIRE_GPU" == "1" ]]; then
+gpu_count="0"
+if [[ "$REQUIRE_GPU" == "1" || "$MIN_GPU_COUNT" -gt 0 ]]; then
   if ! command -v nvidia-smi >/dev/null 2>&1; then
-    echo "[FAIL] REQUIRE_GPU=1 but nvidia-smi missing"
+    echo "[FAIL] nvidia-smi is required when REQUIRE_GPU=1 or MIN_GPU_COUNT>0"
     exit 2
   fi
-  nvidia-smi >/dev/null
+  gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | awk '{print $1}')"
+  if (( gpu_count < MIN_GPU_COUNT )); then
+    echo "[FAIL] gpu count too low: ${gpu_count} < ${MIN_GPU_COUNT}"
+    exit 2
+  fi
+fi
+
+mkdir -p "$MODEL_DIR"
+if [[ ! -w "$MODEL_DIR" ]]; then
+  echo "[FAIL] model dir is not writable: $MODEL_DIR"
+  exit 2
+fi
+
+if [[ "$RUN_SECURITY_VALIDATION" == "1" ]]; then
+  echo "[1/5] security hardening checks"
+  RUN_TESTS=0 bash scripts/validate_security_hardening.sh --skip-tests
+else
+  echo "[1/5] security hardening checks skipped (RUN_SECURITY_VALIDATION=${RUN_SECURITY_VALIDATION})"
+fi
+
+echo "[2/5] python syntax checks (runtime entry points)"
+syntax_files=(
+  backend/main.py
+  backend/v2_router.py
+  backend/task_queue.py
+  collector/collector.py
+  monitoring/health_check.py
+  monitoring/model_ops_scheduler.py
+  monitoring/task_worker.py
+  scripts/continuous_ops_loop.py
+)
+for f in "${syntax_files[@]}"; do
+  "$PYTHON_BIN" -m py_compile "$f"
+done
+
+if [[ "$RUN_TESTS" == "1" ]]; then
+  echo "[3/5] targeted runtime/no-gpu tests"
+  PYTHONPATH="${ROOT_DIR}/backend:${ROOT_DIR}/monitoring" "$PYTHON_BIN" -m pytest -q \
+    backend/tests/test_task_queue.py \
+    backend/tests/test_health_slo.py \
+    backend/tests/test_health_postgres_fallback.py \
+    backend/tests/test_task_worker_loop.py \
+    backend/tests/test_security_config.py
+else
+  echo "[3/5] tests skipped (RUN_TESTS=${RUN_TESTS})"
+fi
+
+echo "[4/5] runtime probes (optional if backend not started)"
+if curl -fsS "${API_BASE}/health" >/dev/null 2>&1; then
+  echo "[INFO] backend health reachable at ${API_BASE}/health"
+  if curl -fsS "${API_BASE}/metrics" >/dev/null 2>&1; then
+    echo "[INFO] backend metrics reachable at ${API_BASE}/metrics"
+  else
+    echo "[WARN] backend metrics endpoint not reachable"
+  fi
+  if curl -fsS "${API_BASE}/api/v2/risk/limits" >/dev/null 2>&1; then
+    echo "[INFO] backend risk limits reachable at ${API_BASE}/api/v2/risk/limits"
+  else
+    echo "[WARN] backend risk limits endpoint not reachable"
+  fi
+else
+  if [[ "$REQUIRE_LIVE_API" == "1" ]]; then
+    echo "[FAIL] backend health probe failed at ${API_BASE}/health"
+    exit 2
+  fi
+  echo "[WARN] backend not running; skipped live API probes"
+fi
+
+torch_probe='{"skipped":"gpu_not_required"}'
+if [[ "$REQUIRE_GPU" == "1" || "$MIN_GPU_COUNT" -gt 0 ]]; then
+  torch_probe="$("$PYTHON_BIN" - <<'PY'
+import json
+try:
+    import torch
+    out = {
+        "torch_version": str(torch.__version__),
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+    }
+except Exception as exc:
+    out = {"torch_import_error": str(exc)}
+print(json.dumps(out, ensure_ascii=False))
+PY
+  )"
+fi
+echo "torch_probe=${torch_probe}"
+
+if [[ "$REQUIRE_DB" == "1" ]]; then
+  if ! "$PYTHON_BIN" - <<'PY'
+import os
+import psycopg2
+dsn = os.getenv("DATABASE_URL", "")
+if not dsn:
+    raise SystemExit(2)
+conn = psycopg2.connect(dsn)
+conn.close()
+PY
+  then
+    echo "[FAIL] DATABASE_URL probe failed"
+    exit 2
+  fi
 fi
 
 git_rev="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-services="$(compose_cmd config --services | tr '\n' ' ')"
-
-echo "[OK] preflight passed"
+echo "[5/5] summary"
+echo "[OK] runtime preflight passed"
 echo "root_dir=$ROOT_DIR"
 echo "git_rev=$git_rev"
 echo "disk_gb=$avail_disk_gb"
 echo "mem_gb=$mem_gb"
-echo "services=$services"
+echo "gpu_count=$gpu_count"
+echo "model_dir=$MODEL_DIR"

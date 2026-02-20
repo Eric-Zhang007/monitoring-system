@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+from datetime import datetime, timedelta, timezone
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -11,11 +12,13 @@ from v2_router import _run_model_replay_backtest  # noqa: E402
 
 
 def _build_feature_rows(n: int):
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
     out = []
     for i in range(n):
         out.append(
             {
                 "lineage_id": "ln-a" if i % 2 == 0 else "ln-b",
+                "as_of_ts": base + timedelta(hours=i),
                 "feature_payload": {
                     "ret_1": 0.001 if i % 3 == 0 else -0.0005,
                     "ret_3": 0.002,
@@ -33,11 +36,12 @@ def _build_feature_rows(n: int):
 
 
 def _build_price_rows(n: int):
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
     price = 100.0
     rows = []
     for i in range(n):
         price = price * (1.0 + (0.001 if i % 2 == 0 else -0.0008))
-        rows.append({"price": price, "volume": 1000.0 + i})
+        rows.append({"price": price, "volume": 1000.0 + i, "timestamp": base + timedelta(hours=i)})
     return rows
 
 
@@ -86,7 +90,7 @@ def test_model_replay_backtest_auto_train_ic_can_invert_polarity():
     prices = [dict(price=price, volume=1000.0)]
     for r in rets:
         price *= (1.0 + float(r))
-        prices.append({"price": price, "volume": 1000.0})
+        prices.append({"price": price, "volume": 1000.0, "timestamp": datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(hours=len(prices))})
     out = _run_model_replay_backtest(
         features,
         prices,
@@ -112,7 +116,7 @@ def test_model_replay_backtest_auto_train_pnl_uses_edge_even_when_ic_threshold_h
     prices = [dict(price=price, volume=1000.0)]
     for r in rets:
         price *= (1.0 + float(r))
-        prices.append({"price": price, "volume": 1000.0})
+        prices.append({"price": price, "volume": 1000.0, "timestamp": datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(hours=len(prices))})
     out = _run_model_replay_backtest(
         features,
         prices,
@@ -137,7 +141,7 @@ def test_model_replay_backtest_auto_train_ic_respects_threshold_hold(monkeypatch
     prices = [dict(price=price, volume=1000.0)]
     for r in rets:
         price *= (1.0 + float(r))
-        prices.append({"price": price, "volume": 1000.0})
+        prices.append({"price": price, "volume": 1000.0, "timestamp": datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(hours=len(prices))})
     out = _run_model_replay_backtest(
         features,
         prices,

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import requests
+from _psql import run_psql
 
 
 def _run(cmd: List[str]) -> tuple[int, str, str]:
@@ -17,32 +18,15 @@ def _run(cmd: List[str]) -> tuple[int, str, str]:
 
 
 def _run_psql(sql: str) -> str:
-    code, out, err = _run([
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        "monitor",
-        "-d",
-        "monitor",
-        "-At",
-        "-F",
-        "|",
-        "-c",
-        sql,
-    ])
-    if code != 0:
-        raise RuntimeError(f"psql failed: {err}")
-    return out
+    return run_psql(sql)
 
 
 def ensure_artifact(model_name: str, model_version: str) -> Dict[str, Any]:
     models_dir = Path("backend/models")
     models_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = models_dir / f"{model_name}_{model_version}.json"
+    registry_base = str(os.getenv("MODEL_REGISTRY_BASE_PATH", "/opt/monitoring-system/models")).rstrip("/")
+    registry_path = f"{registry_base}/{artifact_path.name}"
     if not artifact_path.exists():
         artifact_path.write_text(
             json.dumps(
@@ -61,12 +45,12 @@ def ensure_artifact(model_name: str, model_version: str) -> Dict[str, Any]:
 
     sql = (
         "INSERT INTO model_registry (model_name, track, model_version, artifact_path, metrics, created_at) "
-        f"VALUES ('{model_name}', 'liquid', '{model_version}', '/app/models/{artifact_path.name}', '{{}}'::jsonb, NOW()) "
+        f"VALUES ('{model_name}', 'liquid', '{model_version}', '{registry_path}', '{{}}'::jsonb, NOW()) "
         "ON CONFLICT (model_name, track, model_version) DO UPDATE "
         "SET artifact_path = EXCLUDED.artifact_path, created_at = NOW();"
     )
     _run_psql(sql)
-    return {"artifact_path": str(artifact_path), "registry_path": f"/app/models/{artifact_path.name}"}
+    return {"artifact_path": str(artifact_path), "registry_path": registry_path}
 
 
 def seed_prices_and_features(hours: int = 720) -> Dict[str, Any]:

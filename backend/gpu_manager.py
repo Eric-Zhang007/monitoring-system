@@ -8,8 +8,14 @@ try:
     import torch
 except Exception:
     torch = None
-import pynvml
-import psutil
+try:
+    import pynvml
+except Exception:
+    pynvml = None
+try:
+    import psutil
+except Exception:
+    psutil = None
 from typing import Literal
 import logging
 
@@ -19,16 +25,20 @@ class GPUManager:
     """Dual A100 Manager (Fixed v3)"""
 
     def __init__(self):
-        try:
-            pynvml.nvmlInit()
-            self.gpu_handles = [
-                pynvml.nvmlDeviceGetHandleByIndex(0),  # Real-time inference
-                pynvml.nvmlDeviceGetHandleByIndex(1),  # Training + Offline
-            ]
-        except Exception as e:
-            logger.warning(f"NVML not available: {e}")
+        if pynvml is None:
+            logger.info("pynvml unavailable, running in CPU-only mode")
             self.gpu_handles = []
-            logger.info("Running in CPU-only mode")
+        else:
+            try:
+                pynvml.nvmlInit()
+                self.gpu_handles = [
+                    pynvml.nvmlDeviceGetHandleByIndex(0),  # Real-time inference
+                    pynvml.nvmlDeviceGetHandleByIndex(1),  # Training + Offline
+                ]
+            except Exception as e:
+                logger.warning(f"NVML not available: {e}")
+                self.gpu_handles = []
+                logger.info("Running in CPU-only mode")
 
         # Memory thresholds (GB)
         self.memory_thresholds = {
@@ -92,6 +102,8 @@ class GPUManager:
     @staticmethod
     def check_system_memory():
         """Check system memory usage (NEW in v3)"""
+        if psutil is None:
+            return {"status": "unknown", "percent": None}
         mem = psutil.virtual_memory()
         if mem.percent > 85:
             logger.critical(f"🚨 System memory critical: {mem.percent}%")

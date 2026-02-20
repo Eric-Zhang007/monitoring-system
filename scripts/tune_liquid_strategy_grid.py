@@ -96,7 +96,7 @@ def main() -> int:
     ap.add_argument("--alignment-mode", default="strict_asof", choices=["strict_asof"])
     ap.add_argument("--alignment-version", default="strict_asof_v1")
     ap.add_argument("--max-feature-staleness-hours", type=int, default=24 * 14)
-    ap.add_argument("--targets", default="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK", help="comma-separated targets")
+    ap.add_argument("--targets", default="BTC,ETH,SOL", help="comma-separated targets")
     ap.add_argument("--data-version", default="v1")
     ap.add_argument("--fee-bps", type=float, default=5.0)
     ap.add_argument("--slippage-bps", type=float, default=3.0)

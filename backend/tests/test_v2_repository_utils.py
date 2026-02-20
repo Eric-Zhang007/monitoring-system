@@ -45,6 +45,11 @@ class _FakeCursor:
     def fetchall(self):
         return list(self._rows)
 
+    def fetchone(self):
+        if not self._rows:
+            return None
+        return self._rows[0]
+
 
 class _FakeConn:
     def __init__(self, cursor):
@@ -112,3 +117,62 @@ def test_get_execution_consecutive_losses_stops_on_non_loss():
     ]
     streak = repo.get_execution_consecutive_losses(track="liquid", lookback_hours=24, limit=200)
     assert streak == 2
+
+
+def test_load_feature_history_dynamic_limit_scales_with_window(monkeypatch):
+    rows = [{"target": "BTC", "track": "liquid", "as_of_ts": datetime.now(timezone.utc), "feature_payload": {}}]
+    cur = _FakeCursor(rows)
+    conn = _FakeConn(cur)
+    repo = object.__new__(V2Repository)
+    repo._connect = lambda: conn  # type: ignore[assignment]
+
+    monkeypatch.setenv("FEATURE_SNAPSHOT_ROWS_PER_DAY", "288")
+    monkeypatch.setenv("FEATURE_HISTORY_MAX_LIMIT", "300000")
+    out = repo.load_feature_history(target="BTC", track="liquid", lookback_days=90, data_version=None, limit=None)
+    assert out == rows
+    assert cur.executed_params is not None
+    # last SQL param is LIMIT
+    assert int(cur.executed_params[-1]) >= 26000
+
+
+def test_get_ops_control_state_queries_table():
+    cur = _FakeCursor(
+        [
+            {
+                "control_key": "live_control_state",
+                "payload": {"live_enabled": True},
+                "source": "api",
+                "updated_by": "manual",
+                "updated_at": datetime.now(timezone.utc),
+            }
+        ]
+    )
+    conn = _FakeConn(cur)
+    repo = object.__new__(V2Repository)
+    repo._connect = lambda: conn  # type: ignore[assignment]
+    row = repo.get_ops_control_state("live_control_state")
+    assert row is not None
+    assert row["control_key"] == "live_control_state"
+    assert "ops_control_state" in cur.executed_sql
+
+
+def test_upsert_ops_control_state_writes_payload_json():
+    cur = _FakeCursor(
+        [
+            {
+                "control_key": "manual_candidate",
+                "payload": {"track": "liquid"},
+                "source": "api",
+                "updated_by": "manual",
+                "updated_at": datetime.now(timezone.utc),
+            }
+        ]
+    )
+    conn = _FakeConn(cur)
+    repo = object.__new__(V2Repository)
+    repo._connect = lambda: conn  # type: ignore[assignment]
+    row = repo.upsert_ops_control_state("manual_candidate", {"track": "liquid"}, updated_by="manual")
+    assert row["control_key"] == "manual_candidate"
+    assert cur.executed_params is not None
+    assert cur.executed_params[0] == "manual_candidate"
+    assert "INSERT INTO ops_control_state" in cur.executed_sql

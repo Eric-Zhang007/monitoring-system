@@ -26,13 +26,14 @@ def test_publish_event_includes_standard_social_payload_fields(monkeypatch):
     monkeypatch.setattr(collector_mod, "start_http_server", lambda *_args, **_kwargs: None)
     captured = {}
 
-    def _fake_post(url, json, timeout):
-        captured["url"] = url
-        captured["body"] = json
-        captured["timeout"] = timeout
-        return _Resp()
+    class _FakeSession:
+        def post(self, url, json, timeout):
+            captured["url"] = url
+            captured["body"] = json
+            captured["timeout"] = timeout
+            return _Resp()
 
-    monkeypatch.setattr(collector_mod.requests, "post", _fake_post)
+    monkeypatch.setattr(collector_mod.DataCollectorV2, "_build_http_session", lambda self: _FakeSession())
 
     dc = collector_mod.DataCollectorV2()
     event = {

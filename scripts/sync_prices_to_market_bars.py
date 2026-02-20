@@ -48,7 +48,7 @@ def main() -> int:
     ap.add_argument("--timeframe", default="1h")
     ap.add_argument("--start", default="2025-01-01T00:00:00+00:00")
     ap.add_argument("--end", default=datetime.now(timezone.utc).isoformat())
-    ap.add_argument("--targets", default="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK")
+    ap.add_argument("--targets", default="BTC,ETH,SOL")
     ap.add_argument("--replace-window", action="store_true")
     ap.add_argument("--symbol-map-json", default="")
     args = ap.parse_args()

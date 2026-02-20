@@ -565,8 +565,8 @@ class BitgetLiveAdapter:
                 j = resp.json()
                 if isinstance(j, dict):
                     parsed = j
-            except Exception:
-                parsed = {}
+            except Exception as exc:
+                raise ValueError("bitget_response_parse_error") from exc
         return int(resp.status_code), parsed
 
     @staticmethod

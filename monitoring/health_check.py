@@ -172,12 +172,22 @@ def _check_postgres_sync() -> Tuple[bool, Dict]:
 
         recent_features, feat_warning = _safe_recent_count(
             cursor,
-            table_fqn="public.semantic_features",
-            time_columns=("timestamp", "created_at", "feature_ts"),
+            table_fqn="public.feature_snapshots",
+            time_columns=("feature_available_at", "as_of_ts", "as_of", "created_at"),
             lookback_hours=6,
         )
         if feat_warning:
-            warnings.append(feat_warning)
+            # Legacy fallback: older deployments may still use semantic_features.
+            legacy_features, legacy_warning = _safe_recent_count(
+                cursor,
+                table_fqn="public.semantic_features",
+                time_columns=("timestamp", "created_at", "feature_ts"),
+                lookback_hours=6,
+            )
+            if legacy_features is not None:
+                recent_features = legacy_features
+            elif legacy_warning:
+                warnings.append(legacy_warning)
 
         out = {
             "version": version[0] if version else "unknown",
@@ -507,41 +517,44 @@ async def check_collector_metrics(session: aiohttp.ClientSession) -> Tuple[bool,
         return False, {"error": f"{endpoint_error}; prometheus query failed: {e}"}
 
 
-def check_docker_services():
-    """Check Docker container status"""
+def check_runtime_services():
+    """Check runtime process status via screen sessions."""
     import subprocess
-    if os.getenv("CHECK_DOCKER_SERVICES", "auto").lower() in {"0", "false", "no", "off"}:
-        log_info("\n🐳 Docker Container Status (skipped by CHECK_DOCKER_SERVICES)")
+    if os.getenv("CHECK_RUNTIME_SERVICES", "auto").lower() in {"0", "false", "no", "off"}:
+        log_info("\n🧭 Runtime Service Status (skipped by CHECK_RUNTIME_SERVICES)")
         return
-    if shutil.which("docker") is None:
-        log_info("\n🐳 Docker Container Status (docker command not found, skipped)")
+    if shutil.which("screen") is None:
+        log_info("\n🧭 Runtime Service Status (screen command not found, skipped)")
         return
 
     services = [
-        'monitoring-system-backend-1',
-        'monitoring-system-inference-1',
-        'monitoring-system-training-1',
-        'monitoring-system-collector-1',
-        'monitoring-system-redis-1',
-        'monitoring-system-postgres-1',
+        'backend',
+        'task_worker',
+        'model_ops',
+        'collector',
     ]
+    if os.getenv("ENABLE_CONTINUOUS_OPS_LOOP", "1").lower() in {"1", "true", "yes", "y", "on"}:
+        services.append('ops_loop')
     
-    log_info("\n🐳 Docker Container Status")
+    log_info("\n🧭 Runtime Service Status")
     print("=" * 50)
-    
+
+    try:
+        screen_ls = subprocess.run(
+            ["screen", "-ls"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except Exception as e:
+        log_error("runtime", f"screen -ls failed: {e}")
+        return
+
     for service in services:
-        try:
-            result = subprocess.run(
-                ['docker', 'ps', '--filter', f'name={service}', '--format', '{{.Status}}'],
-                capture_output=True, text=True, timeout=5
-            )
-            status = result.stdout.strip()
-            if 'Up' in status:
-                log_success(service.split('-')[-2], f"Running - {status}")
-            else:
-                log_error(service.split('-')[-2], "Not running")
-        except Exception as e:
-            log_error(service.split('-')[-2], f"Error: {e}")
+        if f".{service}" in screen_ls:
+            log_success(service, "Running")
+        else:
+            log_error(service, "Not running")
 
 
 async def run_health_checks():
@@ -647,8 +660,8 @@ async def run_health_checks():
         else:
             log_warning('collector_metrics', data.get('error', 'Collector metrics unhealthy'))
     
-    # Check Docker
-    check_docker_services()
+    # Check runtime services
+    check_runtime_services()
     
     print("\n" + "=" * 50)
     if all_healthy:

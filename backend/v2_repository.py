@@ -13,6 +13,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from psycopg2.pool import ThreadedConnectionPool
 
+from repository_modules import backtest_store, execution_store
 from schemas_v2 import Event
 
 
@@ -21,7 +22,16 @@ class V2Repository:
         self.db_url = db_url
         min_conn = int(os.getenv("DB_POOL_MIN_CONN", "1"))
         max_conn = int(os.getenv("DB_POOL_MAX_CONN", "8"))
-        self._pool = ThreadedConnectionPool(minconn=min_conn, maxconn=max_conn, dsn=self.db_url)
+        connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT_SEC", "3"))
+        if connect_timeout > 0:
+            self._pool = ThreadedConnectionPool(
+                minconn=min_conn,
+                maxconn=max_conn,
+                dsn=self.db_url,
+                connect_timeout=connect_timeout,
+            )
+        else:
+            self._pool = ThreadedConnectionPool(minconn=min_conn, maxconn=max_conn, dsn=self.db_url)
 
     class _PooledConnection(AbstractContextManager):
         class _ConnProxy:
@@ -108,6 +118,9 @@ class V2Repository:
                         payload["source_confidence"] = float(event.confidence_score)
                     if "source_tier_weight" not in payload:
                         payload["source_tier_weight"] = max(0.1, min(1.0, (6.0 - float(event.source_tier)) / 5.0))
+                    savepoint = f"sp_ingest_event_{len(event_ids)}"
+                    row = None
+                    cur.execute(f"SAVEPOINT {savepoint}")
                     try:
                         cur.execute(
                             """
@@ -145,39 +158,49 @@ class V2Repository:
                                 fp,
                             ),
                         )
+                        row = cur.fetchone()
                     except Exception:
-                        conn.rollback()
-                        cur.execute(
-                            """
-                            INSERT INTO events (
-                                event_type, title, occurred_at, source_url, source_name,
-                                source_timezone, source_tier, confidence_score, event_importance,
-                                novelty_score, entity_confidence, latency_ms, dedup_cluster_id,
-                                payload, fingerprint, created_at
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        try:
+                            cur.execute(
+                                """
+                                INSERT INTO events (
+                                    event_type, title, occurred_at, source_url, source_name,
+                                    source_timezone, source_tier, confidence_score, event_importance,
+                                    novelty_score, entity_confidence, latency_ms, dedup_cluster_id,
+                                    payload, fingerprint, created_at
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                                ON CONFLICT (fingerprint) DO NOTHING
+                                RETURNING id
+                                """,
+                                (
+                                    event.event_type,
+                                    event.title,
+                                    event.occurred_at,
+                                    event.source_url,
+                                    event.source_name,
+                                    event.source_timezone,
+                                    event.source_tier,
+                                    event.confidence_score,
+                                    event.event_importance,
+                                    event.novelty_score,
+                                    event.entity_confidence,
+                                    event.latency_ms,
+                                    event.dedup_cluster_id,
+                                    json.dumps(payload),
+                                    fp,
+                                ),
                             )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                            ON CONFLICT (fingerprint) DO NOTHING
-                            RETURNING id
-                            """,
-                            (
-                                event.event_type,
-                                event.title,
-                                event.occurred_at,
-                                event.source_url,
-                                event.source_name,
-                                event.source_timezone,
-                                event.source_tier,
-                                event.confidence_score,
-                                event.event_importance,
-                                event.novelty_score,
-                                event.entity_confidence,
-                                event.latency_ms,
-                                event.dedup_cluster_id,
-                                json.dumps(payload),
-                                fp,
-                            ),
-                        )
-                    row = cur.fetchone()
+                            row = cur.fetchone()
+                        except Exception:
+                            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            raise
+                    finally:
+                        try:
+                            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        except Exception:
+                            pass
                     if row:
                         event_id = row["id"]
                         inserted += 1
@@ -372,6 +395,299 @@ class V2Repository:
                     )
                 return [dict(r) for r in cur.fetchall()]
 
+    def upsert_enriched_event_feature(self, event_id: int, payload: Dict[str, Any]) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO enriched_event_features (
+                            event_id,
+                            social_platform,
+                            social_kind,
+                            language,
+                            summary,
+                            sentiment,
+                            author,
+                            author_followers,
+                            engagement_score,
+                            embedding,
+                            observed_at,
+                            event_time,
+                            ingest_lag_sec,
+                            coverage_score,
+                            payload,
+                            updated_at,
+                            created_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb, NOW(), NOW()
+                        )
+                        ON CONFLICT (event_id)
+                        DO UPDATE SET
+                            social_platform = EXCLUDED.social_platform,
+                            social_kind = EXCLUDED.social_kind,
+                            language = EXCLUDED.language,
+                            summary = EXCLUDED.summary,
+                            sentiment = EXCLUDED.sentiment,
+                            author = EXCLUDED.author,
+                            author_followers = EXCLUDED.author_followers,
+                            engagement_score = EXCLUDED.engagement_score,
+                            embedding = EXCLUDED.embedding,
+                            observed_at = EXCLUDED.observed_at,
+                            event_time = EXCLUDED.event_time,
+                            ingest_lag_sec = EXCLUDED.ingest_lag_sec,
+                            coverage_score = EXCLUDED.coverage_score,
+                            payload = EXCLUDED.payload,
+                            updated_at = NOW()
+                        """,
+                        (
+                            int(event_id),
+                            str(payload.get("social_platform") or ""),
+                            str(payload.get("social_kind") or "post"),
+                            str(payload.get("language") or ""),
+                            str(payload.get("summary") or "")[:1000],
+                            float(payload.get("sentiment") or 0.0),
+                            str(payload.get("author") or ""),
+                            int(payload.get("author_followers") or 0),
+                            float(payload.get("engagement_score") or 0.0),
+                            json.dumps(payload.get("embedding") if isinstance(payload.get("embedding"), list) else []),
+                            payload.get("observed_at"),
+                            payload.get("event_time"),
+                            float(payload.get("ingest_lag_sec") or 0.0),
+                            float(payload.get("coverage_score") or 0.0),
+                            json.dumps(payload.get("payload") if isinstance(payload.get("payload"), dict) else {}),
+                        ),
+                    )
+                    return True
+                except Exception:
+                    conn.rollback()
+                    return False
+
+    def latest_feature_snapshot(self, target: str, track: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        """
+                        SELECT
+                            target,
+                            track,
+                            feature_version,
+                            data_version,
+                            as_of,
+                            as_of_ts,
+                            event_time,
+                            feature_available_at,
+                            lineage_id,
+                            feature_payload,
+                            created_at
+                        FROM feature_snapshots
+                        WHERE UPPER(target) = UPPER(%s)
+                          AND track = %s
+                        ORDER BY COALESCE(feature_available_at, as_of_ts, as_of, created_at) DESC
+                        LIMIT 1
+                        """,
+                        (target, track),
+                    )
+                    row = cur.fetchone()
+                    return dict(row) if row else None
+                except Exception:
+                    conn.rollback()
+                    cur.execute(
+                        """
+                        SELECT
+                            target,
+                            track,
+                            feature_version,
+                            'v1'::text AS data_version,
+                            as_of,
+                            NULL::timestamptz AS as_of_ts,
+                            NULL::timestamptz AS event_time,
+                            NULL::timestamptz AS feature_available_at,
+                            NULL::text AS lineage_id,
+                            feature_payload,
+                            created_at
+                        FROM feature_snapshots
+                        WHERE UPPER(target) = UPPER(%s)
+                          AND track = %s
+                        ORDER BY COALESCE(as_of, created_at) DESC
+                        LIMIT 1
+                        """,
+                        (target, track),
+                    )
+                    row = cur.fetchone()
+                    return dict(row) if row else None
+
+    def social_coverage_stats(self, window_hours: int = 24, target: Optional[str] = None) -> Dict[str, Any]:
+        window_hours = max(1, int(window_hours))
+        target_symbol = str(target or "").strip().upper()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        """
+                        WITH base AS (
+                            SELECT DISTINCT
+                                e.id AS event_id,
+                                COALESCE(
+                                    e.available_at,
+                                    e.ingested_at,
+                                    e.published_at,
+                                    e.occurred_at,
+                                    e.created_at
+                                ) AS observed_ts,
+                                e.occurred_at AS event_ts,
+                                COALESCE(e.payload->>'social_kind', 'post') AS social_kind,
+                                CASE WHEN eef.event_id IS NULL THEN 0 ELSE 1 END AS enriched_flag
+                            FROM events e
+                            LEFT JOIN enriched_event_features eef ON eef.event_id = e.id
+                            WHERE COALESCE(
+                                e.available_at,
+                                e.ingested_at,
+                                e.published_at,
+                                e.occurred_at,
+                                e.created_at
+                            ) > NOW() - make_interval(hours => %s)
+                              AND (
+                                (e.payload ? 'social_platform')
+                                OR COALESCE(e.source_name, '') LIKE 'social:%'
+                              )
+                              AND (
+                                %s = ''
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM event_links el2
+                                    JOIN entities en2 ON en2.id = el2.entity_id
+                                    WHERE el2.event_id = e.id
+                                      AND UPPER(COALESCE(en2.symbol, '')) = %s
+                                )
+                              )
+                        )
+                        SELECT
+                            COUNT(*)::double precision AS total_events,
+                            COALESCE(SUM(CASE WHEN social_kind = 'post' THEN 1 ELSE 0 END), 0)::double precision AS posts,
+                            COALESCE(SUM(CASE WHEN social_kind = 'comment' THEN 1 ELSE 0 END), 0)::double precision AS comments,
+                            COALESCE(SUM(enriched_flag), 0)::double precision AS enriched_events,
+                            COALESCE(
+                                PERCENTILE_CONT(0.50) WITHIN GROUP (
+                                    ORDER BY
+                                        CASE
+                                            WHEN observed_ts >= event_ts THEN EXTRACT(EPOCH FROM (observed_ts - event_ts))
+                                            ELSE NULL
+                                        END
+                                ),
+                                0.0
+                            )::double precision AS ingest_lag_p50_sec,
+                            COALESCE(
+                                PERCENTILE_CONT(0.90) WITHIN GROUP (
+                                    ORDER BY
+                                        CASE
+                                            WHEN observed_ts >= event_ts THEN EXTRACT(EPOCH FROM (observed_ts - event_ts))
+                                            ELSE NULL
+                                        END
+                                ),
+                                0.0
+                            )::double precision AS ingest_lag_p90_sec,
+                            COALESCE(
+                                PERCENTILE_CONT(0.99) WITHIN GROUP (
+                                    ORDER BY
+                                        CASE
+                                            WHEN observed_ts >= event_ts THEN EXTRACT(EPOCH FROM (observed_ts - event_ts))
+                                            ELSE NULL
+                                        END
+                                ),
+                                0.0
+                            )::double precision AS ingest_lag_p99_sec,
+                            COALESCE(
+                                AVG(
+                                    CASE
+                                        WHEN observed_ts >= event_ts THEN EXTRACT(EPOCH FROM (observed_ts - event_ts))
+                                        ELSE NULL
+                                    END
+                                ),
+                                0.0
+                            )::double precision AS avg_ingest_lag_sec
+                        FROM base
+                        """,
+                        (window_hours, target_symbol, target_symbol),
+                    )
+                    totals = dict(cur.fetchone() or {})
+                    total_events = float(totals.get("total_events") or 0.0)
+                    totals["coverage_ratio"] = round(float(totals.get("enriched_events") or 0.0) / max(1.0, total_events), 6)
+                    for k in (
+                        "total_events",
+                        "posts",
+                        "comments",
+                        "enriched_events",
+                        "avg_ingest_lag_sec",
+                        "ingest_lag_p50_sec",
+                        "ingest_lag_p90_sec",
+                        "ingest_lag_p99_sec",
+                    ):
+                        totals[k] = round(float(totals.get(k) or 0.0), 6)
+                except Exception:
+                    conn.rollback()
+                    totals = {
+                        "total_events": 0.0,
+                        "posts": 0.0,
+                        "comments": 0.0,
+                        "enriched_events": 0.0,
+                        "avg_ingest_lag_sec": 0.0,
+                        "ingest_lag_p50_sec": 0.0,
+                        "ingest_lag_p90_sec": 0.0,
+                        "ingest_lag_p99_sec": 0.0,
+                        "coverage_ratio": 0.0,
+                    }
+
+                try:
+                    cur.execute(
+                        """
+                        SELECT
+                            UPPER(en.symbol) AS symbol,
+                            COUNT(DISTINCT e.id)::double precision AS samples,
+                            COALESCE(SUM(CASE WHEN COALESCE(e.payload->>'social_kind', 'post') = 'post' THEN 1 ELSE 0 END), 0)::double precision AS posts,
+                            COALESCE(SUM(CASE WHEN COALESCE(e.payload->>'social_kind', 'post') = 'comment' THEN 1 ELSE 0 END), 0)::double precision AS comments,
+                            COUNT(DISTINCT eef.event_id)::double precision AS enriched_events
+                        FROM events e
+                        JOIN event_links el ON el.event_id = e.id
+                        JOIN entities en ON en.id = el.entity_id
+                        LEFT JOIN enriched_event_features eef ON eef.event_id = e.id
+                        WHERE COALESCE(
+                                e.available_at,
+                                e.ingested_at,
+                                e.published_at,
+                                e.occurred_at,
+                                e.created_at
+                              ) > NOW() - make_interval(hours => %s)
+                          AND (
+                                (e.payload ? 'social_platform')
+                                OR COALESCE(e.source_name, '') LIKE 'social:%'
+                              )
+                          AND en.entity_type = 'asset'
+                          AND COALESCE(en.symbol, '') <> ''
+                          AND (%s = '' OR UPPER(en.symbol) = %s)
+                        GROUP BY UPPER(en.symbol)
+                        ORDER BY samples DESC, symbol ASC
+                        LIMIT 20
+                        """,
+                        (window_hours, target_symbol, target_symbol),
+                    )
+                    by_symbol = []
+                    for row in cur.fetchall() or []:
+                        item = dict(row)
+                        samples = float(item.get("samples") or 0.0)
+                        item["samples"] = round(samples, 6)
+                        item["posts"] = round(float(item.get("posts") or 0.0), 6)
+                        item["comments"] = round(float(item.get("comments") or 0.0), 6)
+                        item["enriched_events"] = round(float(item.get("enriched_events") or 0.0), 6)
+                        item["coverage_ratio"] = round(float(item.get("enriched_events") or 0.0) / max(1.0, samples), 6)
+                        by_symbol.append(item)
+                except Exception:
+                    conn.rollback()
+                    by_symbol = []
+
+        return {"totals": totals, "by_symbol": by_symbol}
+
     def latest_price_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -489,29 +805,10 @@ class V2Repository:
                 return out
 
     def create_backtest_run(self, run_name: str, track: str, config: Dict[str, Any], run_source: str = "prod") -> int:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO backtest_runs (run_name, track, run_source, started_at, metrics, config, created_at)
-                    VALUES (%s, %s, %s, NOW(), %s, %s, NOW())
-                    RETURNING id
-                    """,
-                    (run_name, track, run_source, json.dumps({"status": "running"}), json.dumps(config)),
-                )
-                return cur.fetchone()["id"]
+        return backtest_store.create_backtest_run(self._connect, run_name=run_name, track=track, config=config, run_source=run_source)
 
     def finish_backtest_run(self, run_id: int, metrics: Dict[str, Any]) -> None:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE backtest_runs
-                    SET ended_at = NOW(), metrics = %s
-                    WHERE id = %s
-                    """,
-                    (json.dumps(metrics), run_id),
-                )
+        backtest_store.finish_backtest_run(self._connect, run_id=run_id, metrics=metrics)
 
     def mark_backtest_run_superseded(self, run_id: int, superseded_by_run_id: int, reason: str) -> None:
         with self._connect() as conn:
@@ -542,30 +839,14 @@ class V2Repository:
         exclude_sources: Optional[List[str]] = None,
         data_regimes: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cond = ["track = %s"]
-                params: List[Any] = [track]
-                if include_sources:
-                    cond.append("COALESCE(run_source, 'prod') = ANY(%s)")
-                    params.append([s.strip() for s in include_sources if s and s.strip()])
-                if exclude_sources:
-                    cond.append("COALESCE(run_source, 'prod') <> ALL(%s)")
-                    params.append([s.strip() for s in exclude_sources if s and s.strip()])
-                if data_regimes:
-                    cond.append("COALESCE(NULLIF(config->>'data_regime',''),'missing') = ANY(%s)")
-                    params.append([s.strip() for s in data_regimes if s and s.strip()])
-                params.append(limit)
-                cur.execute(
-                    f"""
-                    SELECT * FROM backtest_runs
-                    WHERE {' AND '.join(cond)}
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    tuple(params),
-                )
-                return [dict(r) for r in cur.fetchall()]
+        return backtest_store.list_recent_backtest_runs(
+            self._connect,
+            track=track,
+            limit=limit,
+            include_sources=include_sources,
+            exclude_sources=exclude_sources,
+            data_regimes=data_regimes,
+        )
 
     def list_failed_backtest_runs(
         self,
@@ -884,57 +1165,18 @@ class V2Repository:
         max_slippage_bps: float,
         orders: List[Dict[str, Any]],
     ) -> List[int]:
-        if not orders:
-            return []
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                rows = [
-                    (
-                        decision_id,
-                        o["target"],
-                        o.get("track", "liquid"),
-                        o["side"],
-                        o.get("quantity", 0.0),
-                        o.get("est_price"),
-                        float(max_slippage_bps),
-                        "submitted",
-                        adapter,
-                        venue,
-                        time_in_force,
-                        float(max_slippage_bps),
-                        o.get("strategy_id", "default-liquid-v1"),
-                        json.dumps(o.get("metadata", {})),
-                    )
-                    for o in orders
-                ]
-                inserted = execute_values(
-                    cur,
-                    """
-                    INSERT INTO orders_sim (
-                        decision_id, target, track, side, quantity, est_price, est_cost_bps,
-                        status, adapter, venue, time_in_force, max_slippage_bps, strategy_id, metadata, created_at
-                    ) VALUES %s
-                    RETURNING id
-                    """,
-                    rows,
-                    template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())",
-                    fetch=True,
-                )
-                return [int(r["id"]) for r in inserted]
+        return execution_store.create_execution_orders(
+            self._connect,
+            decision_id=decision_id,
+            adapter=adapter,
+            venue=venue,
+            time_in_force=time_in_force,
+            max_slippage_bps=max_slippage_bps,
+            orders=orders,
+        )
 
     def fetch_orders_for_decision(self, decision_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT * FROM orders_sim
-                    WHERE decision_id = %s
-                    ORDER BY created_at ASC
-                    LIMIT %s
-                    """,
-                    (decision_id, limit),
-                )
-                return [dict(r) for r in cur.fetchall()]
+        return execution_store.fetch_orders_for_decision(self._connect, decision_id=decision_id, limit=limit)
 
     def get_order_by_id(self, order_id: int) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -979,28 +1221,17 @@ class V2Repository:
         return {"signals": signals, "orders": orders, "positions": positions}
 
     def update_order_execution(self, order_id: int, status: str, metadata: Dict[str, Any]) -> None:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE orders_sim
-                    SET status = %s, metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
-                    WHERE id = %s
-                    """,
-                    (status, json.dumps(metadata), order_id),
-                )
+        execution_store.update_order_execution(self._connect, order_id=order_id, status=status, metadata=metadata)
 
     def save_risk_event(self, decision_id: str, severity: str, code: str, message: str, payload: Dict[str, Any]) -> None:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO risk_events (
-                        decision_id, severity, code, message, payload, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, NOW())
-                    """,
-                    (decision_id, severity, code, message, json.dumps(payload)),
-                )
+        execution_store.save_risk_event(
+            self._connect,
+            decision_id=decision_id,
+            severity=severity,
+            code=code,
+            message=message,
+            payload=payload,
+        )
 
     def save_scheduler_audit_log(
         self,
@@ -1476,8 +1707,14 @@ class V2Repository:
         track: str,
         lookback_days: int,
         data_version: Optional[str] = None,
-        limit: int = 5000,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        if limit is None or int(limit) <= 0:
+            rows_per_day = max(24, int(os.getenv("FEATURE_SNAPSHOT_ROWS_PER_DAY", "288")))
+            hard_cap = max(5000, int(os.getenv("FEATURE_HISTORY_MAX_LIMIT", "300000")))
+            resolved_limit = min(hard_cap, max(5000, int(lookback_days) * rows_per_day + 512))
+        else:
+            resolved_limit = max(1, int(limit))
         with self._connect() as conn:
             with conn.cursor() as cur:
                 try:
@@ -1499,7 +1736,7 @@ class V2Repository:
                             ORDER BY COALESCE(as_of_ts, as_of) ASC
                             LIMIT %s
                             """,
-                            (target, track, data_version, lookback_days, limit),
+                            (target, track, data_version, lookback_days, resolved_limit),
                         )
                     else:
                         cur.execute(
@@ -1518,7 +1755,7 @@ class V2Repository:
                             ORDER BY COALESCE(as_of_ts, as_of) ASC
                             LIMIT %s
                             """,
-                            (target, track, lookback_days, limit),
+                            (target, track, lookback_days, resolved_limit),
                         )
                 except Exception:
                     conn.rollback()
@@ -1533,7 +1770,7 @@ class V2Repository:
                             ORDER BY as_of_ts ASC
                             LIMIT %s
                             """,
-                            (target, track, data_version, lookback_days, limit),
+                            (target, track, data_version, lookback_days, resolved_limit),
                         )
                     else:
                         cur.execute(
@@ -1545,9 +1782,58 @@ class V2Repository:
                             ORDER BY as_of_ts ASC
                             LIMIT %s
                             """,
-                            (target, track, lookback_days, limit),
+                            (target, track, lookback_days, resolved_limit),
                         )
                 return [dict(r) for r in cur.fetchall()]
+
+    def get_ops_control_state(self, control_key: str) -> Optional[Dict[str, Any]]:
+        key = str(control_key or "").strip().lower()
+        if not key:
+            return None
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT control_key, payload, source, updated_by, updated_at
+                    FROM ops_control_state
+                    WHERE control_key = %s
+                    LIMIT 1
+                    """,
+                    (key,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def upsert_ops_control_state(
+        self,
+        control_key: str,
+        payload: Dict[str, Any],
+        *,
+        source: str = "api",
+        updated_by: str = "system",
+    ) -> Dict[str, Any]:
+        key = str(control_key or "").strip().lower()
+        if not key:
+            raise ValueError("control_key_required")
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ops_control_state (
+                        control_key, payload, source, updated_by, updated_at
+                    ) VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (control_key)
+                    DO UPDATE SET
+                        payload = EXCLUDED.payload,
+                        source = EXCLUDED.source,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    RETURNING control_key, payload, source, updated_by, updated_at
+                    """,
+                    (key, json.dumps(payload or {}), str(source or "api"), str(updated_by or "system")),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {}
 
     def get_active_model_state(self, track: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:

@@ -15,6 +15,9 @@ MARKET_CSV="${MARKET_CSV:-${ROOT_DIR}/artifacts/server_bundle/market_bars_top10_
 MARKET_CSV_2="${MARKET_CSV_2:-${ROOT_DIR}/artifacts/server_bundle/market_bars_top10_${SECONDARY_TF}_2025_now.csv}"
 EVENTS_JSONL="${EVENTS_JSONL:-${ROOT_DIR}/artifacts/server_bundle/events_multisource_2025_now.jsonl}"
 SOCIAL_JSONL="${SOCIAL_JSONL:-${ROOT_DIR}/artifacts/server_bundle/social_history_2025_now.jsonl}"
+ORDERBOOK_CSV="${ORDERBOOK_CSV:-${ROOT_DIR}/artifacts/server_bundle/orderbook_l2_2025_now.csv}"
+FUNDING_CSV="${FUNDING_CSV:-${ROOT_DIR}/artifacts/server_bundle/funding_rates_2025_now.csv}"
+ONCHAIN_CSV="${ONCHAIN_CSV:-${ROOT_DIR}/artifacts/server_bundle/onchain_signals_2025_now.csv}"
 
 if [[ ! -f "${MARKET_CSV}" ]]; then
   echo "[ERR] missing market csv: ${MARKET_CSV}" >&2
@@ -42,6 +45,15 @@ fi
 if [[ -f "${SOCIAL_JSONL}" ]]; then
   "${SCP_BASE[@]}" "${SOCIAL_JSONL}" "${USER_NAME}@${HOST}:${REMOTE_DIR}/artifacts/server_bundle/social_history_2025_now.jsonl"
 fi
+if [[ -f "${ORDERBOOK_CSV}" ]]; then
+  "${SCP_BASE[@]}" "${ORDERBOOK_CSV}" "${USER_NAME}@${HOST}:${REMOTE_DIR}/artifacts/server_bundle/orderbook_l2_2025_now.csv"
+fi
+if [[ -f "${FUNDING_CSV}" ]]; then
+  "${SCP_BASE[@]}" "${FUNDING_CSV}" "${USER_NAME}@${HOST}:${REMOTE_DIR}/artifacts/server_bundle/funding_rates_2025_now.csv"
+fi
+if [[ -f "${ONCHAIN_CSV}" ]]; then
+  "${SCP_BASE[@]}" "${ONCHAIN_CSV}" "${USER_NAME}@${HOST}:${REMOTE_DIR}/artifacts/server_bundle/onchain_signals_2025_now.csv"
+fi
 
 echo "[2/6] import market bars"
 "${SSH_BASE[@]}" "cd '${REMOTE_DIR}' && python3 scripts/import_market_bars_csv.py --csv artifacts/server_bundle/market_bars_top10_${PRIMARY_TF}_2025_now.csv --database-url '${DB_URL}'"
@@ -53,6 +65,21 @@ echo "[3/6] import events"
 "${SSH_BASE[@]}" "cd '${REMOTE_DIR}' && python3 scripts/import_events_jsonl.py --jsonl artifacts/server_bundle/events_multisource_2025_now.jsonl --database-url '${DB_URL}' --batch-size 200"
 if [[ -f "${SOCIAL_JSONL}" ]]; then
   "${SSH_BASE[@]}" "cd '${REMOTE_DIR}' && python3 scripts/import_social_events_jsonl.py --jsonl artifacts/server_bundle/social_history_2025_now.jsonl --database-url '${DB_URL}' --batch-size 200"
+fi
+
+if [[ -f "${ORDERBOOK_CSV}" || -f "${FUNDING_CSV}" || -f "${ONCHAIN_CSV}" ]]; then
+  echo "[3.5/6] import aux/orderbook csv"
+  AUX_CMD="cd '${REMOTE_DIR}' && python3 scripts/import_liquid_data_csv.py --database-url '${DB_URL}' --replace-window"
+  if [[ -f "${ORDERBOOK_CSV}" ]]; then
+    AUX_CMD="${AUX_CMD} --orderbook-csv artifacts/server_bundle/orderbook_l2_2025_now.csv"
+  fi
+  if [[ -f "${FUNDING_CSV}" ]]; then
+    AUX_CMD="${AUX_CMD} --funding-csv artifacts/server_bundle/funding_rates_2025_now.csv"
+  fi
+  if [[ -f "${ONCHAIN_CSV}" ]]; then
+    AUX_CMD="${AUX_CMD} --onchain-csv artifacts/server_bundle/onchain_signals_2025_now.csv"
+  fi
+  "${SSH_BASE[@]}" "${AUX_CMD}"
 fi
 
 echo "[4/6] run data completeness audit (420d)"

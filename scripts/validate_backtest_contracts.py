@@ -4,30 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
-
-def _run_psql(sql: str) -> str:
-    cmd = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        "monitor",
-        "-d",
-        "monitor",
-        "-At",
-        "-F",
-        "|",
-        "-c",
-        sql,
-    ]
-    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+from _psql import run_psql
 
 
 def _parse_sources(raw: str) -> List[str]:
@@ -136,7 +116,7 @@ def main() -> int:
         f"LIMIT {max(1, int(args.limit))};"
     )
 
-    rows = [r for r in _run_psql(sql).splitlines() if r.strip()]
+    rows = [r for r in run_psql(sql).splitlines() if r.strip()]
     sql_shadow = (
         "SELECT COUNT(*)::text FROM backtest_runs "
         f"WHERE track='{str(args.track).strip().lower()}' "
@@ -146,7 +126,7 @@ def main() -> int:
         + f"AND COALESCE(config->>'score_source','heuristic')='{args.score_source}' "
         "AND COALESCE(NULLIF(config->>'data_regime',''),'missing')='missing';"
     )
-    raw_shadow = _run_psql(sql_shadow)
+    raw_shadow = run_psql(sql_shadow)
     prod_model_missing_regime_rows = int(float(raw_shadow or 0)) if raw_shadow else 0
     valid = 0
     invalid = 0

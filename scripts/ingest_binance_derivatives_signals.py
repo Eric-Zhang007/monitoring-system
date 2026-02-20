@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import psycopg2
@@ -15,6 +17,20 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+try:
+    from inference.liquid_feature_contract import DERIVATIVE_METRIC_NAMES as CONTRACT_DERIVATIVE_METRICS
+except Exception:
+    CONTRACT_DERIVATIVE_METRICS = [
+        "long_short_ratio_global_accounts",
+        "long_short_ratio_top_accounts",
+        "long_short_ratio_top_positions",
+        "taker_buy_sell_ratio",
+        "basis_rate",
+        "annualized_basis_rate",
+    ]
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 
@@ -109,6 +125,17 @@ def _safe_float(raw: Any) -> Optional[float]:
         return None
 
 
+def _period_ms(period: str) -> int:
+    text = str(period or "").strip().lower()
+    if text.endswith("m"):
+        return max(1, int(text[:-1] or "1")) * 60_000
+    if text.endswith("h"):
+        return max(1, int(text[:-1] or "1")) * 3_600_000
+    if text.endswith("d"):
+        return max(1, int(text[:-1] or "1")) * 86_400_000
+    raise ValueError(f"unsupported_period:{period}")
+
+
 def _build_session(proxy: str = "") -> requests.Session:
     sess = requests.Session()
     retry = Retry(
@@ -144,6 +171,39 @@ def _dedup_points(points: Sequence[Tuple[int, float]]) -> List[Tuple[int, float]
     for ts_ms, v in points:
         dedup[int(ts_ms)] = float(v)
     return sorted(dedup.items(), key=lambda x: x[0])
+
+
+def _expand_forward_fill(
+    points: Sequence[Tuple[int, float]],
+    *,
+    start_ms: int,
+    end_ms: int,
+    bucket_ms: int,
+) -> List[Tuple[int, float]]:
+    if not points:
+        return []
+    if bucket_ms <= 0:
+        return _dedup_points(points)
+    base = _dedup_points(points)
+    if base and int(base[0][0]) > int(start_ms):
+        base = [(int(start_ms), float(base[0][1]))] + base
+    out: List[Tuple[int, float]] = []
+    clipped_start = int(start_ms)
+    clipped_end = int(end_ms)
+    for idx, (ts_ms, value) in enumerate(base):
+        right = base[idx + 1][0] - 1 if idx + 1 < len(base) else clipped_end
+        seg_start = max(int(ts_ms), clipped_start)
+        seg_end = min(int(right), clipped_end)
+        if seg_end < seg_start:
+            continue
+        bucket_start = int((seg_start // bucket_ms) * bucket_ms)
+        if bucket_start < clipped_start:
+            bucket_start += bucket_ms
+        cur = bucket_start
+        while cur <= seg_end:
+            out.append((int(cur), float(value)))
+            cur += bucket_ms
+    return _dedup_points(out)
 
 
 def _fetch_metric_series(
@@ -322,11 +382,13 @@ def main() -> int:
     ap.add_argument("--source", default="binance_fapi_derivatives")
     ap.add_argument(
         "--metrics",
-        default="long_short_ratio_global_accounts,long_short_ratio_top_accounts,long_short_ratio_top_positions,taker_buy_sell_ratio,basis_rate,annualized_basis_rate",
+        default=",".join(CONTRACT_DERIVATIVE_METRICS),
     )
     ap.add_argument("--replace-window", action="store_true", default=True)
     ap.add_argument("--no-replace-window", dest="replace_window", action="store_false")
     ap.add_argument("--proxy", default=os.getenv("HTTPS_PROXY", os.getenv("ALL_PROXY", "")))
+    ap.add_argument("--expand-to-period", action="store_true", default=True)
+    ap.add_argument("--no-expand-to-period", dest="expand_to_period", action="store_false")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out-json", default="")
     args = ap.parse_args()
@@ -359,6 +421,7 @@ def main() -> int:
     floor_dt = datetime.now(timezone.utc) - timedelta(days=max(1, int(args.max_lookback_days)))
     floor_ms = int(floor_dt.timestamp() * 1000)
     clamped_start_ms = max(start_ms, floor_ms)
+    bucket_ms = _period_ms(str(args.period))
 
     out: Dict[str, Any] = {
         "status": "ok",
@@ -411,6 +474,7 @@ def main() -> int:
                 "metrics": {},
                 "warnings": [],
             }
+            basis_series_for_annualized: List[Tuple[int, float]] = []
             if bool(args.replace_window):
                 deleted = _replace_window(
                     conn,
@@ -439,6 +503,18 @@ def main() -> int:
                     sleep_sec=float(args.sleep_sec),
                     contract_type=str(args.contract_type),
                 )
+                raw_points = int(len(series))
+                if bool(args.expand_to_period) and raw_points > 0:
+                    series = _expand_forward_fill(
+                        series,
+                        start_ms=clamped_start_ms,
+                        end_ms=end_ms,
+                        bucket_ms=bucket_ms,
+                    )
+                if metric_name == "basis_rate":
+                    basis_series_for_annualized = list(series)
+                if metric_name == "annualized_basis_rate" and not series and basis_series_for_annualized:
+                    series = [(int(ts_ms), float(val) * 365.0) for ts_ms, val in basis_series_for_annualized]
                 if warn:
                     msg = f"{metric_name}:{warn}"
                     sym_obj["warnings"].append(msg)
@@ -453,6 +529,7 @@ def main() -> int:
                     batch_size=int(args.batch_size),
                 )
                 sym_obj["metrics"][metric_name] = {
+                    "raw_points": int(raw_points),
                     "points": int(len(series)),
                     "written": int(written),
                 }

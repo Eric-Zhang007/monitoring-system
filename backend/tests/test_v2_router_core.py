@@ -282,6 +282,9 @@ def test_run_execution_blocks_on_abnormal_volatility(monkeypatch):
             prices[-1] = prices[-2] * 1.2
             return [{"price": p} for p in prices]
 
+        def latest_price_snapshot(self, symbol: str):
+            return {"symbol": symbol, "price": 100.0, "volume": 1000.0, "timestamp": datetime.now(timezone.utc)}
+
         def upsert_kill_switch_state(self, **kwargs):
             return {}
 
@@ -336,6 +339,9 @@ def test_run_execution_blocks_on_strategy_consecutive_losses(monkeypatch):
         def load_price_history(self, symbol: str, lookback_days: int = 90):
             return [{"price": 100.0 + i * 0.01} for i in range(60)]
 
+        def latest_price_snapshot(self, symbol: str):
+            return {"symbol": symbol, "price": 100.0, "volume": 1000.0, "timestamp": datetime.now(timezone.utc)}
+
         def get_execution_consecutive_losses(self, track: str, lookback_hours: int = 24, limit: int = 200, strategy_id: str | None = None):
             return 3 if strategy_id == "strat-a" else 0
 
@@ -372,6 +378,9 @@ def test_run_execution_blocks_on_take_profit_precheck(monkeypatch):
 
         def load_price_history(self, symbol: str, lookback_days: int = 90):
             return [{"price": 100.0 + i * 0.01} for i in range(80)]
+
+        def latest_price_snapshot(self, symbol: str):
+            return {"symbol": symbol, "price": 100.0, "volume": 1000.0, "timestamp": datetime.now(timezone.utc)}
 
         def get_execution_consecutive_losses(self, track: str, lookback_hours: int = 24, limit: int = 200, strategy_id: str | None = None):
             return 0

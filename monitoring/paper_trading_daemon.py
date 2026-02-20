@@ -7,13 +7,14 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
-DEFAULT_SYMBOLS = "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"
+DEFAULT_SYMBOLS = "BTC,ETH,SOL"
 
 
 def _now_iso() -> str:
@@ -42,58 +43,6 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def _fetch_latest_predictions(cur, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-    cur.execute(
-        """
-        WITH ranked AS (
-          SELECT
-            target,
-            outputs,
-            created_at,
-            ROW_NUMBER() OVER (PARTITION BY target ORDER BY created_at DESC) AS rn
-          FROM predictions_v2
-          WHERE track = 'liquid'
-            AND target = ANY(%s)
-        )
-        SELECT target, outputs, created_at
-        FROM ranked
-        WHERE rn = 1
-        """,
-        (symbols,),
-    )
-    out: Dict[str, Dict[str, Any]] = {}
-    for r in cur.fetchall() or []:
-        out[str(r.get("target") or "").upper()] = {
-            "outputs": r.get("outputs") if isinstance(r.get("outputs"), dict) else {},
-            "created_at": r.get("created_at"),
-        }
-    return out
-
-
-def _fetch_latest_prices(cur, symbols: List[str], timeframe: str) -> Dict[str, float]:
-    cur.execute(
-        """
-        WITH ranked AS (
-          SELECT
-            symbol,
-            close::double precision AS close,
-            ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn
-          FROM market_bars
-          WHERE symbol = ANY(%s)
-            AND timeframe = %s
-        )
-        SELECT symbol, close
-        FROM ranked
-        WHERE rn = 1
-        """,
-        (symbols, timeframe),
-    )
-    out: Dict[str, float] = {}
-    for r in cur.fetchall() or []:
-        out[str(r.get("symbol") or "").upper()] = float(r.get("close") or 0.0)
-    return out
-
-
 def _target_position(pred_payload: Dict[str, Any]) -> float:
     signal = float(pred_payload.get("expected_return") or 0.0)
     confidence = float(pred_payload.get("signal_confidence") or 0.0)
@@ -106,11 +55,60 @@ def _target_position(pred_payload: Dict[str, Any]) -> float:
     return float(signed * mag)
 
 
+def _http_session() -> requests.Session:
+    sess = requests.Session()
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+
+def _call_json(
+    sess: requests.Session,
+    method: str,
+    url: str,
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout_sec: float = 12.0,
+) -> Dict[str, Any]:
+    resp = sess.request(
+        method=method.upper(),
+        url=url,
+        json=payload,
+        timeout=max(0.5, float(timeout_sec)),
+    )
+    body: Dict[str, Any] = {}
+    if resp.content:
+        try:
+            parsed = resp.json()
+            if isinstance(parsed, dict):
+                body = parsed
+        except Exception:
+            body = {"raw": resp.text[:500]}
+    if resp.status_code >= 300:
+        raise RuntimeError(f"http_{resp.status_code}:{body}")
+    return body
+
+
 def _run_cycle(
     *,
-    db_url: str,
+    api_base: str,
     symbols: List[str],
-    timeframe: str,
+    horizon: str,
+    min_confidence: float,
+    strategy_id: str,
+    capital_per_order_usd: float,
+    max_orders: int,
+    timeout_sec: float,
     state_path: Path,
     history_path: Path,
     control_path: Path,
@@ -120,68 +118,186 @@ def _run_cycle(
     live_enabled = bool(control.get("live_enabled", False))
     paper_enabled = bool(control.get("paper_enabled", True))
 
-    prev_equity = float(state.get("equity", 1.0) or 1.0)
-    prev_prices = state.get("last_prices") if isinstance(state.get("last_prices"), dict) else {}
-    prev_positions = state.get("positions") if isinstance(state.get("positions"), dict) else {}
+    base_cycle: Dict[str, Any] = {
+        "timestamp": _now_iso(),
+        "paper_enabled": paper_enabled,
+        "live_enabled": live_enabled,
+        "symbols": symbols,
+        "horizon": horizon,
+        "min_confidence": float(min_confidence),
+    }
 
-    with psycopg2.connect(db_url, cursor_factory=RealDictCursor) as conn:
-        with conn.cursor() as cur:
-            preds = _fetch_latest_predictions(cur, symbols)
-            prices = _fetch_latest_prices(cur, symbols, timeframe=timeframe)
-
-    if not prices:
+    if not paper_enabled:
         cycle = {
-            "timestamp": _now_iso(),
-            "status": "no_prices",
-            "equity": prev_equity,
-            "paper_enabled": paper_enabled,
-            "live_enabled": live_enabled,
-            "symbols": symbols,
+            **base_cycle,
+            "status": "paper_disabled",
+            "signals": 0,
+            "orders": 0,
+            "filled": 0,
+            "rejected": 0,
+            "reject_breakdown": {},
+            "decision_id": None,
+            "order_ids": [],
+            "failures": [],
         }
         _write_json(state_path, cycle)
         _append_jsonl(history_path, cycle)
         return cycle
 
-    pnl = 0.0
-    next_positions: Dict[str, float] = {}
+    sess = _http_session()
+    signals: List[Dict[str, Any]] = []
+    orders: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+
     for sym in symbols:
-        px = float(prices.get(sym, 0.0) or 0.0)
-        old_px = float(prev_prices.get(sym, px) or px)
-        old_pos = float(prev_positions.get(sym, 0.0) or 0.0)
-        if old_px > 0:
-            pnl += old_pos * ((px - old_px) / old_px)
+        try:
+            sig = _call_json(
+                sess,
+                "POST",
+                f"{api_base}/api/v2/signals/generate",
+                payload={
+                    "track": "liquid",
+                    "target": sym,
+                    "horizon": horizon,
+                    "policy": "baseline-v2",
+                    "min_confidence": float(min_confidence),
+                    "strategy_id": strategy_id,
+                    "cost_profile": "standard",
+                    "risk_profile": "balanced",
+                },
+                timeout_sec=timeout_sec,
+            )
+            signals.append(sig)
+        except Exception as exc:
+            failures.append({"symbol": sym, "stage": "signal", "error": str(exc)})
+            continue
 
-        pred_payload = preds.get(sym, {}).get("outputs") if isinstance(preds.get(sym), dict) else {}
-        next_pos = _target_position(pred_payload) if paper_enabled else 0.0
-        next_positions[sym] = float(next_pos)
+        action = str(sig.get("action") or "hold").lower()
+        confidence = float(sig.get("confidence") or 0.0)
+        if action not in {"buy", "sell"} or confidence < float(min_confidence):
+            continue
 
-    equity = float(max(0.01, prev_equity * (1.0 + pnl)))
+        try:
+            pred = _call_json(
+                sess,
+                "POST",
+                f"{api_base}/api/v2/predict/liquid",
+                payload={"symbol": sym, "horizon": horizon},
+                timeout_sec=timeout_sec,
+            )
+            px = float(pred.get("outputs", {}).get("current_price") or 0.0)
+        except Exception as exc:
+            failures.append({"symbol": sym, "stage": "price", "error": str(exc)})
+            continue
+
+        if px <= 0.0:
+            failures.append({"symbol": sym, "stage": "price", "error": "invalid_price"})
+            continue
+
+        qty = max(0.000001, (float(capital_per_order_usd) / px) * max(0.2, min(1.0, confidence)))
+        orders.append(
+            {
+                "target": sym,
+                "track": "liquid",
+                "side": action,
+                "quantity": round(float(qty), 8),
+                "est_price": float(px),
+                "strategy_id": strategy_id,
+                "metadata": {
+                    "source": "paper_trading_daemon",
+                    "signal_confidence": confidence,
+                    "signal_id": sig.get("signal_id"),
+                },
+            }
+        )
+
+    if len(orders) > max(1, int(max_orders)):
+        orders = orders[: max(1, int(max_orders))]
+
+    if not orders:
+        cycle = {
+            **base_cycle,
+            "status": "no_orders",
+            "signals": len(signals),
+            "orders": 0,
+            "filled": 0,
+            "rejected": 0,
+            "reject_breakdown": {},
+            "decision_id": None,
+            "order_ids": [],
+            "failures": failures[:20],
+            "prev_state_status": str(state.get("status") or ""),
+        }
+        _write_json(state_path, cycle)
+        _append_jsonl(history_path, cycle)
+        return cycle
+
+    submit = _call_json(
+        sess,
+        "POST",
+        f"{api_base}/api/v2/execution/orders",
+        payload={
+            "adapter": "paper",
+            "venue": "coinbase",
+            "time_in_force": "IOC",
+            "max_slippage_bps": 12.0,
+            "market_type": "spot",
+            "orders": orders,
+        },
+        timeout_sec=timeout_sec,
+    )
+    decision_id = str(submit.get("decision_id") or "")
+    if not decision_id:
+        raise RuntimeError("missing_decision_id_from_submit")
+
+    run_out = _call_json(
+        sess,
+        "POST",
+        f"{api_base}/api/v2/execution/run",
+        payload={
+            "decision_id": decision_id,
+            "adapter": "paper",
+            "time_in_force": "IOC",
+            "max_slippage_bps": 12.0,
+            "venue": "coinbase",
+            "market_type": "spot",
+            "max_orders": len(orders),
+            "limit_timeout_sec": 2.0,
+            "max_retries": 1,
+            "fee_bps": 5.0,
+        },
+        timeout_sec=timeout_sec,
+    )
 
     cycle = {
-        "timestamp": _now_iso(),
+        **base_cycle,
         "status": "ok",
-        "paper_enabled": paper_enabled,
-        "live_enabled": live_enabled,
-        "equity": equity,
-        "equity_change": float(equity - prev_equity),
-        "pnl_ratio": float(pnl),
-        "positions": next_positions,
-        "last_prices": prices,
-        "prediction_count": len(preds),
-        "timeframe": timeframe,
-        "symbols": symbols,
+        "signals": len(signals),
+        "orders": len(orders),
+        "filled": int(run_out.get("filled") or 0),
+        "rejected": int(run_out.get("rejected") or 0),
+        "reject_breakdown": dict(run_out.get("reject_breakdown") or {}),
+        "decision_id": decision_id,
+        "order_ids": list(submit.get("order_ids") or []),
+        "failures": failures[:20],
+        "prev_state_status": str(state.get("status") or ""),
     }
-
     _write_json(state_path, cycle)
     _append_jsonl(history_path, cycle)
     return cycle
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Continuous paper-trading daemon with manual live control")
+    parser = argparse.ArgumentParser(description="Continuous paper-trading daemon through unified v2 execution loop")
+    parser.add_argument("--api-base", default=os.getenv("API_BASE", "http://localhost:8000"))
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor"))
     parser.add_argument("--symbols", default=os.getenv("LIQUID_SYMBOLS", DEFAULT_SYMBOLS))
-    parser.add_argument("--timeframe", default=os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m"))
+    parser.add_argument("--horizon", default=os.getenv("PAPER_HORIZON", "1d"), choices=["1h", "1d", "7d"])
+    parser.add_argument("--min-confidence", type=float, default=float(os.getenv("PAPER_MIN_CONFIDENCE", "0.45")))
+    parser.add_argument("--strategy-id", default=os.getenv("PAPER_STRATEGY_ID", "continuous-paper-v1"))
+    parser.add_argument("--capital-per-order-usd", type=float, default=float(os.getenv("PAPER_CAPITAL_PER_ORDER_USD", "300.0")))
+    parser.add_argument("--max-orders", type=int, default=int(os.getenv("PAPER_MAX_ORDERS_PER_CYCLE", "8")))
+    parser.add_argument("--request-timeout-sec", type=float, default=float(os.getenv("PAPER_REQUEST_TIMEOUT_SEC", "12")))
     parser.add_argument("--interval-sec", type=float, default=float(os.getenv("PAPER_DAEMON_INTERVAL_SEC", "60")))
     parser.add_argument("--state-file", default=os.getenv("PAPER_STATE_FILE", "artifacts/paper/paper_state.json"))
     parser.add_argument("--history-file", default=os.getenv("PAPER_HISTORY_FILE", "artifacts/paper/paper_history.jsonl"))
@@ -199,20 +315,42 @@ def main() -> int:
 
     if bool(args.loop):
         while True:
-            _run_cycle(
-                db_url=args.database_url,
-                symbols=symbols,
-                timeframe=str(args.timeframe),
-                state_path=state_path,
-                history_path=history_path,
-                control_path=control_path,
-            )
+            try:
+                _run_cycle(
+                    api_base=str(args.api_base).rstrip("/"),
+                    symbols=symbols,
+                    horizon=str(args.horizon),
+                    min_confidence=float(args.min_confidence),
+                    strategy_id=str(args.strategy_id),
+                    capital_per_order_usd=float(args.capital_per_order_usd),
+                    max_orders=int(args.max_orders),
+                    timeout_sec=float(args.request_timeout_sec),
+                    state_path=state_path,
+                    history_path=history_path,
+                    control_path=control_path,
+                )
+            except Exception as exc:
+                err = {
+                    "timestamp": _now_iso(),
+                    "status": "error",
+                    "error": str(exc),
+                    "paper_enabled": bool(_load_json(control_path).get("paper_enabled", True)),
+                    "live_enabled": bool(_load_json(control_path).get("live_enabled", False)),
+                    "symbols": symbols,
+                }
+                _write_json(state_path, err)
+                _append_jsonl(history_path, err)
             time.sleep(max(1.0, float(args.interval_sec)))
     else:
         cycle = _run_cycle(
-            db_url=args.database_url,
+            api_base=str(args.api_base).rstrip("/"),
             symbols=symbols,
-            timeframe=str(args.timeframe),
+            horizon=str(args.horizon),
+            min_confidence=float(args.min_confidence),
+            strategy_id=str(args.strategy_id),
+            capital_per_order_usd=float(args.capital_per_order_usd),
+            max_orders=int(args.max_orders),
+            timeout_sec=float(args.request_timeout_sec),
             state_path=state_path,
             history_path=history_path,
             control_path=control_path,

@@ -1,8 +1,73 @@
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class ValidationProtocol:
+    wf_train_window: int = 512
+    wf_test_window: int = 96
+    wf_purge_window: int = 12
+    wf_step_window: int = 96
+    wf_min_folds: int = 3
+    pkf_splits: int = 5
+    pkf_purge_window: int = 12
+    min_train_points: int = 64
+    min_test_points: int = 16
+
+
+def _env_int(candidates: List[str], default: int) -> int:
+    for name in candidates:
+        raw = str(os.getenv(name, "")).strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except Exception:
+            continue
+    return int(default)
+
+
+def resolve_validation_protocol(prefix: str = "LIQUID") -> ValidationProtocol:
+    key_prefix = str(prefix or "LIQUID").strip().upper()
+    wf_train_window = _env_int([f"{key_prefix}_WF_TRAIN_WINDOW", "VALIDATION_WF_TRAIN_WINDOW"], 512)
+    wf_test_window = _env_int([f"{key_prefix}_WF_TEST_WINDOW", "VALIDATION_WF_TEST_WINDOW"], 96)
+    wf_purge_window = _env_int([f"{key_prefix}_WF_PURGE_WINDOW", "VALIDATION_WF_PURGE_WINDOW"], 12)
+    wf_step_window = _env_int([f"{key_prefix}_WF_STEP_WINDOW", "VALIDATION_WF_STEP_WINDOW"], wf_test_window)
+    wf_min_folds = _env_int([f"{key_prefix}_WF_MIN_FOLDS", "VALIDATION_WF_MIN_FOLDS"], 3)
+    pkf_splits = _env_int([f"{key_prefix}_PURGED_KFOLD_SPLITS", "VALIDATION_PURGED_KFOLD_SPLITS"], 5)
+    pkf_purge_window = _env_int([f"{key_prefix}_PURGED_KFOLD_PURGE", "VALIDATION_PURGED_KFOLD_PURGE"], 12)
+    min_train_points = _env_int([f"{key_prefix}_MIN_TRAIN_POINTS", "VALIDATION_MIN_TRAIN_POINTS"], 64)
+    min_test_points = _env_int([f"{key_prefix}_MIN_TEST_POINTS", "VALIDATION_MIN_TEST_POINTS"], 16)
+    return ValidationProtocol(
+        wf_train_window=max(1, int(wf_train_window)),
+        wf_test_window=max(1, int(wf_test_window)),
+        wf_purge_window=max(0, int(wf_purge_window)),
+        wf_step_window=max(1, int(wf_step_window)),
+        wf_min_folds=max(1, int(wf_min_folds)),
+        pkf_splits=max(2, int(pkf_splits)),
+        pkf_purge_window=max(0, int(pkf_purge_window)),
+        min_train_points=max(1, int(min_train_points)),
+        min_test_points=max(1, int(min_test_points)),
+    )
+
+
+def validation_protocol_to_dict(protocol: ValidationProtocol) -> Dict[str, int]:
+    return {
+        "wf_train_window": int(protocol.wf_train_window),
+        "wf_test_window": int(protocol.wf_test_window),
+        "wf_purge_window": int(protocol.wf_purge_window),
+        "wf_step_window": int(protocol.wf_step_window),
+        "wf_min_folds": int(protocol.wf_min_folds),
+        "pkf_splits": int(protocol.pkf_splits),
+        "pkf_purge_window": int(protocol.pkf_purge_window),
+        "min_train_points": int(protocol.min_train_points),
+        "min_test_points": int(protocol.min_test_points),
+    }
 
 
 def walk_forward_slices(

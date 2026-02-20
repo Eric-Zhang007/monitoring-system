@@ -274,12 +274,19 @@ def main() -> int:
     ap.add_argument("--social-sources", default=os.getenv("BACKFILL_SOCIAL_SOURCES", "twitter,reddit,youtube,telegram"))
     ap.add_argument("--skip-events", action="store_true")
     ap.add_argument("--skip-social", action="store_true")
+    ap.add_argument("--event-disable-google", action="store_true", default=str(os.getenv("BACKFILL_EVENT_DISABLE_GOOGLE", "0")).strip().lower() in {"1", "true", "yes", "on"})
+    ap.add_argument("--event-disable-gdelt", action="store_true", default=str(os.getenv("BACKFILL_EVENT_DISABLE_GDELT", "0")).strip().lower() in {"1", "true", "yes", "on"})
+    ap.add_argument("--event-disable-official-rss", action="store_true", default=str(os.getenv("BACKFILL_EVENT_DISABLE_OFFICIAL_RSS", "0")).strip().lower() in {"1", "true", "yes", "on"})
+    ap.add_argument("--event-disable-source-balance", action="store_true", default=str(os.getenv("BACKFILL_EVENT_DISABLE_SOURCE_BALANCE", "0")).strip().lower() in {"1", "true", "yes", "on"})
+    ap.add_argument("--event-gdelt-max-records", type=int, default=max(10, int(os.getenv("BACKFILL_EVENT_GDELT_MAX_RECORDS", "50"))))
+    ap.add_argument("--event-day-step", type=int, default=max(1, int(os.getenv("BACKFILL_EVENT_DAY_STEP", "7"))))
     ap.add_argument("--event-script", default="scripts/build_multisource_events_2025.py")
     ap.add_argument("--social-script", default="scripts/backfill_social_history.py")
     ap.add_argument("--chunk-dir", default="artifacts/backfill_2018_now/chunks")
     ap.add_argument("--out-events-jsonl", default="artifacts/backfill_2018_now/events_2018_now.jsonl")
     ap.add_argument("--out-social-jsonl", default="artifacts/backfill_2018_now/social_2018_now.jsonl")
     args = ap.parse_args()
+    python_bin = str(os.getenv("PYTHON_BIN", "python3")).strip() or "python3"
 
     start_dt = _parse_dt_utc(args.start)
     end_dt = _parse_dt_utc(args.end) if str(args.end).strip() else datetime.now(timezone.utc)
@@ -355,21 +362,30 @@ def main() -> int:
         event_chunk = str(chunk_dir / f"{cid}.events.jsonl")
         social_chunk = str(chunk_dir / f"{cid}.social.jsonl")
         event_cmd = [
-            "python3",
+            python_bin,
             str(args.event_script),
             "--start",
             _to_iso_z(w_start),
             "--end",
             _to_iso_z(w_end),
             "--day-step",
-            str(max(1, min(7, int(args.chunk_days)))),
+            str(max(1, int(args.event_day_step))),
             "--google-locales",
             ",".join(google_locales),
             "--out-jsonl",
             event_chunk,
         ]
+        if bool(args.event_disable_google):
+            event_cmd.append("--disable-google")
+        if bool(args.event_disable_gdelt):
+            event_cmd.append("--disable-gdelt")
+        if bool(args.event_disable_official_rss):
+            event_cmd.append("--disable-official-rss")
+        if bool(args.event_disable_source_balance):
+            event_cmd.append("--disable-source-balance")
+        event_cmd.extend(["--gdelt-max-records", str(max(10, int(args.event_gdelt_max_records)))])
         social_cmd = [
-            "python3",
+            python_bin,
             str(args.social_script),
             "--start",
             _to_iso_z(w_start),

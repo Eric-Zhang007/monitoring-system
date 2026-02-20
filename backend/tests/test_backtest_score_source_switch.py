@@ -50,7 +50,11 @@ def _build_price_rows(n: int):
 
 
 def test_model_score_source_fails_without_artifact_under_strict_model_only(monkeypatch):
-    monkeypatch.setattr(router_mod, "_load_tabular_model_weights", lambda _target: None)
+    class _FailService:
+        def predict_from_feature_payload(self, **kwargs):
+            raise RuntimeError("model_artifact_missing:tabular:BTC")
+
+    monkeypatch.setattr(router_mod, "_get_liquid_model_service", lambda: _FailService())
     out = router_mod._run_model_inference_backtest(
         target="BTC",
         feature_rows=_build_feature_rows(120),

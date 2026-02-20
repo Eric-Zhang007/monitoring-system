@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 from _metrics_test_logger import record_metrics_test
+from _psql import run_psql
 
 
 BITGET_PERP_URL = "https://api.bitget.com/api/v2/mix/market/history-candles"
@@ -42,50 +43,23 @@ class EventPoint:
     confidence: float
 
 
-def _run(cmd: List[str], input_text: str | None = None) -> str:
-    p = subprocess.run(cmd, input=input_text, capture_output=True, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"command failed: {' '.join(cmd)}\n{p.stderr.strip()}")
-    return p.stdout.strip()
-
-
 def _psql(sql: str) -> str:
-    cmd = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        "monitor",
-        "-d",
-        "monitor",
-        "-At",
-        "-F",
-        "|",
-        "-c",
-        sql,
-    ]
-    return _run(cmd)
+    return run_psql(sql)
 
 
 def _copy_csv(table_cols: str, csv_text: str) -> None:
+    dsn = str(os.getenv("DATABASE_URL", "")).strip() or str(os.getenv("METRICS_DATABASE_URL", "")).strip()
+    if not dsn:
+        raise RuntimeError("DATABASE_URL is required for COPY import")
     cmd = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
         "psql",
-        "-U",
-        "monitor",
-        "-d",
-        "monitor",
+        dsn,
         "-c",
         f"\\copy {table_cols} FROM STDIN WITH (FORMAT csv)",
     ]
-    _run(cmd, input_text=csv_text)
+    p = subprocess.run(cmd, input=csv_text, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"copy failed: {p.stderr.strip() or p.stdout.strip()}")
 
 
 def _fetch_symbol_2025(symbol: str, market: str, limit: int = 200) -> List[Candle]:

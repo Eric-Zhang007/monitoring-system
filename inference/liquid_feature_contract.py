@@ -6,26 +6,64 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-LIQUID_FEATURE_SCHEMA_VERSION = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.3")
-LIQUID_FEATURE_KEYS: List[str] = [
+ONCHAIN_FLOW_METRIC_NAMES: List[str] = [
+    "netflow",
+    "exchange_netflow",
+    "net_inflow",
+]
+DEFAULT_ONCHAIN_PRIMARY_METRIC = "net_inflow"
+DERIVATIVE_METRIC_KEY_MAP: Dict[str, str] = {
+    "long_short_ratio_global_accounts": "deriv_long_short_ratio_global_accounts",
+    "long_short_ratio_top_accounts": "deriv_long_short_ratio_top_accounts",
+    "long_short_ratio_top_positions": "deriv_long_short_ratio_top_positions",
+    "taker_buy_sell_ratio": "deriv_taker_buy_sell_ratio",
+    "basis_rate": "deriv_basis_rate",
+    "annualized_basis_rate": "deriv_annualized_basis_rate",
+}
+DERIVATIVE_METRIC_NAMES: List[str] = list(DERIVATIVE_METRIC_KEY_MAP.keys())
+DERIVATIVE_FEATURE_KEYS: List[str] = list(DERIVATIVE_METRIC_KEY_MAP.values())
+DERIVATIVE_MISSING_FLAG_KEYS: List[str] = [f"{k}_missing_flag" for k in DERIVATIVE_FEATURE_KEYS]
+
+BASE_V2_FEATURE_KEYS: List[str] = [
     "ret_1",
     "ret_3",
     "ret_12",
     "ret_48",
+    "ret_96",
+    "ret_288",
     "vol_3",
     "vol_12",
     "vol_48",
     "vol_96",
+    "vol_288",
+    "ret_accel_1_3",
+    "ret_accel_3_12",
+    "ret_accel_12_48",
+    "vol_term_3_12",
+    "vol_term_12_48",
+    "vol_term_48_288",
     "log_volume",
     "vol_z",
     "volume_impact",
     "orderbook_imbalance",
     "funding_rate",
     "onchain_norm",
+    "deriv_long_short_ratio_global_accounts",
+    "deriv_long_short_ratio_top_accounts",
+    "deriv_long_short_ratio_top_positions",
+    "deriv_taker_buy_sell_ratio",
+    "deriv_basis_rate",
+    "deriv_annualized_basis_rate",
     "event_decay",
     "orderbook_missing_flag",
     "funding_missing_flag",
     "onchain_missing_flag",
+    "deriv_long_short_ratio_global_accounts_missing_flag",
+    "deriv_long_short_ratio_top_accounts_missing_flag",
+    "deriv_long_short_ratio_top_positions_missing_flag",
+    "deriv_taker_buy_sell_ratio_missing_flag",
+    "deriv_basis_rate_missing_flag",
+    "deriv_annualized_basis_rate_missing_flag",
     "source_tier_weight",
     "source_confidence",
     "social_post_sentiment",
@@ -43,7 +81,36 @@ LIQUID_FEATURE_KEYS: List[str] = [
     "event_lag_bucket_0_1h",
     "event_lag_bucket_1_6h",
     "event_lag_bucket_6_24h",
+    "event_density",
+    "sentiment_abs",
+    "social_comment_rate",
+    "event_importance_mean",
+    "novelty_confidence_blend",
 ]
+ONLINE_LIQUID_FEATURE_KEYS: List[str] = list(BASE_V2_FEATURE_KEYS)
+
+LIQUID_MANUAL_FEATURE_KEYS: List[str] = list(BASE_V2_FEATURE_KEYS) + [
+    f"manual_stat_{i:03d}" for i in range(351)
+]
+
+LIQUID_FEATURE_SCHEMA_VERSION = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "main")
+_schema = str(LIQUID_FEATURE_SCHEMA_VERSION).strip().lower()
+_schema_latent_dim_map = {
+    "main_64": 64,
+    "main-lite64": 64,
+    "main_lite64": 64,
+    "mainv3": 64,
+    "v3": 64,
+}
+_default_latent_dim = max(0, int(os.getenv("LIQUID_LATENT_DIM", "128")))
+_resolved_latent_dim = int(_schema_latent_dim_map.get(_schema, _default_latent_dim))
+LIQUID_LATENT_FEATURE_KEYS: List[str] = [f"latent_{i:03d}" for i in range(_resolved_latent_dim)]
+LIQUID_FULL_FEATURE_KEYS: List[str] = LIQUID_MANUAL_FEATURE_KEYS + LIQUID_LATENT_FEATURE_KEYS
+
+if _schema in {"v2", "v2.3", "legacy"}:
+    LIQUID_FEATURE_KEYS: List[str] = list(BASE_V2_FEATURE_KEYS)
+else:
+    LIQUID_FEATURE_KEYS: List[str] = list(LIQUID_FULL_FEATURE_KEYS)
 
 
 def source_tier_weights() -> Dict[int, float]:
@@ -66,6 +133,15 @@ def source_tier_weights() -> Dict[int, float]:
 
 def vector_from_payload(payload: Dict[str, float]) -> np.ndarray:
     return np.array([float(payload.get(k, 0.0) or 0.0) for k in LIQUID_FEATURE_KEYS], dtype=np.float32)
+
+
+def project_to_online_schema(payload: Dict[str, float]) -> Dict[str, float]:
+    return {k: float(payload.get(k, 0.0) or 0.0) for k in ONLINE_LIQUID_FEATURE_KEYS}
+
+
+def vector_from_payload_online(payload: Dict[str, float]) -> np.ndarray:
+    projected = project_to_online_schema(payload)
+    return np.array([float(projected.get(k, 0.0) or 0.0) for k in ONLINE_LIQUID_FEATURE_KEYS], dtype=np.float32)
 
 
 def weighted_std(values: List[float], weights: List[float]) -> float:

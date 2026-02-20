@@ -3,10 +3,29 @@ set -euo pipefail
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${1:-artifacts/manual_runs/${TS}}"
-PAR="${PARALLELISM:-$(nproc)}"
+CPU_NPROC="$(nproc)"
+PAR_DEFAULT="$(( CPU_NPROC * 3 ))"
+if [ "${PAR_DEFAULT}" -gt 64 ]; then
+  PAR_DEFAULT=64
+fi
+if [ "${PAR_DEFAULT}" -lt 8 ]; then
+  PAR_DEFAULT=8
+fi
+PAR="${PARALLELISM:-${PAR_DEFAULT}}"
 MIN_SHARPE_DAILY="${MIN_SHARPE_DAILY:-1.5}"
+API_BASE="${API_BASE:-http://localhost:8000}"
 
 mkdir -p "${OUT_DIR}"
+
+if ! curl -fsS "${API_BASE}/health" > /dev/null; then
+  echo "[ERROR] backend not reachable at ${API_BASE}; start backend first."
+  exit 2
+fi
+
+if ! command -v psql >/dev/null 2>&1; then
+  echo "[ERROR] psql not found; install postgresql-client first."
+  exit 2
+fi
 
 echo "[1/5] 2025全年回测（perp+spot）"
 python3 scripts/run_bitget_2025_backtest.py \
@@ -25,7 +44,7 @@ wait "${P1}" "${P2}"
 
 echo "[2/5] 2025 PERP+SPOT 并发网格调参"
 python3 scripts/tune_liquid_strategy_grid.py \
-  --api-base http://localhost:8000 \
+  --api-base "${API_BASE}" \
   --run-source maintenance \
   --data-regime maintenance_replay \
   --score-source model \
@@ -54,7 +73,7 @@ python3 scripts/tune_liquid_strategy_grid.py \
 P3=$!
 
 python3 scripts/tune_liquid_strategy_grid.py \
-  --api-base http://localhost:8000 \
+  --api-base "${API_BASE}" \
   --run-source maintenance \
   --data-regime maintenance_replay \
   --score-source model \

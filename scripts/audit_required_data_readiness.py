@@ -4,13 +4,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+try:
+    from inference.liquid_feature_contract import DERIVATIVE_METRIC_NAMES as CONTRACT_DERIVATIVE_METRICS
+    from inference.liquid_feature_contract import DEFAULT_ONCHAIN_PRIMARY_METRIC as CONTRACT_ONCHAIN_PRIMARY_METRIC
+except Exception:
+    CONTRACT_DERIVATIVE_METRICS = [
+        "long_short_ratio_global_accounts",
+        "long_short_ratio_top_accounts",
+        "long_short_ratio_top_positions",
+        "taker_buy_sell_ratio",
+        "basis_rate",
+        "annualized_basis_rate",
+    ]
+    CONTRACT_ONCHAIN_PRIMARY_METRIC = "net_inflow"
 
 
 def _parse_dt_utc(raw: str) -> datetime:
@@ -144,8 +162,28 @@ def _safe_float(raw: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _resolve_mode_windows(
+    *,
+    mode: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    lookback_days: int,
+    recent_derivatives_days: int,
+) -> tuple[str, datetime, datetime]:
+    mode_norm = str(mode or "production").strip().lower()
+    if mode_norm not in {"production", "research"}:
+        mode_norm = "production"
+    if mode_norm == "research":
+        lookback_start = start_dt
+    else:
+        lookback_start = max(start_dt, end_dt - timedelta(days=max(1, int(lookback_days))))
+    deriv_start = max(start_dt, end_dt - timedelta(days=max(1, int(recent_derivatives_days))))
+    return mode_norm, lookback_start, deriv_start
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Audit required data readiness for training/deployment")
+    ap.add_argument("--mode", default=os.getenv("DATA_READINESS_MODE", "production"), choices=["production", "research"])
     ap.add_argument("--database-url", default=DATABASE_URL)
     ap.add_argument("--symbols", default="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK")
     ap.add_argument("--primary-timeframe", default="5m")
@@ -154,10 +192,10 @@ def main() -> int:
     ap.add_argument("--start", default="2018-01-01T00:00:00Z")
     ap.add_argument("--end", default="")
     ap.add_argument("--recent-derivatives-days", type=int, default=30)
-    ap.add_argument("--onchain-primary-metric", default="net_inflow")
+    ap.add_argument("--onchain-primary-metric", default=str(CONTRACT_ONCHAIN_PRIMARY_METRIC))
     ap.add_argument(
         "--required-derivative-metrics",
-        default="long_short_ratio_global_accounts,long_short_ratio_top_accounts,long_short_ratio_top_positions,taker_buy_sell_ratio,basis_rate,annualized_basis_rate",
+        default=",".join(CONTRACT_DERIVATIVE_METRICS),
     )
     ap.add_argument("--min-primary-coverage", type=float, default=0.9)
     ap.add_argument("--min-secondary-coverage", type=float, default=0.85)
@@ -179,8 +217,13 @@ def main() -> int:
     start_dt = _parse_dt_utc(args.start)
     if end_dt <= start_dt:
         raise RuntimeError("invalid_time_range")
-    lookback_start = max(start_dt, end_dt - timedelta(days=max(1, int(args.lookback_days))))
-    deriv_start = max(start_dt, end_dt - timedelta(days=max(1, int(args.recent_derivatives_days))))
+    mode_name, lookback_start, deriv_start = _resolve_mode_windows(
+        mode=str(args.mode),
+        start_dt=start_dt,
+        end_dt=end_dt,
+        lookback_days=int(args.lookback_days),
+        recent_derivatives_days=int(args.recent_derivatives_days),
+    )
 
     primary_tf = str(args.primary_timeframe).strip().lower()
     secondary_tf = str(args.secondary_timeframe).strip().lower()
@@ -194,6 +237,7 @@ def main() -> int:
         "status": "ok",
         "generated_at": _to_iso_z(datetime.now(timezone.utc)),
         "window": {
+            "mode": mode_name,
             "start": _to_iso_z(start_dt),
             "end": _to_iso_z(end_dt),
             "lookback_start": _to_iso_z(lookback_start),
@@ -218,6 +262,17 @@ def main() -> int:
         },
         "events_social": {},
         "derivatives_metrics": {},
+        "thresholds": {
+            "min_primary_coverage": float(args.min_primary_coverage),
+            "min_secondary_coverage": float(args.min_secondary_coverage),
+            "min_orderbook_coverage": float(args.min_orderbook_coverage),
+            "min_funding_coverage": float(args.min_funding_coverage),
+            "min_onchain_coverage": float(args.min_onchain_coverage),
+            "min_derivatives_coverage": float(args.min_derivatives_coverage),
+            "min_linked_events_per_symbol": int(args.min_linked_events_per_symbol),
+            "min_social_posts": int(args.min_social_posts),
+            "min_comment_post_ratio": float(args.min_comment_post_ratio),
+        },
         "gates": {},
         "missing_data_kinds": [],
         "recommended_commands": [],

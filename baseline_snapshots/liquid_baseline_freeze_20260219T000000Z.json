@@ -1,0 +1,205 @@
+{
+  "snapshot": {
+    "label": "phase_a_baseline_freeze",
+    "generated_at": "2026-02-19T13:18:48.219157Z",
+    "scope": {
+      "track": "liquid",
+      "purpose": "baseline_freeze"
+    },
+    "git": {
+      "head": "d11fb500a1e29aee464dea0e0566dc63af27d2a4",
+      "head_short": "d11fb50",
+      "branch": "main",
+      "dirty": true,
+      "dirty_files_count": 138
+    },
+    "feature_contract": {
+      "feature_payload_schema_version": "main",
+      "online_dim": 49,
+      "base_v2_dim": 49,
+      "manual_dim": 400,
+      "latent_dim": 128,
+      "full_dim": 528,
+      "effective_training_dim": 528,
+      "source": "static_parse_fallback"
+    },
+    "trainer_defaults": {
+      "TRAIN_SEED": {
+        "default": "42",
+        "effective": "42",
+        "source": "default"
+      },
+      "LIQUID_EPOCHS": {
+        "default": "14",
+        "effective": "14",
+        "source": "default"
+      },
+      "LIQUID_BATCH_SIZE": {
+        "default": "128",
+        "effective": "128",
+        "source": "default"
+      },
+      "TRAIN_GRAD_ACC_STEPS": {
+        "default": "4",
+        "effective": "4",
+        "source": "default"
+      },
+      "LIQUID_VAL_RATIO": {
+        "default": "0.2",
+        "effective": "0.2",
+        "source": "default"
+      },
+      "LIQUID_EARLY_STOP_PATIENCE": {
+        "default": "3",
+        "effective": "3",
+        "source": "default"
+      },
+      "TRAIN_GRAD_CLIP": {
+        "default": "1.0",
+        "effective": "1.0",
+        "source": "default"
+      },
+      "LIQUID_WF_TRAIN_WINDOW": {
+        "default": "512",
+        "effective": "512",
+        "source": "default"
+      },
+      "LIQUID_WF_TEST_WINDOW": {
+        "default": "96",
+        "effective": "96",
+        "source": "default"
+      },
+      "LIQUID_WF_PURGE_WINDOW": {
+        "default": "12",
+        "effective": "12",
+        "source": "default"
+      },
+      "LIQUID_PURGED_KFOLD_SPLITS": {
+        "default": "5",
+        "effective": "5",
+        "source": "default"
+      },
+      "LIQUID_PURGED_KFOLD_PURGE": {
+        "default": "12",
+        "effective": "12",
+        "source": "default"
+      },
+      "FEATURE_VERSION": {
+        "default": "feature-store-v2.1",
+        "effective": "feature-store-v2.1",
+        "source": "default"
+      },
+      "DATA_VERSION": {
+        "default": "v1",
+        "effective": "v1",
+        "source": "default"
+      },
+      "LIQUID_SYMBOLS": {
+        "default": "BTC,ETH,SOL",
+        "effective": "BTC,ETH,SOL",
+        "source": "default"
+      },
+      "LIQUID_PRIMARY_TIMEFRAME": {
+        "default": "5m",
+        "effective": "5m",
+        "source": "default"
+      },
+      "TRAIN_DQ_GATE_MODE": {
+        "default": "soft",
+        "effective": "soft",
+        "source": "default"
+      },
+      "LIQUID_DQ_GATE_MODE": {
+        "default": "soft",
+        "effective": "soft",
+        "source": "default"
+      }
+    },
+    "multimodal_defaults": {
+      "MULTIMODAL_L2": {
+        "default": "0.05",
+        "effective": "0.05",
+        "source": "default"
+      },
+      "MULTIMODAL_TARGET_HORIZON_STEPS": {
+        "default": "1",
+        "effective": "1",
+        "source": "default"
+      },
+      "FEATURE_PAYLOAD_SCHEMA_VERSION": {
+        "default": "main",
+        "effective": "main",
+        "source": "default"
+      }
+    },
+    "model_dir": "backend/models",
+    "model_artifacts": [
+      {
+        "path": "backend/models/liquid_btc_lgbm_baseline_v2.json",
+        "file_name": "liquid_btc_lgbm_baseline_v2.json",
+        "size_bytes": 482,
+        "sha256": "669641f592c89d978fc6216a71b66d07b1286e12096bc898306a91c99049fdbb",
+        "model_name": "liquid_baseline_btc",
+        "model_version": "v2.0",
+        "type": "tabular_linear",
+        "feature_version": "feature-store-v2.1",
+        "data_version": "v1",
+        "feature_dim": 18
+      },
+      {
+        "path": "backend/models/liquid_eth_lgbm_baseline_v2.json",
+        "file_name": "liquid_eth_lgbm_baseline_v2.json",
+        "size_bytes": 482,
+        "sha256": "a56c1e1b6c5ab717630f55708cb74d3b34824bd27b2c2bcd1c5ccf893c9e0acd",
+        "model_name": "liquid_baseline_eth",
+        "model_version": "v2.0",
+        "type": "tabular_linear",
+        "feature_version": "feature-store-v2.1",
+        "data_version": "v1",
+        "feature_dim": 18
+      },
+      {
+        "path": "backend/models/liquid_sol_lgbm_baseline_v2.json",
+        "file_name": "liquid_sol_lgbm_baseline_v2.json",
+        "size_bytes": 488,
+        "sha256": "49913173b3015bde0916855fe53edd1486b361697750fa8bb3f00652eba2bafe",
+        "model_name": "liquid_baseline_sol",
+        "model_version": "v2.0",
+        "type": "tabular_linear",
+        "feature_version": "feature-store-v2.1",
+        "data_version": "v1",
+        "feature_dim": 18
+      },
+      {
+        "path": "backend/models/liquid_ttm_ensemble_v2.1.json",
+        "file_name": "liquid_ttm_ensemble_v2.1.json",
+        "size_bytes": 592,
+        "sha256": "2bc1c7735f1473c6cb43eeaa217624cc0b49b5221ac016ae5331168f360eb4ac",
+        "model_name": "liquid_ttm_ensemble",
+        "model_version": "v2.1",
+        "type": "ensemble_manifest",
+        "feature_version": "feature-store-v2.1",
+        "data_version": "v1",
+        "feature_dim": null,
+        "component_refs": [
+          "liquid_btc_lgbm_baseline_v2.json",
+          "liquid_eth_lgbm_baseline_v2.json",
+          "liquid_sol_lgbm_baseline_v2.json",
+          "liquid_btc_tsmixer_v2.pt",
+          "liquid_eth_tsmixer_v2.pt",
+          "liquid_sol_tsmixer_v2.pt"
+        ]
+      }
+    ],
+    "integrity_checks": {
+      "artifact_count": 4,
+      "missing_component_refs": [
+        "liquid_btc_tsmixer_v2.pt",
+        "liquid_eth_tsmixer_v2.pt",
+        "liquid_sol_tsmixer_v2.pt"
+      ],
+      "all_component_refs_present": false
+    }
+  },
+  "snapshot_sha256": "b90d375582362350b666a90581dac72db6dc9ae385e874be6c68c92ba2f722ae"
+}

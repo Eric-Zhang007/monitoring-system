@@ -50,7 +50,7 @@ def main() -> int:
     from v2_repository import V2Repository  # type: ignore
 
     rows = _load_events(jsonl)
-    repo = V2Repository(dsn=args.database_url)
+    repo = V2Repository(db_url=args.database_url)
     accepted = 0
     inserted = 0
     deduped = 0

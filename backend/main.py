@@ -5,27 +5,31 @@ FastAPI Main Application - Backend Service (修复版)
 import os
 import logging
 import time
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 import asyncio
 import json
 from datetime import datetime, timedelta
 from contextlib import suppress
+from pathlib import Path
 
 from gpu_manager import GPUManager
 from nim_integration import get_nim_cache
 from redis_streams import get_redis_consumer
 from security_config import build_cors_settings
 from v2_router import router as v2_router
+from routers.multimodal import router as multimodal_router
+from v2_repository import V2Repository
 from metrics import (
     CONTENT_TYPE_LATEST,
     WEBSOCKET_ACTIVE_CONNECTIONS,
     WEBSOCKET_DROPPED_MESSAGES_TOTAL,
     observe_http_request,
     render_metrics,
+    set_multimodal_health_metrics,
 )
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -42,6 +46,42 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
 CORS_SETTINGS = build_cors_settings()
+OPS_STATE_FILE = os.getenv(
+    "OPS_STATE_FILE",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "ops" / "continuous_runtime_state.json"),
+)
+HISTORY_COMPLETENESS_FILE = os.getenv(
+    "HISTORY_COMPLETENESS_FILE",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "audit" / "full_history_latest.json"),
+)
+ALIGNMENT_FILE = os.getenv(
+    "ALIGNMENT_FILE",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "audit" / "asof_alignment_latest.json"),
+)
+SOCIAL_THROUGHPUT_FILE = os.getenv(
+    "SOCIAL_THROUGHPUT_FILE",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "social" / "social_throughput_latest.json"),
+)
+MODEL_STATUS_FILE = os.getenv(
+    "MODEL_STATUS_FILE",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "models" / "candidate_registry.jsonl"),
+)
+PHASE_D_UNIFIED_SUMMARY_FILE = os.getenv(
+    "PHASE_D_UNIFIED_SUMMARY_FILE",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "experiments" / "phase_d_summary_latest.json"),
+)
+PAPER_STATE_FILE = os.getenv(
+    "PAPER_STATE_FILE",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "paper" / "paper_state.json"),
+)
+LIVE_CONTROL_FILE = os.getenv(
+    "LIVE_CONTROL_FILE",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "ops" / "live_control_state.json"),
+)
+MANUAL_CANDIDATE_FILE = os.getenv(
+    "MANUAL_CANDIDATE_FILE",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "ops" / "manual_candidate_control.json"),
+)
 
 # Global instances
 gpu_mgr = None
@@ -49,6 +89,7 @@ _nim_cache = None
 _redis_consumer = None
 _postgres_conn = None
 _redis_client = None
+_v2_repo = None
 
 # WebSocket Connection Manager
 class ConnectionManager:
@@ -182,6 +223,54 @@ def get_redis():
     except Exception as e:
         logger.error(f"❌ Failed to connect to Redis: {e}")
         raise HTTPException(status_code=500, detail="Redis connection failed")
+
+
+def _get_v2_repo() -> V2Repository:
+    global _v2_repo
+    if _v2_repo is None:
+        _v2_repo = V2Repository(DATABASE_URL)
+    return _v2_repo
+
+
+def _read_control_state_db(control_key: str) -> Optional[Dict[str, Any]]:
+    try:
+        row = _get_v2_repo().get_ops_control_state(control_key)
+        if not row:
+            return None
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        out = dict(payload)
+        out.setdefault("status", "ok")
+        out.setdefault("source", "db")
+        out.setdefault("control_key", str(row.get("control_key") or str(control_key).strip().lower()))
+        out.setdefault("updated_by", str(row.get("updated_by") or "system"))
+        updated_at = row.get("updated_at")
+        if updated_at:
+            out.setdefault("updated_at", updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at))
+        return out
+    except Exception:
+        return None
+
+
+def _write_control_state_db(control_key: str, payload: Dict[str, Any], *, updated_by: str = "manual") -> Optional[Dict[str, Any]]:
+    try:
+        row = _get_v2_repo().upsert_ops_control_state(
+            control_key=control_key,
+            payload=payload,
+            source="api",
+            updated_by=updated_by or "manual",
+        )
+    except Exception:
+        return None
+    data = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    out = dict(data)
+    out.setdefault("status", "ok")
+    out.setdefault("source", "db")
+    out.setdefault("control_key", str(row.get("control_key") or str(control_key).strip().lower()))
+    out.setdefault("updated_by", str(row.get("updated_by") or "system"))
+    updated_at = row.get("updated_at")
+    if updated_at:
+        out.setdefault("updated_at", updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at))
+    return out
 
 
 def _split_table_name(table_fqn: str) -> tuple[str, str]:
@@ -394,6 +483,7 @@ app.add_middleware(
     allow_headers=CORS_SETTINGS["allow_headers"],
 )
 app.include_router(v2_router)
+app.include_router(multimodal_router)
 
 
 @app.middleware("http")
@@ -515,6 +605,338 @@ async def get_system_status():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/ops/runtime-state")
+async def get_ops_runtime_state():
+    """Return latest continuous paper+train runtime state for frontend monitoring."""
+    try:
+        db_state = _read_control_state_db("ops_runtime_state")
+        if db_state:
+            return db_state
+        p = Path(OPS_STATE_FILE)
+        if not p.exists():
+            return {"status": "missing", "path": str(p)}
+        raw = p.read_text(encoding="utf-8")
+        payload = json.loads(raw) if raw.strip() else {}
+        if not isinstance(payload, dict):
+            raise RuntimeError("invalid_ops_state_not_object")
+        payload.setdefault("status", "ok")
+        payload.setdefault("path", str(p))
+        return payload
+    except Exception as e:
+        logger.error(f"❌ Failed to read ops runtime state: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _read_json_file(path: str) -> Dict:
+    p = Path(path)
+    if not p.exists():
+        return {"status": "missing", "path": str(p)}
+    raw = p.read_text(encoding="utf-8")
+    obj = json.loads(raw) if raw.strip() else {}
+    if isinstance(obj, dict):
+        obj.setdefault("status", "ok")
+        obj.setdefault("path", str(p))
+        return obj
+    return {"status": "invalid", "path": str(p)}
+
+
+def _read_last_jsonl(path: str) -> Dict:
+    p = Path(path)
+    if not p.exists():
+        return {"status": "missing", "path": str(p)}
+    last = ""
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                last = line.strip()
+    if not last:
+        return {"status": "missing", "path": str(p)}
+    try:
+        obj = json.loads(last)
+        if isinstance(obj, dict):
+            obj.setdefault("status", "ok")
+            obj.setdefault("path", str(p))
+            return obj
+    except Exception:
+        pass
+    return {"status": "invalid", "path": str(p)}
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _extract_multimodal_health(
+    *,
+    latest_candidate: Dict[str, Any],
+    phase_d_summary: Dict[str, Any],
+    social_throughput: Dict[str, Any],
+) -> Dict[str, Any]:
+    cand = latest_candidate if isinstance(latest_candidate, dict) else {}
+    summary = phase_d_summary if isinstance(phase_d_summary, dict) else {}
+    social = social_throughput if isinstance(social_throughput, dict) else {}
+    gate = cand.get("gate") if isinstance(cand.get("gate"), dict) else {}
+    ab = cand.get("ablation_summary") if isinstance(cand.get("ablation_summary"), dict) else {}
+    backbones = list(cand.get("backbone_ready_list") or [])
+    if not backbones:
+        bb = summary.get("backbone") if isinstance(summary.get("backbone"), dict) else {}
+        backbones = list(bb.get("ready_backbones") or [])
+
+    gate_openness = _to_float(cand.get("gate_val_mean"), 0.0)
+    text_contribution_abs = _to_float(cand.get("delta_val_mean_abs"), 0.0)
+    if text_contribution_abs <= 0.0:
+        text_contribution_abs = max(
+            0.0,
+            _to_float(ab.get("delta_mse_no_text_vs_full"), 0.0),
+        )
+
+    text_coverage_ratio = _to_float(social.get("text_coverage_ratio"), -1.0)
+    if text_coverage_ratio < 0:
+        rows = ab.get("rows") if isinstance(ab.get("rows"), dict) else {}
+        full_rows = _to_float(rows.get("full"), 0.0)
+        event_rows = _to_float(rows.get("event_window"), 0.0)
+        if full_rows > 0:
+            text_coverage_ratio = max(0.0, min(1.0, event_rows / full_rows))
+        else:
+            text_coverage_ratio = 0.0
+
+    candidate_gate_passed = bool(gate.get("passed", False))
+    health = {
+        "status": "ok",
+        "fusion_mode": str(cand.get("fusion_mode") or ""),
+        "text_dropout_prob": _to_float(cand.get("text_dropout_prob"), 0.0),
+        "text_coverage_ratio": float(max(0.0, min(1.0, text_coverage_ratio))),
+        "gate_openness": float(max(0.0, min(1.0, gate_openness))),
+        "text_contribution_abs": float(max(0.0, text_contribution_abs)),
+        "ready_backbones": [str(x) for x in backbones if str(x).strip()],
+        "ready_backbone_count": int(len([x for x in backbones if str(x).strip()])),
+        "candidate_gate_passed": bool(candidate_gate_passed),
+        "candidate_gate_reasons": list(gate.get("reasons") or []),
+        "ablation_primary": str(ab.get("primary") or summary.get("ablation", {}).get("primary_ablation") or ""),
+    }
+    return health
+
+
+@app.get("/api/v2/monitor/history-completeness")
+async def monitor_history_completeness():
+    try:
+        return _read_json_file(HISTORY_COMPLETENESS_FILE)
+    except Exception as e:
+        logger.error(f"❌ Failed to read history completeness snapshot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v2/monitor/alignment")
+async def monitor_alignment():
+    try:
+        return _read_json_file(ALIGNMENT_FILE)
+    except Exception as e:
+        logger.error(f"❌ Failed to read alignment snapshot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v2/monitor/social-throughput")
+async def monitor_social_throughput():
+    try:
+        db_state = _read_control_state_db("social_throughput")
+        if db_state:
+            return db_state
+        return _read_json_file(SOCIAL_THROUGHPUT_FILE)
+    except Exception as e:
+        logger.error(f"❌ Failed to read social throughput snapshot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v2/monitor/model-status")
+async def monitor_model_status():
+    try:
+        latest_candidate = _read_last_jsonl(MODEL_STATUS_FILE)
+        db_candidate = _read_control_state_db("manual_candidate")
+        if db_candidate:
+            latest_candidate = db_candidate
+        phase_d_summary = _read_json_file(PHASE_D_UNIFIED_SUMMARY_FILE)
+        social_state = _read_control_state_db("social_throughput") or _read_json_file(SOCIAL_THROUGHPUT_FILE)
+        multimodal_health = _extract_multimodal_health(
+            latest_candidate=latest_candidate,
+            phase_d_summary=phase_d_summary,
+            social_throughput=social_state if isinstance(social_state, dict) else {},
+        )
+        set_multimodal_health_metrics(
+            track="liquid",
+            text_coverage_ratio=float(multimodal_health.get("text_coverage_ratio", 0.0)),
+            gate_openness=float(multimodal_health.get("gate_openness", 0.0)),
+            text_contribution_abs=float(multimodal_health.get("text_contribution_abs", 0.0)),
+            ready_backbones=int(multimodal_health.get("ready_backbone_count", 0)),
+            candidate_gate_passed=bool(multimodal_health.get("candidate_gate_passed", False)),
+        )
+        active = {}
+        try:
+            conn = get_postgres()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT track, active_model_name, active_model_version
+                FROM active_model_state
+                ORDER BY track ASC
+                """
+            )
+            active = {str(r.get("track")): {"name": r.get("active_model_name"), "version": r.get("active_model_version")} for r in (cur.fetchall() or [])}
+            cur.close()
+            conn.close()
+        except Exception:
+            active = {}
+        return {
+            "status": "ok",
+            "active_models": active,
+            "latest_candidate": latest_candidate,
+            "multimodal_health": multimodal_health,
+            "phase_d_summary": phase_d_summary,
+        }
+    except Exception as e:
+        logger.error(f"❌ Failed to read model status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v2/monitor/multimodal-health")
+async def monitor_multimodal_health():
+    try:
+        latest_candidate = _read_last_jsonl(MODEL_STATUS_FILE)
+        phase_d_summary = _read_json_file(PHASE_D_UNIFIED_SUMMARY_FILE)
+        social_state = _read_control_state_db("social_throughput") or _read_json_file(SOCIAL_THROUGHPUT_FILE)
+        health = _extract_multimodal_health(
+            latest_candidate=latest_candidate,
+            phase_d_summary=phase_d_summary,
+            social_throughput=social_state if isinstance(social_state, dict) else {},
+        )
+        set_multimodal_health_metrics(
+            track="liquid",
+            text_coverage_ratio=float(health.get("text_coverage_ratio", 0.0)),
+            gate_openness=float(health.get("gate_openness", 0.0)),
+            text_contribution_abs=float(health.get("text_contribution_abs", 0.0)),
+            ready_backbones=int(health.get("ready_backbone_count", 0)),
+            candidate_gate_passed=bool(health.get("candidate_gate_passed", False)),
+        )
+        return health
+    except Exception as e:
+        logger.error(f"❌ Failed to read multimodal health: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v2/monitor/paper-performance")
+async def monitor_paper_performance():
+    try:
+        db_state = _read_control_state_db("paper_performance")
+        if db_state:
+            return db_state
+        return _read_json_file(PAPER_STATE_FILE)
+    except Exception as e:
+        logger.error(f"❌ Failed to read paper performance snapshot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v2/control/live/state")
+async def control_live_state():
+    try:
+        db_state = _read_control_state_db("live_control_state")
+        if db_state:
+            return db_state
+        return _read_json_file(LIVE_CONTROL_FILE)
+    except Exception as e:
+        logger.error(f"❌ Failed to read live control state: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v2/control/live/enable")
+async def control_live_enable(payload: Dict = Body(default={})):
+    try:
+        current = _read_control_state_db("live_control_state") or _read_json_file(LIVE_CONTROL_FILE)
+        if not isinstance(current, dict):
+            current = {}
+        current["live_enabled"] = True
+        current["paper_enabled"] = bool(payload.get("paper_enabled", False))
+        current["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        current["operator"] = str(payload.get("operator") or "manual")
+        current["reason"] = str(payload.get("reason") or "manual_enable")
+        db_saved = _write_control_state_db(
+            "live_control_state",
+            current,
+            updated_by=str(current.get("operator") or "manual"),
+        )
+        p = Path(LIVE_CONTROL_FILE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        return dict(db_saved or {"status": "ok", **current})
+    except Exception as e:
+        logger.error(f"❌ Failed to enable live control: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v2/control/live/disable")
+async def control_live_disable(payload: Dict = Body(default={})):
+    try:
+        current = _read_control_state_db("live_control_state") or _read_json_file(LIVE_CONTROL_FILE)
+        if not isinstance(current, dict):
+            current = {}
+        current["live_enabled"] = False
+        current["paper_enabled"] = bool(payload.get("paper_enabled", True))
+        current["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        current["operator"] = str(payload.get("operator") or "manual")
+        current["reason"] = str(payload.get("reason") or "manual_disable")
+        db_saved = _write_control_state_db(
+            "live_control_state",
+            current,
+            updated_by=str(current.get("operator") or "manual"),
+        )
+        p = Path(LIVE_CONTROL_FILE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        return dict(db_saved or {"status": "ok", **current})
+    except Exception as e:
+        logger.error(f"❌ Failed to disable live control: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v2/control/model/candidate-state")
+async def control_candidate_state():
+    try:
+        db_state = _read_control_state_db("manual_candidate")
+        if db_state:
+            return db_state
+        return _read_json_file(MANUAL_CANDIDATE_FILE)
+    except Exception as e:
+        logger.error(f"❌ Failed to read candidate control state: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v2/control/model/switch-candidate")
+async def control_switch_candidate(payload: Dict = Body(default={})):
+    try:
+        row = {
+            "status": "ok",
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "track": str(payload.get("track") or "liquid"),
+            "model_name": str(payload.get("model_name") or ""),
+            "model_version": str(payload.get("model_version") or ""),
+            "operator": str(payload.get("operator") or "manual"),
+            "reason": str(payload.get("reason") or "manual_candidate_switch"),
+        }
+        db_saved = _write_control_state_db(
+            "manual_candidate",
+            row,
+            updated_by=str(row.get("operator") or "manual"),
+        )
+        p = Path(MANUAL_CANDIDATE_FILE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
+        return dict(db_saved or row)
+    except Exception as e:
+        logger.error(f"❌ Failed to switch candidate: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ======================================
 # Prediction Endpoints (修复版：真实数据)
 # ======================================
@@ -525,106 +947,11 @@ async def get_predictions(
     hours: int = Query(default=24, ge=1, le=168, description="过去多少小时的预测")
 ):
     _legacy_api_frozen()
-    """
-    获取预测数据（修复版：从数据库查询真实预测）
-
-    Args:
-        symbol: 交易对/股票符号
-        hours: 查询过去几小时的预测
-    """
-    try:
-        conn = get_postgres()
-        cursor = conn.cursor()
-
-        query = """
-            SELECT
-                symbol,
-                scenario,
-                direction,
-                confidence,
-                expected_change_pct,
-                expected_price,
-                scenario_probabilities,
-                created_at
-            FROM predictions
-            WHERE symbol = UPPER(%s)
-              AND created_at > NOW() - make_interval(hours => %s)
-            ORDER BY created_at DESC
-            LIMIT 100
-        """
-
-        cursor.execute(query, (symbol, hours))
-        rows = cursor.fetchall()
-
-        predictions = []
-        for row in rows:
-            pred = dict(row)
-            pred['scenario_probabilities'] = json.loads(pred['scenario_probabilities'])
-            predictions.append(pred)
-
-        cursor.close()
-        conn.close()
-
-        return {
-            "symbol": symbol.upper(),
-            "predictions": predictions,
-            "count": len(predictions)
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Failed to get predictions for {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/predictions/latest")
 async def get_latest_predictions():
     _legacy_api_frozen()
-    """获取所有符号的最新预测"""
-    try:
-        conn = get_postgres()
-        cursor = conn.cursor()
-
-        # 使用窗口函数获取每个符号的最新预测
-        query = """
-            WITH ranked_predictions AS (
-                SELECT
-                    symbol,
-                    scenario,
-                    direction,
-                    confidence,
-                    expected_change_pct,
-                    expected_price,
-                    scenario_probabilities,
-                    created_at,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY created_at DESC) as rn
-                FROM predictions
-                WHERE created_at > NOW() - INTERVAL '24 hours'
-            )
-            SELECT * FROM ranked_predictions WHERE rn = 1
-            ORDER BY created_at DESC
-        """
-
-        cursor.execute(query)
-        rows = cursor.fetchall()
-
-        predictions = []
-        for row in rows:
-            pred = dict(row)
-            pred.pop('rn')
-            pred['scenario_probabilities'] = json.loads(pred['scenario_probabilities'])
-            predictions.append(pred)
-
-        cursor.close()
-        conn.close()
-
-        return {
-            "predictions": predictions,
-            "count": len(predictions)
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Failed to get latest predictions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ======================================
@@ -637,105 +964,11 @@ async def get_prices(
     hours: int = Query(default=24, ge=1, le=168, description="过去多少小时的价格")
 ):
     _legacy_api_frozen()
-    """
-    获取价格历史（修复版：从数据库查询真实价格）
-
-    Args:
-        symbol: 交易对/股票符号
-        hours: 查询过去几小时的价格
-    """
-    try:
-        # 先尝试Redis缓存
-        r = get_redis()
-        cache_key = f"prices:{symbol}"
-        cached = r.get(cache_key)
-
-        if cached:
-            return json.loads(cached)
-
-        # Redis没有，查询数据库
-        conn = get_postgres()
-        cursor = conn.cursor()
-
-        query = """
-            SELECT
-                symbol,
-                price,
-                volume,
-                timestamp
-            FROM prices
-            WHERE symbol = UPPER(%s)
-              AND timestamp > NOW() - make_interval(hours => %s)
-            ORDER BY timestamp DESC
-            LIMIT 500
-        """
-
-        cursor.execute(query, (symbol, hours))
-        rows = cursor.fetchall()
-
-        prices = [dict(row) for row in rows]
-
-        # 缓存到Redis（5分钟）
-        r.setex(cache_key, 300, json.dumps({"symbol": symbol.upper(), "prices": prices, "count": len(prices)}))
-
-        cursor.close()
-        conn.close()
-
-        return {
-            "symbol": symbol.upper(),
-            "prices": prices,
-            "count": len(prices)
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Failed to get prices for {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/prices/{symbol}/latest")
 async def get_latest_price(symbol: str):
     _legacy_api_frozen()
-    """获取最新价格"""
-    try:
-        r = get_redis()
-        cache_key = f"price:{symbol}"
-        cached = r.get(cache_key)
-
-        if cached:
-            return json.loads(cached)
-
-        conn = get_postgres()
-        cursor = conn.cursor()
-
-        query = """
-            SELECT price, volume, timestamp
-            FROM prices
-            WHERE symbol = UPPER(%s)
-            ORDER BY timestamp DESC
-            LIMIT 1
-        """
-
-        cursor.execute(query, (symbol,))
-        row = cursor.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail=f"No price data found for {symbol}")
-
-        result = dict(row)
-
-        # 缓存到Redis（1分钟）
-        r.setex(cache_key, 60, json.dumps(result))
-
-        cursor.close()
-        conn.close()
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Failed to get latest price for {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ======================================
@@ -748,68 +981,6 @@ async def get_news(
     limit: int = Query(default=20, ge=1, le=100, description="返回数量")
 ):
     _legacy_api_frozen()
-    """
-    获取新闻（修复版：从数据库查询真实新闻）
-
-    Args:
-        symbol: 可选，过滤符号
-        limit: 返回数量
-    """
-    try:
-        conn = get_postgres()
-        cursor = conn.cursor()
-
-        if symbol:
-            query = """
-                SELECT
-                    id,
-                    title,
-                    url,
-                    symbol,
-                    priority,
-                    sentiment,
-                    is_important,
-                    summary,
-                    created_at
-                FROM news
-                WHERE symbol = UPPER(%s)
-                ORDER BY created_at DESC
-                LIMIT %s
-            """
-            cursor.execute(query, (symbol, limit))
-        else:
-            query = """
-                SELECT
-                    id,
-                    title,
-                    url,
-                    symbol,
-                    priority,
-                    sentiment,
-                    is_important,
-                    summary,
-                    created_at
-                FROM news
-                WHERE is_important = TRUE
-                ORDER BY created_at DESC
-                LIMIT %s
-            """
-            cursor.execute(query, (limit,))
-
-        rows = cursor.fetchall()
-        news_items = [dict(row) for row in rows]
-
-        cursor.close()
-        conn.close()
-
-        return {
-            "news": news_items,
-            "count": len(news_items)
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Failed to get news: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/news/{symbol}/sentiment")
@@ -818,70 +989,6 @@ async def get_symbol_sentiment(
     hours: int = Query(default=24, ge=1, le=168)
 ):
     _legacy_api_frozen()
-    """
-    获取符号的情感分析（修复版：从数据库查询真实情感）
-
-    Args:
-        symbol: 交易对/股票符号
-        hours: 过去多少小时
-    """
-    try:
-        conn = get_postgres()
-        cursor = conn.cursor()
-
-        query = """
-            SELECT
-                sentiment,
-                COUNT(*) as count
-            FROM news
-            WHERE symbol = UPPER(%s)
-              AND created_at > NOW() - make_interval(hours => %s)
-            GROUP BY sentiment
-        """
-
-        cursor.execute(query, (symbol, hours))
-        rows = cursor.fetchall()
-
-        sentiment_counts = {row['sentiment']: row['count'] for row in rows}
-        total = sum(sentiment_counts.values()) or 1
-
-        # 计算百分比
-        sentiment_percentages = {
-            k: round(v / total * 100, 1) for k, v in sentiment_counts.items()
-        }
-
-        # 确定总体情感
-        positive = sentiment_percentages.get('positive', 0)
-        negative = sentiment_percentages.get('negative', 0)
-
-        if positive > negative + 20:
-            overall = "positive"
-            trend = "up"
-        elif negative > positive + 20:
-            overall = "negative"
-            trend = "down"
-        else:
-            overall = "neutral"
-            trend = "sideways"
-
-        cursor.close()
-        conn.close()
-
-        return {
-            "symbol": symbol.upper(),
-            "sentiment": {
-                "counts": sentiment_counts,
-                "percentages": sentiment_percentages
-            },
-            "overall": overall,
-            "trend": trend,
-            "total_news": total if total > 1 else 0,
-            "timeframe": f"{hours}h"
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Failed to get sentiment for {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ======================================
@@ -891,33 +998,6 @@ async def get_symbol_sentiment(
 @app.get("/api/indicators/{symbol}")
 async def get_technical_indicators(symbol: str):
     _legacy_api_frozen()
-    """获取技术指标"""
-    try:
-        conn = get_postgres()
-        cursor = conn.cursor()
-
-        query = """
-            SELECT * FROM v_latest_ti
-            WHERE symbol = UPPER(%s)
-            LIMIT 1
-        """
-
-        cursor.execute(query, (symbol,))
-        row = cursor.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail=f"No technical indicators found for {symbol}")
-
-        cursor.close()
-        conn.close()
-
-        return dict(row)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Failed to get indicators for {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ======================================

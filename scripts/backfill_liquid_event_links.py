@@ -8,7 +8,7 @@ import psycopg2
 
 
 def _get_symbols() -> List[str]:
-    raw = os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK")
+    raw = os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL")
     out = []
     for part in raw.split(","):
         sym = part.strip().upper()

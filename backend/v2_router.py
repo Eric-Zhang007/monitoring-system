@@ -73,20 +73,39 @@ from schemas_v2 import (
     VCPredictRequest,
 )
 from execution_engine import ExecutionEngine
+from execution_api import (
+    infer_execution_risk_positions as _executionapi_infer_execution_risk_positions,
+    normalize_execution_payload as _executionapi_normalize_execution_payload,
+    normalize_reject_reason as _executionapi_normalize_reject_reason,
+    order_to_risk_weight as _executionapi_order_to_risk_weight,
+)
 from feature_signal import feature_signal_score
+from liquid_model_service import LiquidModelService
 from metrics import (
     BACKTEST_FAILED_RUNS_TOTAL,
+    BITGET_UNCLASSIFIED_ERRORS_TOTAL,
     DATA_FRESHNESS_SECONDS,
     EXECUTION_LATENCY_SECONDS,
     EXECUTION_ORDERS_TOTAL,
     EXECUTION_REJECTS_TOTAL,
     EXECUTION_REJECT_RATE,
     METRIC_GATE_STATUS,
+    MODEL_COVERAGE_RATIO,
     MODEL_DRIFT_EVENTS_TOTAL,
+    RISK_WEIGHT_CONVERSION_ERRORS_TOTAL,
     RISK_HARD_BLOCKS_TOTAL,
     SIGNAL_LATENCY_SECONDS,
+    SIGNAL_PREDICT_DIVERGENCE,
+    STRICT_ASOF_FAIL_COUNT,
     INGEST_EVENTS_TOTAL,
 )
+from drift_ops import feature_drift_score as _driftops_feature_drift_score
+from drift_ops import ks_statistic as _driftops_ks_statistic
+from drift_ops import psi as _driftops_psi
+from risk_control import drawdown_thresholds as _riskcontrol_drawdown_thresholds
+from strategy_backtest import evaluate_gate as _strategybacktest_evaluate_gate
+from strategy_backtest import score_source_filter as _strategybacktest_score_source_filter
+from strategy_signal import strategy_bucket as _strategysignal_strategy_bucket
 from v2_repository import V2Repository
 from task_queue import enqueue_task, get_task
 
@@ -179,7 +198,7 @@ _INFER_DIR = _ROOT / "inference"
 if str(_INFER_DIR) not in sys.path:
     sys.path.append(str(_INFER_DIR))
 try:
-    from liquid_feature_contract import LIQUID_FEATURE_KEYS as _CONTRACT_KEYS  # type: ignore
+    from liquid_feature_contract import ONLINE_LIQUID_FEATURE_KEYS as _CONTRACT_KEYS  # type: ignore
     from liquid_feature_contract import LIQUID_FEATURE_SCHEMA_VERSION as _CONTRACT_SCHEMA  # type: ignore
     from model_router import ModelRouter  # type: ignore
 
@@ -197,6 +216,7 @@ except Exception:
     pass
 
 _MODEL_ROUTER: Optional[Any] = None
+_LIQUID_MODEL_SERVICE: Optional[LiquidModelService] = None
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -244,118 +264,42 @@ def _get_model_router() -> Any:
 
 
 def _active_liquid_model() -> Tuple[str, str]:
-    try:
-        row = repo.get_active_model_state("liquid")
-    except Exception:
-        row = None
-    if isinstance(row, dict):
-        name = str(row.get("active_model_name") or "").strip()
-        ver = str(row.get("active_model_version") or "").strip()
-        if name and ver:
-            return name, ver
-    return _default_model_by_track("liquid")
+    return _get_liquid_model_service()._active_liquid_model()  # type: ignore[attr-defined]
+
+
+def _get_liquid_model_service() -> LiquidModelService:
+    global _LIQUID_MODEL_SERVICE
+    if _LIQUID_MODEL_SERVICE is not None and _LIQUID_MODEL_SERVICE.repo is repo:
+        return _LIQUID_MODEL_SERVICE
+    default_name, default_version = _default_model_by_track("liquid")
+    _LIQUID_MODEL_SERVICE = LiquidModelService(
+        repo=repo,
+        feature_keys=LIQUID_FEATURE_KEYS,
+        feature_version=FEATURE_VERSION,
+        data_version=DATA_VERSION,
+        default_model_name=default_name,
+        default_model_version=default_version,
+    )
+    return _LIQUID_MODEL_SERVICE
 
 
 def _latest_liquid_feature_payload(symbol: str, *, max_lookback_days: int = 30) -> Dict[str, float]:
-    rows = repo.load_feature_history(
-        target=symbol.upper(),
-        track="liquid",
-        lookback_days=max(1, int(max_lookback_days)),
-        data_version=DATA_VERSION,
-        limit=20000,
-    )
-    if not rows:
-        rows = repo.load_feature_history(
-            target=symbol.upper(),
-            track="liquid",
-            lookback_days=max(1, int(max_lookback_days)),
-            data_version=None,
-            limit=20000,
-        )
-    for row in reversed(rows):
-        payload = row.get("feature_payload") if isinstance(row, dict) else None
-        if isinstance(payload, dict) and payload:
-            return {k: float(payload.get(k, 0.0) or 0.0) for k in LIQUID_FEATURE_KEYS}
-    raise HTTPException(status_code=424, detail=f"feature_payload_unavailable:{symbol.upper()}")
+    payload = _get_liquid_model_service().latest_feature_payload(symbol, max_lookback_days=max_lookback_days)
+    if payload:
+        return payload
+    raise HTTPException(status_code=424, detail=f"feature_payload_unavailable:{str(symbol or '').upper()}")
 
 
 def _build_liquid_model_prediction(symbol: str, horizon: str) -> Dict[str, object]:
-    target = str(symbol or "").strip().upper()
-    if not target:
-        raise HTTPException(status_code=400, detail="symbol is required")
-    price_row = repo.latest_price_snapshot(target)
-    if not price_row:
-        raise HTTPException(status_code=404, detail=f"no price snapshot for {target}")
-    ts = price_row.get("timestamp")
-    if isinstance(ts, datetime):
-        ts_utc = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    result = _get_liquid_model_service().predict_with_context(symbol=symbol, horizon=horizon)
+    target = str(result.get("target") or "").upper()
+    # Keep data freshness metric sourced from price snapshot timestamp if present.
+    ts_raw = (repo.latest_price_snapshot(target) or {}).get("timestamp")
+    if isinstance(ts_raw, datetime):
+        ts_utc = ts_raw if ts_raw.tzinfo else ts_raw.replace(tzinfo=timezone.utc)
         freshness = max(0.0, (_utcnow() - ts_utc.astimezone(timezone.utc)).total_seconds())
         DATA_FRESHNESS_SECONDS.labels(target=target).set(freshness)
-
-    feature_payload = _latest_liquid_feature_payload(target)
-    feature_vec = _feature_vector_from_payload(feature_payload).astype(np.float32)
-    model_name, model_version = _active_liquid_model()
-    model_router = _get_model_router()
-    tab_bundle = model_router._load_liquid_tabular_model(target)  # type: ignore[attr-defined]
-    if tab_bundle is None:
-        raise HTTPException(status_code=503, detail=f"model_artifact_missing:tabular:{target}")
-    if model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
-        nn_path = os.path.join(str(_default_model_dir()), f"liquid_{target.lower()}_tsmixer_v2.pt")
-        nn_bundle = model_router._load_torch_model(nn_path, "liquid", feature_vec.shape[0])  # type: ignore[attr-defined]
-        if nn_bundle is None:
-            raise HTTPException(status_code=503, detail=f"model_artifact_missing:neural:{target}")
-
-    out = model_router.predict_liquid(target, feature_vec, model_name=model_name)
-    scale = {"1h": 0.3, "1d": 1.0, "7d": 2.1}.get(str(horizon).strip().lower(), 1.0)
-    expected_return = float(out.get("expected_return") or 0.0) * float(scale)
-    signal_confidence = float(out.get("signal_confidence") or 0.0)
-    vol_forecast = float(out.get("vol_forecast") or 0.0)
-    stack = out.get("stack") if isinstance(out.get("stack"), dict) else {}
-    context = repo.recent_event_context(target, limit=8)
-    explanation = {
-        "top_event_contributors": [
-            {
-                "event_id": e.get("id"),
-                "event_type": e.get("event_type"),
-                "title": e.get("title"),
-                "weight": round(0.1 + float(e.get("confidence_score") or 0.5) * 0.7, 3),
-            }
-            for e in context[:5]
-        ],
-        "top_feature_contributors": [
-            {"feature": "ret_12", "value": round(float(feature_payload.get("ret_12", 0.0)), 6), "contribution": round(float(feature_payload.get("ret_12", 0.0)), 6)},
-            {"feature": "vol_12", "value": round(float(feature_payload.get("vol_12", 0.0)), 6), "contribution": round(-abs(float(feature_payload.get("vol_12", 0.0))), 6)},
-            {
-                "feature": "orderbook_imbalance",
-                "value": round(float(feature_payload.get("orderbook_imbalance", 0.0)), 6),
-                "contribution": round(float(feature_payload.get("orderbook_imbalance", 0.0)) * 0.5, 6),
-            },
-        ],
-        "evidence_links": [str(e.get("source_url") or "") for e in context if str(e.get("source_url") or "").strip()][:5],
-        "model_version": f"{model_name}:{model_version}",
-        "feature_version": FEATURE_VERSION,
-    }
-    outputs = {
-        "expected_return": round(float(expected_return), 6),
-        "vol_forecast": round(float(vol_forecast), 6),
-        "signal_confidence": round(float(signal_confidence), 4),
-        "current_price": float(price_row.get("price") or 0.0),
-        "horizon": str(horizon),
-        "as_of": _utcnow().isoformat(),
-        "model_name": model_name,
-        "model_version": model_version,
-        "score_source": "model",
-        "stack": stack,
-    }
-    return {
-        "target": target,
-        "score": float(round(expected_return, 6)),
-        "confidence": float(round(signal_confidence, 4)),
-        "outputs": outputs,
-        "explanation": explanation,
-        "model_name": model_name,
-        "model_version": model_version,
-    }
+    return result
 
 
 def _risk_limits() -> Dict[str, float]:
@@ -370,14 +314,11 @@ def _risk_limits() -> Dict[str, float]:
 
 
 def _drawdown_thresholds(dd_limit: float) -> Tuple[float, float]:
-    warn = float(os.getenv("RISK_DRAWDOWN_WARN_THRESHOLD", "0.08"))
-    near = float(os.getenv("RISK_DRAWDOWN_NEAR_LIMIT", "0.10"))
-    if dd_limit > 1e-9:
-        warn = min(warn, max(0.0, dd_limit * 0.9))
-        near = min(near, max(0.0, dd_limit * 0.98))
-    if near <= warn:
-        near = min(max(warn + 0.005, near), dd_limit if dd_limit > 0 else warn + 0.005)
-    return max(0.0, warn), max(0.0, near)
+    return _riskcontrol_drawdown_thresholds(
+        dd_limit=float(dd_limit),
+        warn_default=float(os.getenv("RISK_DRAWDOWN_WARN_THRESHOLD", "0.08")),
+        near_default=float(os.getenv("RISK_DRAWDOWN_NEAR_LIMIT", "0.10")),
+    )
 
 
 def _risk_runtime_limits() -> Dict[str, float]:
@@ -506,6 +447,71 @@ def _execution_volatility_violations(orders: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def _market_adaptation_limits() -> Dict[str, float]:
+    return {
+        "min_latest_volume": float(os.getenv("RISK_MIN_LATEST_VOLUME", "1.0")),
+        "max_price_staleness_sec": float(os.getenv("RISK_MAX_PRICE_STALENESS_SEC", "900")),
+        "min_order_notional_usd": float(os.getenv("RISK_MIN_ORDER_NOTIONAL_USD", "5.0")),
+    }
+
+
+def _order_market_fit_violations(orders: List[Dict[str, Any]], market_type: str) -> List[str]:
+    limits = _market_adaptation_limits()
+    out: List[str] = []
+    seen: set[str] = set()
+    for order in orders:
+        qty = float(order.get("quantity") or 0.0)
+        if qty <= 0.0:
+            continue
+        target = str(order.get("target") or "").upper()
+        if not target:
+            continue
+        if str(market_type).strip().lower() == "perp_usdt" and not target.endswith("USDT"):
+            code = f"market_type_mismatch:{target}:perp_usdt_requires_usdt_pair"
+            if code not in seen:
+                seen.add(code)
+                out.append(code)
+            continue
+        if str(market_type).strip().lower() == "spot" and target.endswith("PERP"):
+            code = f"market_type_mismatch:{target}:spot_symbol_invalid"
+            if code not in seen:
+                seen.add(code)
+                out.append(code)
+            continue
+        try:
+            px = repo.latest_price_snapshot(target)
+        except Exception:
+            px = None
+        if not isinstance(px, dict):
+            code = f"market_data_missing:{target}"
+            if code not in seen:
+                seen.add(code)
+                out.append(code)
+            continue
+        price = float(px.get("price") or 0.0)
+        latest_volume = float(px.get("volume") or 0.0)
+        ts = px.get("timestamp")
+        if isinstance(ts, datetime):
+            ts_utc = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            age_sec = max(0.0, (_utcnow() - ts_utc.astimezone(timezone.utc)).total_seconds())
+            if age_sec > float(limits["max_price_staleness_sec"]):
+                code = f"stale_price_data:{target}"
+                if code not in seen:
+                    seen.add(code)
+                    out.append(code)
+        if latest_volume < float(limits["min_latest_volume"]):
+            code = f"insufficient_liquidity:{target}"
+            if code not in seen:
+                seen.add(code)
+                out.append(code)
+        if price <= 0.0 or (price * qty) < float(limits["min_order_notional_usd"]):
+            code = f"order_notional_too_small:{target}"
+            if code not in seen:
+                seen.add(code)
+                out.append(code)
+    return out
+
+
 def _order_risk_price(order: Dict[str, Any], cache: Dict[str, float]) -> float:
     est_price = float(order.get("est_price") or 0.0)
     if est_price > 0.0:
@@ -525,109 +531,30 @@ def _order_risk_price(order: Dict[str, Any], cache: Dict[str, float]) -> float:
 
 
 def _infer_execution_risk_positions(orders: List[Dict[str, Any]], risk_equity_usd: Optional[float]) -> List[RebalancePosition]:
-    price_cache: Dict[str, float] = {}
-    signed_units: List[float] = []
-    signed_notionals: List[float] = []
-    for o in orders:
-        qty = float(o.get("quantity") or 0.0)
-        if qty <= 0.0:
-            signed_units.append(0.0)
-            signed_notionals.append(0.0)
-            continue
-        side = str(o.get("side") or "buy").lower()
-        sign = 1.0 if side == "buy" else -1.0
-        signed_qty = sign * qty
-        px = _order_risk_price(o, price_cache)
-        signed_units.append(signed_qty)
-        signed_notionals.append(signed_qty * max(0.0, px))
+    return _executionapi_infer_execution_risk_positions(
+        orders=orders,
+        risk_equity_usd=risk_equity_usd,
+        order_risk_price_fn=_order_risk_price,
+        rebalance_position_cls=RebalancePosition,
+        conversion_error_hook=lambda track: RISK_WEIGHT_CONVERSION_ERRORS_TOTAL.labels(track=track).inc(),
+    )
 
-    total_abs_units = float(sum(abs(x) for x in signed_units))
-    total_abs_notional = float(sum(abs(x) for x in signed_notionals))
-    denom_notional = float(risk_equity_usd or 0.0) if risk_equity_usd is not None else total_abs_notional
 
-    inferred: List[RebalancePosition] = []
-    for idx, o in enumerate(orders):
-        signed_qty = signed_units[idx]
-        if abs(signed_qty) <= 1e-12:
-            continue
-        signed_notional = signed_notionals[idx]
-        if denom_notional > 1e-9 and abs(signed_notional) > 0.0:
-            weight = signed_notional / denom_notional
-        elif total_abs_units > 1e-9:
-            weight = signed_qty / total_abs_units
-        else:
-            weight = 0.0
-        inferred.append(
-            RebalancePosition(
-                target=str(o.get("target") or "").upper(),
-                track=str(o.get("track") or "liquid"),
-                weight=float(weight),
-            )
-        )
-    return inferred
+def _order_to_risk_weight(order: Dict[str, Any], risk_equity_usd: Optional[float], signed_notional: Optional[float] = None) -> Optional[float]:
+    return _executionapi_order_to_risk_weight(
+        order=order,
+        risk_equity_usd=risk_equity_usd,
+        signed_notional=signed_notional,
+        conversion_error_hook=lambda track: RISK_WEIGHT_CONVERSION_ERRORS_TOTAL.labels(track=track).inc(),
+    )
 
 
 def _normalize_execution_payload(execution: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(execution or {})
-    lifecycle_in = execution.get("lifecycle") if isinstance(execution, dict) else []
-    lifecycle_out: List[Dict[str, Any]] = []
-    now_iso = _utcnow_iso_z()
-    if isinstance(lifecycle_in, list):
-        for ev in lifecycle_in:
-            if not isinstance(ev, dict):
-                continue
-            metrics: Dict[str, float] = {}
-            for k in ("filled_qty", "remaining_qty", "avg_fill_price", "retry", "http_code", "timeout_sec"):
-                v = ev.get(k)
-                if isinstance(v, (int, float)):
-                    metrics[k] = float(v)
-            lifecycle_out.append(
-                {
-                    "event": str(ev.get("event") or "unknown"),
-                    "status": str(ev.get("status") or "unknown"),
-                    "time": str(ev.get("time") or now_iso),
-                    "metrics": metrics,
-                }
-            )
-    out["lifecycle"] = lifecycle_out
-    reason = str(out.get("reject_reason") or "")
-    out["reject_reason_category"] = _normalize_reject_reason(reason)
-    return out
+    return _executionapi_normalize_execution_payload(execution=execution, now_iso=_utcnow_iso_z())
 
 
 def _normalize_reject_reason(reason: str) -> str:
-    r = (reason or "").strip().lower()
-    if not r:
-        return "none"
-    if "invalid_quantity" in r:
-        return "invalid_quantity"
-    if "slippage_too_wide" in r:
-        return "slippage_too_wide"
-    if "risk_blocked" in r or "kill_switch" in r:
-        return "risk_blocked"
-    if "venue_http_" in r or "venue_error" in r:
-        return "venue_error"
-    if "bitget_credentials_not_configured" in r:
-        return "bitget_credentials_not_configured"
-    if "bitget_signature_error" in r:
-        return "bitget_signature_error"
-    if "bitget_transport_error" in r:
-        return "bitget_transport_error"
-    if "bitget_unknown_error" in r:
-        return "bitget_unknown_error"
-    if "bitget_rate_limited" in r:
-        return "bitget_rate_limited"
-    if "bitget_symbol_not_supported" in r:
-        return "bitget_symbol_not_supported"
-    if "bitget_precision_invalid" in r:
-        return "bitget_precision_invalid"
-    if "bitget_position_rule_violation" in r:
-        return "bitget_position_rule_violation"
-    if "timeout" in r or "no_fill_after_retries" in r:
-        return "timeout_or_no_fill"
-    if "paper_reject_simulated" in r:
-        return "simulated_reject"
-    return "other"
+    return _executionapi_normalize_reject_reason(reason)
 
 
 def _position_sizing_settings() -> Dict[str, float]:
@@ -696,8 +623,7 @@ def _data_regime_filters() -> List[str]:
 
 
 def _score_source_filter(value: Optional[str]) -> str:
-    v = str(value or "").strip().lower()
-    return "heuristic" if v == "heuristic" else "model"
+    return _strategybacktest_score_source_filter(value)
 
 
 def _default_gate_thresholds() -> Dict[str, Any]:
@@ -1723,6 +1649,8 @@ def _run_model_inference_backtest(
     max_feature_staleness_hours: int = 24 * 14,
     alignment_version: str = "strict_asof_v1",
     strict_asof_fail_fast: bool = False,
+    model_name: Optional[str] = None,
+    model_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     alignment = _align_feature_price_rows(
         feature_rows=feature_rows,
@@ -1757,10 +1685,22 @@ def _run_model_inference_backtest(
     model_raw: List[float] = []
     predicted = 0
     failed_points = 0
+    service = _get_liquid_model_service()
     for i in range(n):
         payload = aligned_features[i].get("feature_payload") or {}
-        exp = _predict_expected_return_tabular(target, payload)
-        if exp is not None and np.isfinite(exp):
+        try:
+            pred = service.predict_from_feature_payload(
+                target=target,
+                payload=payload,
+                horizon="1d",
+                model_name=model_name,
+                model_version=model_version,
+                require_artifact=True,
+            )
+            exp = float(pred.get("expected_return") or 0.0)
+        except Exception:
+            exp = None
+        if exp is not None and np.isfinite(float(exp)):
             predicted += 1
             model_raw.append(float(exp))
         else:
@@ -1975,101 +1915,36 @@ def _evaluate_gate(
     windows: int,
     score_source: str = "model",
 ) -> Tuple[bool, str, Dict[str, float], int]:
-    score_source = _score_source_filter(score_source)
-    require_leakage_pass = _env_flag("GATE_REQUIRE_LEAKAGE_PASS", "1")
-    allow_degraded_runs = _env_flag("GATE_ALLOW_DEGRADED_RUNS", "0")
-    include_sources, exclude_sources = _run_source_filters()
-    data_regimes = _data_regime_filters()
-    runs = repo.list_recent_backtest_runs(
+    return _strategybacktest_evaluate_gate(
         track=track,
-        limit=windows,
-        include_sources=include_sources,
-        exclude_sources=exclude_sources,
-        data_regimes=data_regimes,
+        min_ic=min_ic,
+        min_pnl_after_cost=min_pnl_after_cost,
+        max_drawdown=max_drawdown,
+        windows=windows,
+        score_source=score_source,
+        repo=repo,
+        env_flag_fn=_env_flag,
+        run_source_filters_fn=_run_source_filters,
+        data_regime_filters_fn=_data_regime_filters,
     )
-    usable: List[Dict[str, Any]] = []
-    for r in runs:
-        metrics = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
-        if not metrics:
-            continue
-        if r.get("superseded_by_run_id") is not None:
-            continue
-        if str(metrics.get("status") or "").lower() != "completed":
-            continue
-        if _score_source_filter((r.get("config") or {}).get("score_source")) != score_source:
-            continue
-        leakage_passed = bool((metrics.get("leakage_checks") or {}).get("passed", False))
-        degraded = bool(metrics.get("degraded", False))
-        if require_leakage_pass and not leakage_passed:
-            continue
-        if (not allow_degraded_runs) and degraded:
-            continue
-        usable.append(r)
-    if len(usable) < windows:
-        return False, "insufficient_windows", {"ic": 0.0, "pnl_after_cost": 0.0, "max_drawdown": 1.0}, len(usable)
-
-    ic_vals = [float(r["metrics"].get("ic", 0.0)) for r in usable[:windows]]
-    pnl_vals = [float(r["metrics"].get("pnl_after_cost", 0.0)) for r in usable[:windows]]
-    dd_vals = [float(r["metrics"].get("max_drawdown", 1.0)) for r in usable[:windows]]
-
-    summary = {
-        "ic": round(float(np.mean(ic_vals)), 6),
-        "pnl_after_cost": round(float(np.mean(pnl_vals)), 6),
-        "max_drawdown": round(float(np.mean(dd_vals)), 6),
-    }
-    passed = summary["ic"] >= min_ic and summary["pnl_after_cost"] >= min_pnl_after_cost and summary["max_drawdown"] <= max_drawdown
-    reason = "passed" if passed else "threshold_failed"
-    return passed, reason, summary, windows
 
 
 def _strategy_bucket(track: str, score: float, confidence: float, target: str) -> str:
-    if track == "vc":
-        return "event"
-    try:
-        f = _latest_liquid_feature_payload(str(target or "").upper(), max_lookback_days=14)
-    except Exception:
-        f = {}
-    ret_1 = float(f.get("ret_1", 0.0) or 0.0)
-    ret_12 = float(f.get("ret_12", 0.0) or 0.0)
-    vol_z = float(f.get("vol_z", 0.0) or 0.0)
-    event_decay = float(f.get("event_decay", 0.0) or 0.0)
-    trend_strength = float(np.tanh(ret_12 * 8.0 + ret_1 * 3.0 + float(score) * 2.0))
-    mr_signal = abs(ret_1) + abs(ret_12)
-    is_low_noise = abs(vol_z) < 1.2
-    if abs(trend_strength) > 0.35 and confidence > 0.55 and is_low_noise:
-        return "trend"
-    if mr_signal < 0.004 and confidence > 0.6 and is_low_noise:
-        return "mean_reversion"
-    if event_decay > 0.0:
-        return "event"
-    return "event"
+    return _strategysignal_strategy_bucket(
+        track=track,
+        score=score,
+        confidence=confidence,
+        target=target,
+        latest_feature_payload_fn=lambda sym: _latest_liquid_feature_payload(sym, max_lookback_days=14),
+    )
 
 
 def _ks_statistic(a: List[float], b: List[float]) -> float:
-    if not a or not b:
-        return 0.0
-    x = np.sort(np.array(a, dtype=np.float64))
-    y = np.sort(np.array(b, dtype=np.float64))
-    all_vals = np.sort(np.unique(np.concatenate([x, y])))
-    cdf_x = np.searchsorted(x, all_vals, side="right") / max(1, len(x))
-    cdf_y = np.searchsorted(y, all_vals, side="right") / max(1, len(y))
-    return float(np.max(np.abs(cdf_x - cdf_y)))
+    return _driftops_ks_statistic(a, b)
 
 
 def _psi(reference: List[float], current: List[float], bins: int = 10) -> float:
-    if not reference or not current:
-        return 0.0
-    ref = np.array(reference, dtype=np.float64)
-    cur = np.array(current, dtype=np.float64)
-    quantiles = np.linspace(0.0, 1.0, bins + 1)
-    edges = np.quantile(ref, quantiles)
-    edges[0] = -np.inf
-    edges[-1] = np.inf
-    ref_hist, _ = np.histogram(ref, bins=edges)
-    cur_hist, _ = np.histogram(cur, bins=edges)
-    ref_pct = np.clip(ref_hist / max(1, ref_hist.sum()), 1e-6, None)
-    cur_pct = np.clip(cur_hist / max(1, cur_hist.sum()), 1e-6, None)
-    return float(np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct)))
+    return _driftops_psi(reference, current, bins=bins)
 
 
 def _flatten_numeric_payloads(payloads: List[Dict[str, float]]) -> Dict[str, List[float]]:
@@ -2084,22 +1959,7 @@ def _flatten_numeric_payloads(payloads: List[Dict[str, float]]) -> Dict[str, Lis
 
 
 def _feature_drift_score(reference_payloads: List[Dict[str, float]], current_payloads: List[Dict[str, float]]) -> Tuple[float, float]:
-    ref_map = _flatten_numeric_payloads(reference_payloads)
-    cur_map = _flatten_numeric_payloads(current_payloads)
-    keys = set(ref_map.keys()) | set(cur_map.keys())
-    if not keys:
-        return 0.0, 0.0
-    psi_vals = []
-    mean_shift = []
-    for k in keys:
-        rv = ref_map.get(k, [])
-        cv = cur_map.get(k, [])
-        if rv and cv:
-            psi_vals.append(_psi(rv, cv))
-            mean_shift.append(abs(float(np.mean(cv)) - float(np.mean(rv))))
-    if not psi_vals:
-        return 0.0, 0.0
-    return float(np.mean(psi_vals)), float(np.mean(mean_shift))
+    return _driftops_feature_drift_score(reference_payloads, current_payloads)
 
 
 @router.post("/ingest/events", response_model=IngestEventsResponse)
@@ -2153,6 +2013,7 @@ async def predict_vc(payload: VCPredictRequest):
 @router.post("/predict/liquid")
 async def predict_liquid(payload: LiquidPredictRequest):
     result = _build_liquid_prediction(payload.symbol, payload.horizon)
+    outputs = result.get("outputs") if isinstance(result.get("outputs"), dict) else {}
     prediction_id = repo.insert_prediction(
         track="liquid",
         target=payload.symbol.upper(),
@@ -2168,7 +2029,13 @@ async def predict_liquid(payload: LiquidPredictRequest):
         "prediction_id": prediction_id,
         "track": "liquid",
         "target": payload.symbol.upper(),
-        "outputs": result["outputs"],
+        "expected_return": float(outputs.get("expected_return") or 0.0),
+        "signal_confidence": float(outputs.get("signal_confidence") or 0.0),
+        "vol_forecast": float(outputs.get("vol_forecast") or 0.0),
+        "stack": dict(outputs.get("stack") or {}),
+        "degraded": bool(outputs.get("degraded", False)),
+        "degraded_reasons": list(outputs.get("degraded_reasons") or []),
+        "outputs": outputs,  # backward-compat window
         "explanation": result["explanation"],
     }
 
@@ -2268,11 +2135,7 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
     if payload.run_source == "prod" and str(payload.alignment_mode).strip().lower() != "strict_asof":
         raise HTTPException(status_code=400, detail="prod run_source requires alignment_mode=strict_asof")
     strict_mode_requested = str(payload.alignment_mode).strip().lower() == "strict_asof"
-    strict_mode_prod_gate = bool(payload.run_source == "prod" or data_regime == "prod_live")
-    strict_asof_fail_fast = bool(
-        strict_mode_requested
-        and (_strict_asof_hard_fail_enabled() or strict_mode_prod_gate)
-    )
+    strict_asof_fail_fast = bool(strict_mode_requested)
     config["score_source"] = score_source
     config["data_regime"] = data_regime
     config["targets"] = targets
@@ -2301,7 +2164,8 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
     model_artifact_ok = True
     if score_source == "model" and payload.require_model_artifact:
         if payload.track == "liquid":
-            missing_model_targets = [t for t in targets if _load_tabular_model_artifact(t) is None]
+            service = _get_liquid_model_service()
+            missing_model_targets = [t for t in targets if not service.has_required_artifacts(target=t, model_name=model_name)]
             model_artifact_ok = len(missing_model_targets) == 0
         else:
             model_artifact_ok = repo.model_artifact_exists(
@@ -2373,6 +2237,8 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
                 max_feature_staleness_hours=payload.max_feature_staleness_hours,
                 alignment_version=payload.alignment_version,
                 strict_asof_fail_fast=strict_asof_fail_fast,
+                model_name=model_name,
+                model_version=model_version,
             )
         else:
             m = _run_model_replay_backtest(
@@ -2572,13 +2438,11 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
             degraded_reasons.append("model_inference_partial_coverage")
         agg["degraded"] = bool(degraded_reasons)
         agg["degraded_reasons"] = sorted(set(degraded_reasons))
-        agg["gate_passed"] = _single_run_gate_pass(
-            metrics=agg,
-            min_ic=float(gate_cfg["min_ic"]),
-            min_pnl_after_cost=float(gate_cfg["min_pnl_after_cost"]),
-            max_drawdown=float(gate_cfg["max_drawdown"]),
-        )
+        agg["gate_passed"] = False
 
+    MODEL_COVERAGE_RATIO.labels(track=payload.track).set(float(agg.get("model_inference_coverage", 0.0) or 0.0))
+    if str(agg.get("reason") or "").startswith("strict_asof_alignment_fail_fast:"):
+        STRICT_ASOF_FAIL_COUNT.labels(track=payload.track).inc()
     repo.finish_backtest_run(run_id, agg)
     if str(agg.get("status")) == "failed":
         BACKTEST_FAILED_RUNS_TOTAL.labels(track=payload.track, reason=str(agg.get("reason") or "unknown")).inc()
@@ -2596,6 +2460,11 @@ async def run_backtest(payload: BacktestRunRequest) -> BacktestRunResponse:
         windows=int(gate_cfg["windows"]),
         score_source=score_source,
     )
+    agg["gate_passed"] = bool(passed) if str(agg.get("status") or "").lower() == "completed" else False
+    agg["gate_reason"] = str(reason)
+    agg["gate_summary"] = dict(summary)
+    agg["gate_windows_checked"] = int(checked)
+    repo.finish_backtest_run(run_id, agg)
     repo.promote_model(
         track=payload.track,
         model_name=gate_model_name,
@@ -2667,6 +2536,11 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
     action = "hold"
     score = float(pred["score"])
     confidence = float(pred["confidence"])
+    pred_outputs = pred.get("outputs") if isinstance(pred.get("outputs"), dict) else {}
+    predicted_score = float(pred_outputs.get("expected_return", score) or score)
+    predicted_conf = float(pred_outputs.get("signal_confidence", confidence) or confidence)
+    divergence = abs(score - predicted_score) + abs(confidence - predicted_conf)
+    SIGNAL_PREDICT_DIVERGENCE.labels(track=payload.track, target=payload.target.upper()).set(float(divergence))
     bucket = _strategy_bucket(payload.track, score, confidence, payload.target)
 
     if payload.policy == "ensemble-v1" and payload.track != "liquid":
@@ -3271,6 +3145,17 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
         od["quantity"] = round(q, 8)
         od["metadata"] = {**(order.get("metadata") or {}), "rollout_stage_pct": pct}
         scaled_orders.append(od)
+    market_fit_violations = _order_market_fit_violations(scaled_orders, payload.market_type)
+    if market_fit_violations:
+        for code in market_fit_violations:
+            repo.save_risk_event(
+                decision_id=f"risk-precheck-{uuid.uuid4().hex[:12]}",
+                severity="warning",
+                code=code,
+                message="execution market adaptation precheck blocked",
+                payload={"decision_id": payload.decision_id, "market_type": payload.market_type},
+            )
+        raise HTTPException(status_code=423, detail=f"risk_blocked:{','.join(market_fit_violations)}")
     precheck_violations = _execution_volatility_violations(scaled_orders)
     if precheck_violations:
         track = str(scaled_orders[0].get("track") or "liquid")
@@ -3348,7 +3233,7 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
     )
     track = str(scaled_orders[0].get("track") or "liquid")
     realized_daily_loss = _infer_daily_loss_ratio(track=track)
-    worst_latest_edge_ratio = min((x[2] for x in pair_latest_edges), default=0.0)
+    best_latest_edge_ratio = max((x[2] for x in pair_latest_edges), default=0.0)
     max_intraday_drawdown = max((x[2] for x in pair_intraday_drawdowns), default=0.0)
     risk_resp = await risk_check(
         RiskCheckRequest(
@@ -3357,7 +3242,7 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
             realized_drawdown=0.0,
             daily_loss=realized_daily_loss,
             consecutive_losses=max_strategy_streak,
-            latest_trade_edge_ratio=worst_latest_edge_ratio,
+            latest_trade_edge_ratio=best_latest_edge_ratio,
             intraday_drawdown=max_intraday_drawdown,
             strategy_id=str(scaled_orders[0].get("strategy_id") or "global"),
         )
@@ -3397,6 +3282,9 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
             reason_cat = str(normalized_res.get("reject_reason_category") or "other")
             reject_breakdown[reason_cat] = reject_breakdown.get(reason_cat, 0) + 1
             EXECUTION_REJECTS_TOTAL.labels(adapter=payload.adapter, reason=reason_cat).inc()
+            reason_raw = str(normalized_res.get("reject_reason") or "").lower()
+            if reason_cat == "other" and "bitget" in reason_raw:
+                BITGET_UNCLASSIFIED_ERRORS_TOTAL.labels(adapter=payload.adapter).inc()
         repo.update_order_execution(order["id"], status=status, metadata={"execution": normalized_res})
         merged.append({**order, "execution": normalized_res})
 

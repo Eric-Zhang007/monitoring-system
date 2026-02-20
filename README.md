@@ -174,6 +174,8 @@ bash scripts/collect_required_data.sh
 - `RUN_MARKET=1 RUN_AUX=1 RUN_ORDERBOOK_PROXY=1 RUN_SOCIAL=1`
 - `MARKET_FALLBACK_SOURCE=none`（`1h` 场景可改 `coingecko`）
 - `SOCIAL_STRICT=0`（社媒缺源时不阻断其余修复步骤）
+- 国内网络推荐：`EVENT_DISABLE_GDELT=1 EVENT_DAY_STEP=30`（降低事件回填超时风险）
+- 若 Reddit 限流明显：`EVENT_SOCIAL_SOURCES=reddit REDDIT_FETCH_COMMENTS=0 REDDIT_LIMIT=80`（评论比率由脚本内回填逻辑补齐）
 
 脚本产物：
 - `artifacts/data_remediation/run_<UTC时间>/audit_before.json`
@@ -199,6 +201,11 @@ python3 scripts/ingest_binance_derivatives_signals.py \
   --period 5m \
   --symbols BTC,ETH,SOL
 ```
+
+说明：
+- 脚本会自动处理交易所历史窗口限制（默认约近 30 天）。
+- 低频衍生品指标会自动扩展到目标 `period`（如 `5m`）以保证训练窗口覆盖。
+- 当源侧缺失 `annualized_basis_rate` 时，会基于 `basis_rate` 派生补齐（用于覆盖与门禁）。
 
 补充：独立执行订单簿代理回填（冷启动）：
 

@@ -20,11 +20,11 @@ import redis
 
 from explainer import build_explanation
 from liquid_feature_contract import (
-    LIQUID_FEATURE_KEYS,
     LIQUID_FEATURE_SCHEMA_VERSION,
+    ONLINE_LIQUID_FEATURE_KEYS,
     event_quality_profile,
     source_tier_weights,
-    vector_from_payload,
+    vector_from_payload_online,
 )
 from model_router import ModelRouter
 
@@ -36,9 +36,10 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
-LIQUID_SYMBOLS = [s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK").split(",") if s.strip()]
+LIQUID_SYMBOLS = [s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL").split(",") if s.strip()]
 LIQUID_PRIMARY_TIMEFRAME = str(os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m")).strip().lower() or "5m"
 INFER_INTERVAL_SEC = int(os.getenv("INFER_INTERVAL_SEC", "60"))
+INFER_PRICE_FALLBACK_ENABLED = os.getenv("INFER_PRICE_FALLBACK_ENABLED", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 
 class InferenceServiceV2:
@@ -53,12 +54,30 @@ class InferenceServiceV2:
         self.feature_payload_schema_version = LIQUID_FEATURE_SCHEMA_VERSION
 
     @staticmethod
+    def _as_utc(ts: object, fallback_now: bool = True) -> Optional[datetime]:
+        if isinstance(ts, datetime):
+            dt = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        if isinstance(ts, str) and ts.strip():
+            text = ts.strip().replace(" ", "T")
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except Exception:
+                pass
+        return datetime.now(timezone.utc) if fallback_now else None
+
+    @staticmethod
     def _source_tier_weights() -> Dict[int, float]:
         return source_tier_weights()
 
     @staticmethod
     def _vector_from_payload(payload: Dict[str, float]) -> np.ndarray:
-        return vector_from_payload(payload)
+        return vector_from_payload_online(payload)
 
     def _event_quality_profile(self, event_ctx: List[Dict], *, as_of_ts: Optional[datetime] = None) -> Dict[str, object]:
         return event_quality_profile(event_ctx, as_of_ts=as_of_ts)
@@ -69,6 +88,24 @@ class InferenceServiceV2:
 
     def get_latest_price(self, symbol: str) -> Optional[Dict]:
         with self.conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT symbol, close::float AS price, volume::float AS volume, ts AS timestamp
+                    FROM market_bars
+                    WHERE symbol = UPPER(%s) AND timeframe = %s
+                    ORDER BY ts DESC
+                    LIMIT 1
+                    """,
+                    (symbol, LIQUID_PRIMARY_TIMEFRAME),
+                )
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+            except Exception:
+                pass
+            if not INFER_PRICE_FALLBACK_ENABLED:
+                return None
             cur.execute(
                 """
                 SELECT symbol, price::float AS price, volume::float AS volume, timestamp
@@ -85,7 +122,37 @@ class InferenceServiceV2:
     def get_latest_prices(self, symbols: List[str]) -> Dict[str, Dict]:
         if not symbols:
             return {}
+        upper_symbols = [s.upper() for s in symbols]
         with self.conn.cursor() as cur:
+            out: Dict[str, Dict] = {}
+            try:
+                cur.execute(
+                    """
+                    WITH ranked AS (
+                        SELECT
+                            symbol,
+                            close::float AS price,
+                            volume::float AS volume,
+                            ts AS timestamp,
+                            ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn
+                        FROM market_bars
+                        WHERE symbol = ANY(%s)
+                          AND timeframe = %s
+                    )
+                    SELECT symbol, price, volume, timestamp
+                    FROM ranked
+                    WHERE rn = 1
+                    """,
+                    (upper_symbols, LIQUID_PRIMARY_TIMEFRAME),
+                )
+                out = {str(r["symbol"]).upper(): dict(r) for r in cur.fetchall()}
+            except Exception:
+                out = {}
+            if (not INFER_PRICE_FALLBACK_ENABLED) or (len(out) >= len(upper_symbols)):
+                return out
+            missing = [s for s in upper_symbols if s not in out]
+            if not missing:
+                return out
             cur.execute(
                 """
                 WITH ranked AS (
@@ -102,11 +169,14 @@ class InferenceServiceV2:
                 FROM ranked
                 WHERE rn = 1
                 """,
-                ([s.upper() for s in symbols],),
+                (missing,),
             )
-            return {str(r["symbol"]).upper(): dict(r) for r in cur.fetchall()}
+            for row in cur.fetchall():
+                out[str(row["symbol"]).upper()] = dict(row)
+            return out
 
-    def get_recent_prices(self, symbol: str, limit: int = 64) -> List[Dict]:
+    def get_recent_prices(self, symbol: str, limit: int = 64, as_of_ts: Optional[datetime] = None) -> List[Dict]:
+        as_of = self._as_utc(as_of_ts, fallback_now=True)
         with self.conn.cursor() as cur:
             try:
                 cur.execute(
@@ -114,98 +184,117 @@ class InferenceServiceV2:
                     SELECT symbol, close::float AS price, volume::float AS volume, ts AS timestamp
                     FROM market_bars
                     WHERE symbol = UPPER(%s) AND timeframe = %s
+                      AND ts <= %s
                     ORDER BY ts DESC
                     LIMIT %s
                     """,
-                    (symbol, LIQUID_PRIMARY_TIMEFRAME, limit),
+                    (symbol, LIQUID_PRIMARY_TIMEFRAME, as_of, limit),
                 )
                 rows = [dict(r) for r in cur.fetchall()]
             except Exception:
                 rows = []
             if rows:
                 return sorted(rows, key=lambda x: x["timestamp"])
+            if not INFER_PRICE_FALLBACK_ENABLED:
+                return []
 
             cur.execute(
                 """
                 SELECT symbol, price::float AS price, volume::float AS volume, timestamp
                 FROM prices
                 WHERE symbol = UPPER(%s)
+                  AND timestamp <= %s
                 ORDER BY timestamp DESC
                 LIMIT %s
                 """,
-                (symbol, limit),
+                (symbol, as_of, limit),
             )
             rows = [dict(r) for r in cur.fetchall()]
             return sorted(rows, key=lambda x: x["timestamp"])
 
-    def get_orderbook_imbalance_latest(self, symbols: List[str]) -> Dict[str, float]:
-        if not symbols:
-            return {}
+    def get_orderbook_imbalance_asof(self, symbol: str, as_of_ts: datetime) -> Optional[float]:
+        as_of = self._as_utc(as_of_ts, fallback_now=True)
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                WITH ranked AS (
-                    SELECT
-                        symbol,
-                        imbalance::float AS imbalance,
-                        ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn
-                    FROM orderbook_l2
-                    WHERE symbol = ANY(%s)
-                )
-                SELECT symbol, imbalance
-                FROM ranked
-                WHERE rn = 1
+                SELECT imbalance::float AS imbalance
+                FROM orderbook_l2
+                WHERE symbol = UPPER(%s)
+                  AND ts <= %s
+                ORDER BY ts DESC
+                LIMIT 1
                 """,
-                ([s.upper() for s in symbols],),
+                (symbol, as_of),
             )
-            return {str(r["symbol"]).upper(): float(r.get("imbalance") or 0.0) for r in cur.fetchall()}
+            row = cur.fetchone()
+            if not row:
+                return None
+            return float((dict(row)).get("imbalance") or 0.0)
 
-    def get_funding_latest(self, symbols: List[str]) -> Dict[str, float]:
-        if not symbols:
-            return {}
+    def get_funding_asof(self, symbol: str, as_of_ts: datetime) -> Optional[float]:
+        as_of = self._as_utc(as_of_ts, fallback_now=True)
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                WITH ranked AS (
-                    SELECT
-                        symbol,
-                        funding_rate::float AS funding_rate,
-                        ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn
-                    FROM funding_rates
-                    WHERE symbol = ANY(%s)
-                )
-                SELECT symbol, funding_rate
-                FROM ranked
-                WHERE rn = 1
+                SELECT funding_rate::float AS funding_rate
+                FROM funding_rates
+                WHERE symbol = UPPER(%s)
+                  AND ts <= %s
+                ORDER BY ts DESC
+                LIMIT 1
                 """,
-                ([s.upper() for s in symbols],),
+                (symbol, as_of),
             )
-            return {str(r["symbol"]).upper(): float(r.get("funding_rate") or 0.0) for r in cur.fetchall()}
+            row = cur.fetchone()
+            if not row:
+                return None
+            return float((dict(row)).get("funding_rate") or 0.0)
 
-    def get_onchain_latest(self, symbols: List[str]) -> Dict[str, float]:
-        if not symbols:
-            return {}
+    def get_onchain_asof(self, symbol: str, as_of_ts: datetime) -> Optional[float]:
+        as_of = self._as_utc(as_of_ts, fallback_now=True)
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                WITH ranked AS (
-                    SELECT
-                        asset_symbol,
-                        metric_value::float AS metric_value,
-                        ROW_NUMBER() OVER (PARTITION BY asset_symbol ORDER BY ts DESC) AS rn
-                    FROM onchain_signals
-                    WHERE asset_symbol = ANY(%s)
-                      AND metric_name IN ('netflow','exchange_netflow','net_inflow')
-                )
-                SELECT asset_symbol, metric_value
-                FROM ranked
-                WHERE rn = 1
+                SELECT metric_value::float AS metric_value
+                FROM onchain_signals
+                WHERE asset_symbol = UPPER(%s)
+                  AND metric_name IN ('netflow','exchange_netflow','net_inflow')
+                  AND ts <= %s
+                ORDER BY ts DESC
+                LIMIT 1
                 """,
-                ([s.upper() for s in symbols],),
+                (symbol, as_of),
             )
-            return {str(r["asset_symbol"]).upper(): float(r.get("metric_value") or 0.0) for r in cur.fetchall()}
+            row = cur.fetchone()
+            if not row:
+                return None
+            return float((dict(row)).get("metric_value") or 0.0)
 
-    def get_event_context(self, target: str, limit: int = 5) -> List[Dict]:
+    def get_feature_matrix_asof(self, symbol: str, as_of_ts: datetime) -> Optional[Dict[str, float]]:
+        as_of = self._as_utc(as_of_ts, fallback_now=True)
+        with self.conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT features
+                    FROM feature_matrix_main
+                    WHERE symbol = UPPER(%s)
+                      AND as_of_ts <= %s
+                    ORDER BY as_of_ts DESC
+                    LIMIT 1
+                    """,
+                    (symbol, as_of),
+                )
+                row = cur.fetchone()
+            except Exception:
+                return None
+            if not row:
+                return None
+            payload = dict(row).get("features")
+            return payload if isinstance(payload, dict) else None
+
+    def get_event_context(self, target: str, limit: int = 5, as_of_ts: Optional[datetime] = None) -> List[Dict]:
+        as_of = self._as_utc(as_of_ts, fallback_now=True)
         with self.conn.cursor() as cur:
             try:
                 cur.execute(
@@ -216,11 +305,11 @@ class InferenceServiceV2:
                     LEFT JOIN event_links el ON el.event_id = e.id
                     LEFT JOIN entities en ON en.id = el.entity_id
                     WHERE (en.symbol = UPPER(%s) OR en.name = %s)
-                      AND COALESCE(e.available_at, e.occurred_at) <= NOW()
+                      AND COALESCE(e.available_at, e.occurred_at) <= %s
                     ORDER BY COALESCE(e.available_at, e.occurred_at) DESC
                     LIMIT %s
                     """,
-                    (target, target, limit),
+                    (target, target, as_of, limit),
                 )
             except Exception:
                 cur.execute(
@@ -231,11 +320,11 @@ class InferenceServiceV2:
                     LEFT JOIN event_links el ON el.event_id = e.id
                     LEFT JOIN entities en ON en.id = el.entity_id
                     WHERE (en.symbol = UPPER(%s) OR en.name = %s)
-                      AND e.occurred_at <= NOW()
+                      AND e.occurred_at <= %s
                     ORDER BY e.occurred_at DESC
                     LIMIT %s
                     """,
-                    (target, target, limit),
+                    (target, target, as_of, limit),
                 )
             return [dict(r) for r in cur.fetchall()]
 
@@ -376,8 +465,10 @@ class InferenceServiceV2:
         features: Dict[str, float],
         lineage_id: str,
         event_time: Optional[datetime] = None,
+        as_of_ts: Optional[datetime] = None,
     ) -> None:
-        ts = datetime.now(timezone.utc)
+        ts = self._as_utc(as_of_ts, fallback_now=True)
+        ev_time = self._as_utc(event_time, fallback_now=False) or ts
         with self.conn.cursor() as cur:
             try:
                 cur.execute(
@@ -393,7 +484,7 @@ class InferenceServiceV2:
                         track,
                         ts,
                         ts,
-                        event_time or ts,
+                        ev_time,
                         ts,
                         self.feature_version,
                         json.dumps(features),
@@ -415,7 +506,7 @@ class InferenceServiceV2:
                         track,
                         ts,
                         ts,
-                        event_time or ts,
+                        ev_time,
                         self.feature_version,
                         json.dumps(features),
                         self.data_version,
@@ -534,14 +625,15 @@ class InferenceServiceV2:
             "event_lag_bucket_1_6h": float(source_profile.get("event_lag_bucket_1_6h") or 0.0),
             "event_lag_bucket_6_24h": float(source_profile.get("event_lag_bucket_6_24h") or 0.0),
         }
-        return {k: float(payload.get(k, 0.0) or 0.0) for k in LIQUID_FEATURE_KEYS}
+        return {k: float(payload.get(k, 0.0) or 0.0) for k in ONLINE_LIQUID_FEATURE_KEYS}
 
     def run_vc_once(self):
         targets = ["OpenAI", "Anthropic", "Scale AI"]
         active_model = self.get_active_model("vc")
         for name in targets:
-            event_ctx = self.get_event_context(name)
-            source_profile = self._event_quality_profile(event_ctx)
+            as_of_ts = datetime.now(timezone.utc)
+            event_ctx = self.get_event_context(name, as_of_ts=as_of_ts)
+            source_profile = self._event_quality_profile(event_ctx, as_of_ts=as_of_ts)
             feature = np.array([len(event_ctx), sum(float(e.get("confidence_score", 0.5)) for e in event_ctx), 1.0, 0.5, 0.2], dtype=np.float32)
             infer_lineage_id = f"infer-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{name.lower().replace(' ', '-')[:12]}"
             self.save_feature_snapshot(
@@ -556,6 +648,7 @@ class InferenceServiceV2:
                 },
                 lineage_id=infer_lineage_id,
                 event_time=max((e.get("occurred_at") for e in event_ctx if e.get("occurred_at") is not None), default=None),
+                as_of_ts=as_of_ts,
             )
             out = self.router.predict_vc(feature, model_name=active_model["name"])
             confidence = 0.55 + min(0.35, len(event_ctx) * 0.05)
@@ -585,74 +678,84 @@ class InferenceServiceV2:
     def run_liquid_once(self):
         active_model = self.get_active_model("liquid")
         latest_map = self.get_latest_prices(LIQUID_SYMBOLS)
-        event_map = self.get_event_contexts(LIQUID_SYMBOLS, limit_per_target=128)
-        orderbook_map = self.get_orderbook_imbalance_latest(LIQUID_SYMBOLS)
-        funding_map = self.get_funding_latest(LIQUID_SYMBOLS)
-        onchain_map = self.get_onchain_latest(LIQUID_SYMBOLS)
         for symbol in LIQUID_SYMBOLS:
             row = latest_map.get(symbol)
             if not row:
                 continue
-            event_ctx = event_map.get(symbol, [])
-            as_of_ts = row.get("timestamp")
-            if isinstance(as_of_ts, datetime):
-                as_of_ts = as_of_ts if as_of_ts.tzinfo else as_of_ts.replace(tzinfo=timezone.utc)
-            else:
-                as_of_ts = datetime.now(timezone.utc)
+            as_of_ts = self._as_utc(row.get("timestamp"), fallback_now=True)
+            event_ctx = self.get_event_context(symbol, limit=128, as_of_ts=as_of_ts)
             source_profile = self._event_quality_profile(event_ctx, as_of_ts=as_of_ts)
             price = float(row["price"])
-            volume = float(row.get("volume") or 0.0)
-            history = self.get_recent_prices(symbol, limit=144)
-            price_history_degraded = False
-            if len(history) >= 97:
-                prices = np.array([float(h.get("price") or price) for h in history], dtype=np.float64)
-                vols = np.array([float(h.get("volume") or 0.0) for h in history], dtype=np.float64)
-                ret_1 = float((prices[-1] - prices[-2]) / max(prices[-2], 1e-12))
-                ret_3 = float((prices[-1] - prices[-4]) / max(prices[-4], 1e-12))
-                ret_12 = float((prices[-1] - prices[-13]) / max(prices[-13], 1e-12))
-                ret_48 = float((prices[-1] - prices[-49]) / max(prices[-49], 1e-12))
-                vol_3 = float(np.std(np.diff(np.log(np.clip(prices[-4:], 1e-12, None)))))
-                vol_12 = float(np.std(np.diff(np.log(np.clip(prices[-13:], 1e-12, None)))))
-                vol_48 = float(np.std(np.diff(np.log(np.clip(prices[-49:], 1e-12, None)))))
-                vol_96 = float(np.std(np.diff(np.log(np.clip(prices[-97:], 1e-12, None)))))
-                vol_hist = vols[-13:-1]
-                vol_z = float((vols[-1] - np.mean(vol_hist)) / max(np.std(vol_hist), 1e-6))
-                volume_impact = float(abs(ret_1) / max(np.sqrt(max(vols[-1], 1.0)), 1e-6))
+            degraded_reasons: List[str] = []
+
+            matrix_payload = self.get_feature_matrix_asof(symbol, as_of_ts)
+            if isinstance(matrix_payload, dict) and matrix_payload:
+                feature_payload = {k: float(matrix_payload.get(k, 0.0) or 0.0) for k in ONLINE_LIQUID_FEATURE_KEYS}
             else:
-                ret_1 = ret_3 = ret_12 = ret_48 = 0.0
-                vol_3 = vol_12 = vol_48 = vol_96 = 0.0
-                vol_z = 0.0
-                volume_impact = 0.0
-                price_history_degraded = True
+                volume = float(row.get("volume") or 0.0)
+                history = self.get_recent_prices(symbol, limit=144, as_of_ts=as_of_ts)
+                price_history_degraded = False
+                if len(history) >= 97:
+                    prices = np.array([float(h.get("price") or price) for h in history], dtype=np.float64)
+                    vols = np.array([float(h.get("volume") or 0.0) for h in history], dtype=np.float64)
+                    ret_1 = float((prices[-1] - prices[-2]) / max(prices[-2], 1e-12))
+                    ret_3 = float((prices[-1] - prices[-4]) / max(prices[-4], 1e-12))
+                    ret_12 = float((prices[-1] - prices[-13]) / max(prices[-13], 1e-12))
+                    ret_48 = float((prices[-1] - prices[-49]) / max(prices[-49], 1e-12))
+                    vol_3 = float(np.std(np.diff(np.log(np.clip(prices[-4:], 1e-12, None)))))
+                    vol_12 = float(np.std(np.diff(np.log(np.clip(prices[-13:], 1e-12, None)))))
+                    vol_48 = float(np.std(np.diff(np.log(np.clip(prices[-49:], 1e-12, None)))))
+                    vol_96 = float(np.std(np.diff(np.log(np.clip(prices[-97:], 1e-12, None)))))
+                    vol_hist = vols[-13:-1]
+                    vol_z = float((vols[-1] - np.mean(vol_hist)) / max(np.std(vol_hist), 1e-6))
+                    volume_impact = float(abs(ret_1) / max(np.sqrt(max(vols[-1], 1.0)), 1e-6))
+                else:
+                    ret_1 = ret_3 = ret_12 = ret_48 = 0.0
+                    vol_3 = vol_12 = vol_48 = vol_96 = 0.0
+                    vol_z = 0.0
+                    volume_impact = 0.0
+                    price_history_degraded = True
 
-            orderbook_imbalance = float(orderbook_map.get(symbol, 0.0))
-            funding_rate = float(funding_map.get(symbol, 0.0))
-            onchain_flow = float(onchain_map.get(symbol, 0.0))
-            onchain_norm = float(np.tanh(onchain_flow / 1e6))
-            orderbook_missing_flag = 0.0 if symbol in orderbook_map else 1.0
-            funding_missing_flag = 0.0 if symbol in funding_map else 1.0
-            onchain_missing_flag = 0.0 if symbol in onchain_map else 1.0
+                orderbook_raw = self.get_orderbook_imbalance_asof(symbol, as_of_ts)
+                funding_raw = self.get_funding_asof(symbol, as_of_ts)
+                onchain_raw = self.get_onchain_asof(symbol, as_of_ts)
+                orderbook_imbalance = float(orderbook_raw or 0.0)
+                funding_rate = float(funding_raw or 0.0)
+                onchain_flow = float(onchain_raw or 0.0)
+                onchain_norm = float(np.tanh(onchain_flow / 1e6))
+                orderbook_missing_flag = 1.0 if orderbook_raw is None else 0.0
+                funding_missing_flag = 1.0 if funding_raw is None else 0.0
+                onchain_missing_flag = 1.0 if onchain_raw is None else 0.0
 
-            feature_payload = self._build_liquid_feature_payload(
-                volume=volume,
-                ret_1=ret_1,
-                ret_3=ret_3,
-                ret_12=ret_12,
-                ret_48=ret_48,
-                vol_3=vol_3,
-                vol_12=vol_12,
-                vol_48=vol_48,
-                vol_96=vol_96,
-                vol_z=vol_z,
-                volume_impact=volume_impact,
-                orderbook_imbalance=orderbook_imbalance,
-                funding_rate=funding_rate,
-                onchain_norm=onchain_norm,
-                orderbook_missing_flag=orderbook_missing_flag,
-                funding_missing_flag=funding_missing_flag,
-                onchain_missing_flag=onchain_missing_flag,
-                source_profile=source_profile,
-            )
+                feature_payload = self._build_liquid_feature_payload(
+                    volume=volume,
+                    ret_1=ret_1,
+                    ret_3=ret_3,
+                    ret_12=ret_12,
+                    ret_48=ret_48,
+                    vol_3=vol_3,
+                    vol_12=vol_12,
+                    vol_48=vol_48,
+                    vol_96=vol_96,
+                    vol_z=vol_z,
+                    volume_impact=volume_impact,
+                    orderbook_imbalance=orderbook_imbalance,
+                    funding_rate=funding_rate,
+                    onchain_norm=onchain_norm,
+                    orderbook_missing_flag=orderbook_missing_flag,
+                    funding_missing_flag=funding_missing_flag,
+                    onchain_missing_flag=onchain_missing_flag,
+                    source_profile=source_profile,
+                )
+                degraded_reasons.append("feature_matrix_unavailable")
+                if price_history_degraded:
+                    degraded_reasons.append("insufficient_price_history")
+                if orderbook_missing_flag > 0:
+                    degraded_reasons.append("orderbook_missing")
+                if funding_missing_flag > 0:
+                    degraded_reasons.append("funding_missing")
+                if onchain_missing_flag > 0:
+                    degraded_reasons.append("onchain_missing")
             feature = self._vector_from_payload(feature_payload)
             infer_lineage_id = f"infer-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{symbol.lower()}"
             latest_event_time = None
@@ -667,17 +770,9 @@ class InferenceServiceV2:
                 },
                 lineage_id=infer_lineage_id,
                 event_time=latest_event_time,
+                as_of_ts=as_of_ts,
             )
             out = self.router.predict_liquid(symbol, feature, model_name=active_model["name"])
-            degraded_reasons: List[str] = []
-            if price_history_degraded:
-                degraded_reasons.append("insufficient_price_history")
-            if orderbook_missing_flag > 0:
-                degraded_reasons.append("orderbook_missing")
-            if funding_missing_flag > 0:
-                degraded_reasons.append("funding_missing")
-            if onchain_missing_flag > 0:
-                degraded_reasons.append("onchain_missing")
             if degraded_reasons:
                 out["signal_confidence"] = float(max(0.2, float(out.get("signal_confidence") or 0.0) * 0.7))
                 out["degraded"] = True

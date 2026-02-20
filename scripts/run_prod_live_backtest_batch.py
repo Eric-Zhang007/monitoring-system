@@ -71,6 +71,16 @@ def _payload_from_args(args: argparse.Namespace, targets: List[str]) -> Dict[str
     }
 
 
+def _validate_cost_floor(fee_bps: float, slippage_bps: float) -> None:
+    min_fee_bps = float(os.getenv("BACKTEST_MIN_FEE_BPS", "3.0"))
+    min_slippage_bps = float(os.getenv("BACKTEST_MIN_SLIPPAGE_BPS", "2.0"))
+    if float(fee_bps) < min_fee_bps or float(slippage_bps) < min_slippage_bps:
+        raise RuntimeError(
+            f"cost_params_too_low fee_bps={fee_bps} slippage_bps={slippage_bps} "
+            f"(minimums: fee={min_fee_bps}, slippage={min_slippage_bps})"
+        )
+
+
 def _http_session() -> requests.Session:
     sess = requests.Session()
     retry = Retry(
@@ -158,7 +168,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Run strict prod_live model backtest batch")
     ap.add_argument("--api-base", default=os.getenv("API_BASE", "http://localhost:8000"))
     ap.add_argument("--track", default="liquid")
-    ap.add_argument("--targets", default=os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"))
+    ap.add_argument("--targets", default=os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL"))
     ap.add_argument("--n-runs", type=int, default=24)
     ap.add_argument("--sleep-sec", type=float, default=0.2)
     ap.add_argument("--request-timeout-sec", type=float, default=12.0)
@@ -184,12 +194,14 @@ def main() -> int:
         default=os.getenv("BACKTEST_SIGNAL_POLARITY_MODE", "auto_train_ic"),
         choices=["normal", "auto_train_ic", "auto_train_pnl"],
     )
-    ap.add_argument("--alignment-mode", default=os.getenv("BACKTEST_ALIGNMENT_MODE", "strict_asof"), choices=["strict_asof", "legacy_index"])
+    ap.add_argument("--alignment-mode", default=os.getenv("BACKTEST_ALIGNMENT_MODE", "strict_asof"), choices=["strict_asof"])
     ap.add_argument("--alignment-version", default=os.getenv("BACKTEST_ALIGNMENT_VERSION", "strict_asof_v1"))
     ap.add_argument("--max-feature-staleness-hours", type=int, default=int(os.getenv("BACKTEST_MAX_FEATURE_STALENESS_HOURS", str(24 * 14))))
     ap.add_argument("--require-model-artifact", action="store_true", default=True)
     ap.add_argument("--jsonl", default="")
     args = ap.parse_args()
+
+    _validate_cost_floor(float(args.fee_bps), float(args.slippage_bps))
 
     started = datetime.now(timezone.utc)
     targets = _parse_targets(args.targets)

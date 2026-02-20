@@ -26,7 +26,7 @@ def _default_model_dir() -> str:
     repo_models = Path(__file__).resolve().parents[1] / "backend" / "models"
     if repo_models.exists():
         return str(repo_models)
-    return "/app/models"
+    return "/opt/monitoring-system/models"
 
 
 MODEL_DIR = _default_model_dir()

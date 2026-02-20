@@ -57,9 +57,8 @@ def test_publish_event_includes_source_quality_payload(monkeypatch):
         captured["timeout"] = timeout
         return _Resp()
 
-    monkeypatch.setattr(collector_mod.requests, "post", _fake_post)
-
     dc = collector_mod.DataCollectorV2()
+    dc._http_post = _fake_post
     event = {
         "event_type": "market",
         "title": "test event",

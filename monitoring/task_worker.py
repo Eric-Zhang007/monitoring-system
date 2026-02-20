@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 APP_ROOT = Path(__file__).resolve().parents[1]
-IMPORT_PATHS = ["/app", str(APP_ROOT / "backend")]
+IMPORT_PATHS = [str(APP_ROOT), str(APP_ROOT / "backend")]
 for p in IMPORT_PATHS:
     if p not in sys.path:
         sys.path.append(p)

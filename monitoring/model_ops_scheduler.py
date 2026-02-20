@@ -5,10 +5,13 @@ Model Ops Scheduler
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -51,6 +54,20 @@ HTTP_CONNECT_TIMEOUT_SEC = max(0.2, float(os.getenv("MODEL_OPS_CONNECT_TIMEOUT_S
 HTTP_READ_TIMEOUT_SEC = max(0.5, float(os.getenv("MODEL_OPS_READ_TIMEOUT_SEC", "12.0")))
 HTTP_MAX_RETRIES = max(0, int(os.getenv("MODEL_OPS_HTTP_MAX_RETRIES", "2")))
 HTTP_BACKOFF_SEC = max(0.0, float(os.getenv("MODEL_OPS_HTTP_BACKOFF_SEC", "0.6")))
+MULTIMODAL_GATE_ENABLE = os.getenv("MULTIMODAL_GATE_ENABLE", "1").lower() in {"1", "true", "yes", "y"}
+MULTIMODAL_GATE_REQUIRE_PASSED = os.getenv("MULTIMODAL_GATE_REQUIRE_PASSED", "1").lower() in {"1", "true", "yes", "y"}
+MULTIMODAL_GATE_MIN_READY_BACKBONES = int(os.getenv("MULTIMODAL_GATE_MIN_READY_BACKBONES", "0"))
+MULTIMODAL_GATE_REQUIRED_BACKBONES = [
+    s.strip().lower() for s in os.getenv("MULTIMODAL_GATE_REQUIRED_BACKBONES", "").split(",") if s.strip()
+]
+MULTIMODAL_GATE_MIN_TEXT_COVERAGE = float(os.getenv("MULTIMODAL_GATE_MIN_TEXT_COVERAGE", "0.0"))
+MULTIMODAL_GATE_MAX_DELTA_MSE_NO_TEXT = float(os.getenv("MULTIMODAL_GATE_MAX_DELTA_MSE_NO_TEXT", "1.0"))
+MULTIMODAL_GATE_MAX_DELTA_MSE_NO_MACRO = float(os.getenv("MULTIMODAL_GATE_MAX_DELTA_MSE_NO_MACRO", "1.0"))
+MULTIMODAL_GATE_STRICT_BLOCK = os.getenv("MULTIMODAL_GATE_STRICT_BLOCK", "0").lower() in {"1", "true", "yes", "y"}
+MULTIMODAL_GATE_SNAPSHOT = os.getenv(
+    "MULTIMODAL_GATE_SNAPSHOT",
+    str(Path(__file__).resolve().parents[1] / "artifacts" / "ops" / "multimodal_gate_state.json"),
+)
 
 
 def _http_session() -> requests.Session:
@@ -185,6 +202,9 @@ def _run_gate(track: str):
     except Exception as exc:
         logger.error("parity tick failed track=%s err=%s", track, exc)
 
+    if MULTIMODAL_GATE_ENABLE and track == "liquid":
+        _run_multimodal_gate(track)
+
     if not ROLLOUT_AUTO_ADVANCE:
         return
     try:
@@ -274,6 +294,76 @@ def _run_rollback(track: str):
         )
     except Exception as exc:
         logger.error("rollback tick failed track=%s err=%s", track, exc)
+
+
+def _run_multimodal_gate(track: str) -> None:
+    try:
+        status = _get("/api/v2/monitor/model-status")
+        latest_candidate = status.get("latest_candidate") if isinstance(status.get("latest_candidate"), dict) else {}
+        health = status.get("multimodal_health") if isinstance(status.get("multimodal_health"), dict) else {}
+        gate = latest_candidate.get("gate") if isinstance(latest_candidate.get("gate"), dict) else {}
+        ab = latest_candidate.get("ablation_summary") if isinstance(latest_candidate.get("ablation_summary"), dict) else {}
+        ready_backbones = [str(x).strip().lower() for x in list(health.get("ready_backbones") or []) if str(x).strip()]
+        ready_set = set(ready_backbones)
+        text_cov = float(health.get("text_coverage_ratio", 0.0) or 0.0)
+        gate_passed = bool(health.get("candidate_gate_passed", gate.get("passed", False)))
+
+        reasons: List[str] = []
+        if MULTIMODAL_GATE_REQUIRE_PASSED and (not gate_passed):
+            reasons.append("candidate_gate_not_passed")
+        if int(len(ready_backbones)) < int(MULTIMODAL_GATE_MIN_READY_BACKBONES):
+            reasons.append("ready_backbones_below_threshold")
+        missing = [b for b in MULTIMODAL_GATE_REQUIRED_BACKBONES if b not in ready_set]
+        if missing:
+            reasons.append("required_backbones_not_ready")
+        if float(text_cov) < float(MULTIMODAL_GATE_MIN_TEXT_COVERAGE):
+            reasons.append("text_coverage_below_threshold")
+
+        d_text = float(ab.get("delta_mse_no_text_vs_full", 0.0) or 0.0)
+        d_macro = float(ab.get("delta_mse_no_macro_vs_full", 0.0) or 0.0)
+        if d_text > float(MULTIMODAL_GATE_MAX_DELTA_MSE_NO_TEXT):
+            reasons.append("delta_mse_no_text_vs_full_above_threshold")
+        if d_macro > float(MULTIMODAL_GATE_MAX_DELTA_MSE_NO_MACRO):
+            reasons.append("delta_mse_no_macro_vs_full_above_threshold")
+
+        passed = len(reasons) == 0
+        payload = {
+            "evaluated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "track": track,
+            "passed": bool(passed),
+            "reasons": reasons,
+            "metrics": {
+                "candidate_gate_passed": bool(gate_passed),
+                "ready_backbones": ready_backbones,
+                "ready_backbone_count": int(len(ready_backbones)),
+                "text_coverage_ratio": float(text_cov),
+                "delta_mse_no_text_vs_full": float(d_text),
+                "delta_mse_no_macro_vs_full": float(d_macro),
+            },
+            "thresholds": {
+                "require_candidate_gate_passed": bool(MULTIMODAL_GATE_REQUIRE_PASSED),
+                "min_ready_backbones": int(MULTIMODAL_GATE_MIN_READY_BACKBONES),
+                "required_backbones": MULTIMODAL_GATE_REQUIRED_BACKBONES,
+                "min_text_coverage": float(MULTIMODAL_GATE_MIN_TEXT_COVERAGE),
+                "max_delta_mse_no_text_vs_full": float(MULTIMODAL_GATE_MAX_DELTA_MSE_NO_TEXT),
+                "max_delta_mse_no_macro_vs_full": float(MULTIMODAL_GATE_MAX_DELTA_MSE_NO_MACRO),
+            },
+            "strict_block": bool(MULTIMODAL_GATE_STRICT_BLOCK),
+        }
+        Path(MULTIMODAL_GATE_SNAPSHOT).parent.mkdir(parents=True, exist_ok=True)
+        Path(MULTIMODAL_GATE_SNAPSHOT).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("multimodal_gate track=%s passed=%s reasons=%s", track, passed, reasons)
+        _audit_log(
+            track=track,
+            action="multimodal_gate",
+            window={"mode": "latest_candidate"},
+            thresholds=payload["thresholds"],
+            decision={"passed": passed, "reasons": reasons, "strict_block": bool(MULTIMODAL_GATE_STRICT_BLOCK)},
+        )
+        if MULTIMODAL_GATE_STRICT_BLOCK and (not passed):
+            logger.error("multimodal_gate strict-block triggered track=%s reasons=%s", track, reasons)
+    except Exception as exc:
+        logger.error("multimodal gate tick failed track=%s err=%s", track, exc)
 
 
 def main():

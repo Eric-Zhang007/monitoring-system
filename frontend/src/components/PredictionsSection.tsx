@@ -1,35 +1,34 @@
-import { Brain, TrendingUp, TrendingDown } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Brain, TrendingDown, TrendingUp } from 'lucide-react';
 
-const MOCK_PREDICTIONS = {
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const LIVE_SYMBOLS = ['BTC', 'ETH', 'SOL'];
+const HORIZONS: Array<'1h' | '1d' | '7d'> = ['1h', '1d', '7d'];
+
+type PredictRow = {
+  horizon: '1h' | '1d' | '7d';
+  direction: 'up' | 'down' | 'neutral';
+  changePct: number;
+  confidence: number;
+  degraded: boolean;
+  degradedReasons: string[];
+};
+
+const MOCK_PREDICTIONS: Record<string, PredictRow[]> = {
   BTC: [
-    { horizon: '1h', direction: 'up', change: '+1.2%', confidence: 0.85, accuracy: 78 },
-    { horizon: '1d', direction: 'up', change: '+3.5%', confidence: 0.73, accuracy: 73 },
-    { horizon: '7d', direction: 'down', change: '-2.1%', confidence: 0.61, accuracy: 61 },
+    { horizon: '1h', direction: 'up', changePct: 1.2, confidence: 0.85, degraded: false, degradedReasons: [] },
+    { horizon: '1d', direction: 'up', changePct: 3.5, confidence: 0.73, degraded: false, degradedReasons: [] },
+    { horizon: '7d', direction: 'down', changePct: -2.1, confidence: 0.61, degraded: false, degradedReasons: [] },
   ],
   ETH: [
-    { horizon: '1h', direction: 'up', change: '+0.8%', confidence: 0.79, accuracy: 75 },
-    { horizon: '1d', direction: 'neutral', change: '+0.2%', confidence: 0.65, accuracy: 68 },
-    { horizon: '7d', direction: 'down', change: '-1.5%', confidence: 0.58, accuracy: 62 },
+    { horizon: '1h', direction: 'up', changePct: 0.8, confidence: 0.79, degraded: false, degradedReasons: [] },
+    { horizon: '1d', direction: 'neutral', changePct: 0.2, confidence: 0.65, degraded: false, degradedReasons: [] },
+    { horizon: '7d', direction: 'down', changePct: -1.5, confidence: 0.58, degraded: false, degradedReasons: [] },
   ],
-  AAPL: [
-    { horizon: '1h', direction: 'down', change: '-0.5%', confidence: 0.71, accuracy: 70 },
-    { horizon: '1d', direction: 'neutral', change: '+0.3%', confidence: 0.63, accuracy: 65 },
-    { horizon: '7d', direction: 'up', change: '+2.8%', confidence: 0.67, accuracy: 67 },
-  ],
-  TSLA: [
-    { horizon: '1h', direction: 'up', change: '+0.6%', confidence: 0.82, accuracy: 76 },
-    { horizon: '1d', direction: 'up', change: '+2.1%', confidence: 0.74, accuracy: 71 },
-    { horizon: '7d', direction: 'up', change: '+4.2%', confidence: 0.69, accuracy: 69 },
-  ],
-  NVDA: [
-    { horizon: '1h', direction: 'up', change: '+1.5%', confidence: 0.87, accuracy: 80 },
-    { horizon: '1d', direction: 'up', change: '+3.2%', confidence: 0.76, accuracy: 74 },
-    { horizon: '7d', direction: 'up', change: '+6.8%', confidence: 0.72, accuracy: 72 },
-  ],
-  GOOGL: [
-    { horizon: '1h', direction: 'neutral', change: '+0.1%', confidence: 0.62, accuracy: 64 },
-    { horizon: '1d', direction: 'neutral', change: '+0.4%', confidence: 0.58, accuracy: 61 },
-    { horizon: '7d', direction: 'down', change: '-1.2%', confidence: 0.55, accuracy: 59 },
+  SOL: [
+    { horizon: '1h', direction: 'up', changePct: 0.6, confidence: 0.82, degraded: false, degradedReasons: [] },
+    { horizon: '1d', direction: 'up', changePct: 2.1, confidence: 0.74, degraded: false, degradedReasons: [] },
+    { horizon: '7d', direction: 'up', changePct: 4.2, confidence: 0.69, degraded: false, degradedReasons: [] },
   ],
 };
 
@@ -37,21 +36,87 @@ interface PredictionsProps {
   symbol?: string;
 }
 
+function directionFromReturn(r: number): 'up' | 'down' | 'neutral' {
+  if (r > 0.0005) return 'up';
+  if (r < -0.0005) return 'down';
+  return 'neutral';
+}
+
+async function postJson(path: string, payload: Record<string, any>): Promise<any> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  if (!res.ok) {
+    throw new Error(`${path} -> ${res.status}`);
+  }
+  return body;
+}
+
 export default function PredictionsSection({ symbol = 'BTC' }: PredictionsProps) {
-  const predictions = MOCK_PREDICTIONS[symbol as keyof typeof MOCK_PREDICTIONS] || MOCK_PREDICTIONS.BTC;
+  const normalizedSymbol = useMemo(() => {
+    const s = String(symbol || 'BTC').toUpperCase();
+    return LIVE_SYMBOLS.includes(s) ? s : 'BTC';
+  }, [symbol]);
+
+  const [rows, setRows] = useState<PredictRow[]>(MOCK_PREDICTIONS.BTC);
+  const [mode, setMode] = useState<'live' | 'mock'>('mock');
+  const [loading, setLoading] = useState<boolean>(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    const run = async () => {
+      try {
+        const out = await Promise.all(
+          HORIZONS.map(async (h): Promise<PredictRow> => {
+            const body = await postJson('/api/v2/predict/liquid', { symbol: normalizedSymbol, horizon: h });
+            const expRet = Number(body?.expected_return ?? body?.outputs?.expected_return ?? 0);
+            const conf = Number(body?.signal_confidence ?? body?.outputs?.signal_confidence ?? 0);
+            return {
+              horizon: h,
+              direction: directionFromReturn(expRet),
+              changePct: expRet * 100,
+              confidence: Math.max(0, Math.min(1, conf)),
+              degraded: Boolean(body?.degraded || body?.outputs?.degraded),
+              degradedReasons: Array.isArray(body?.degraded_reasons) ? body.degraded_reasons : [],
+            };
+          })
+        );
+        if (cancelled) return;
+        setRows(out);
+        setMode('live');
+      } catch {
+        if (cancelled) return;
+        setRows(MOCK_PREDICTIONS[normalizedSymbol] || MOCK_PREDICTIONS.BTC);
+        setMode('mock');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    run();
+    const timer = setInterval(run, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [normalizedSymbol]);
 
   const getDirectionClass = (direction: string, scheme: 'cn' | 'us' = 'cn') => {
     if (direction === 'up') {
       return scheme === 'cn'
         ? 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'
         : 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300';
-    } else if (direction === 'down') {
+    }
+    if (direction === 'down') {
       return scheme === 'cn'
         ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'
         : 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300';
-    } else {
-      return 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-300';
     }
+    return 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-300';
   };
 
   const getConfidenceLevel = (confidence: number) => {
@@ -64,97 +129,76 @@ export default function PredictionsSection({ symbol = 'BTC' }: PredictionsProps)
     <div className="space-y-6">
       <div className="flex items-center space-x-2 mb-6">
         <Brain className="w-6 h-6 text-purple-600 dark:text-purple-400" />
-        <h2 className="text-2xl font-bold text-slate-900 dark:text-white">AI 预测分析 <span className="text-sm font-normal text-slate-500 dark:text-slate-400">| {symbol}</span></h2>
+        <h2 className="text-2xl font-bold text-slate-900 dark:text-white">
+          AI 预测分析 <span className="text-sm font-normal text-slate-500 dark:text-slate-400">| {normalizedSymbol}</span>
+        </h2>
+        <span
+          className={`text-xs px-2 py-1 rounded ${mode === 'live' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}
+        >
+          {loading ? 'updating' : mode}
+        </span>
       </div>
 
       <div className="bg-white dark:bg-slate-800 rounded-xl shadow-md p-6 border border-slate-200 dark:border-slate-700">
-        <h3 className="text-lg font-semibold text-slate-900 dark:text-white mb-4">
-          未来走势预测
-        </h3>
+        <h3 className="text-lg font-semibold text-slate-900 dark:text-white mb-4">未来走势预测</h3>
 
-        {/* Predictions List */}
         <div className="space-y-4">
-          {predictions.map((pred, index) => {
+          {rows.map((pred, index) => {
             const confidenceLevel = getConfidenceLevel(pred.confidence);
             return (
               <div
-                key={index}
+                key={`${pred.horizon}-${index}`}
                 className="bg-slate-50 dark:bg-slate-700/50 rounded-lg p-4 border border-slate-200 dark:border-slate-600"
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center space-x-4">
-                    {/* Horizon */}
                     <div className="w-16 text-center">
-                      <div className="text-2xl font-bold text-slate-900 dark:text-white">
-                        {pred.horizon}
-                      </div>
+                      <div className="text-2xl font-bold text-slate-900 dark:text-white">{pred.horizon}</div>
                     </div>
 
-                    {/* Direction & Change */}
-                    <div className={`
-                      px-3 py-1.5 rounded-lg flex items-center space-x-2
-                      ${getDirectionClass(pred.direction, 'cn')}
-                    `}>
+                    <div className={`px-3 py-1.5 rounded-lg flex items-center space-x-2 ${getDirectionClass(pred.direction, 'cn')}`}>
                       {pred.direction === 'up' && <TrendingUp className="w-4 h-4" />}
                       {pred.direction === 'down' && <TrendingDown className="w-4 h-4" />}
                       {pred.direction === 'neutral' && <span className="font-semibold">•</span>}
-                      <span className="font-semibold">{pred.change}</span>
+                      <span className="font-semibold">
+                        {pred.changePct >= 0 ? '+' : ''}
+                        {pred.changePct.toFixed(2)}%
+                      </span>
                     </div>
                   </div>
 
-                  {/* Confidence Bar */}
                   <div className="flex-1 max-w-xs mx-4">
                     <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-1">
                       <span>置信度</span>
                       <span>{(pred.confidence * 100).toFixed(0)}%</span>
                     </div>
                     <div className="h-2 bg-slate-200 dark:bg-slate-600 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full ${confidenceLevel.color} transition-all duration-300`}
-                        style={{ width: `${pred.confidence * 100}%` }}
-                      />
+                      <div className={`h-full ${confidenceLevel.color} transition-all duration-300`} style={{ width: `${pred.confidence * 100}%` }} />
                     </div>
                   </div>
 
-                  {/* Accuracy */}
-                  <div className="text-center min-w-16">
-                    <div className="text-sm font-medium text-green-600 dark:text-green-400">
-                      {pred.accuracy}%
-                    </div>
-                    <div className="text-xs text-slate-500 dark:text-slate-400">
-                      准确率
-                    </div>
+                  <div className="text-center min-w-20">
+                    <div className="text-sm font-medium text-slate-700 dark:text-slate-300">{confidenceLevel.text}</div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">置信等级</div>
                   </div>
                 </div>
+                {pred.degraded && pred.degradedReasons.length > 0 && (
+                  <div className="mt-2 text-xs text-rose-600 dark:text-rose-300">
+                    degraded: {pred.degradedReasons.join(', ')}
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
 
-        {/* Disclaimer */}
         <div className="mt-6 p-4 bg-amber-50 dark:bg-amber-900/20 rounded-lg border border-amber-200 dark:border-amber-800">
           <p className="text-sm text-amber-800 dark:text-amber-300">
-            ⚠️ 免责声明：本预测仅供参考，不构成投资建议。投资有风险，需谨慎。
+            免责声明：本预测仅供参考，不构成投资建议。投资有风险，需谨慎。
           </p>
-        </div>
-      </div>
-
-      {/* Feature Integration Note */}
-      <div className="bg-gradient-to-r from-purple-50 to-blue-50 dark:from-purple-900/20 dark:to-blue-900/20
-                       rounded-xl p-6 border border-purple-200 dark:border-purple-800">
-        <div className="flex items-start space-x-3">
-          <Brain className="w-6 h-6 text-purple-600 dark:text-purple-400 flex-shrink-0 mt-0.5" />
-          <div>
-            <h4 className="text-base font-semibold text-slate-900 dark:text-white mb-2">
-              NIM 特征提取
-            </h4>
-            <p className="text-sm text-slate-600 dark:text-slate-400">
-              使用 NVIDIA NIM API 进行新闻文本特征提取，结合 LSTM 模型进行价格预测。
-              特征向量维度：128 | 模型：LSTM (2层, 256 hidden)
-            </p>
-          </div>
         </div>
       </div>
     </div>
   );
 }
+

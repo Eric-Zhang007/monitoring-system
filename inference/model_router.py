@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-from torch import nn
+try:
+    import torch
+    from torch import nn
+    HAS_TORCH = True
+except Exception:
+    torch = None
+    nn = None
+    HAS_TORCH = False
 
 try:
     import lightgbm as lgb  # type: ignore
@@ -23,74 +29,86 @@ def _default_model_dir() -> str:
     local_models = Path(__file__).resolve().parents[1] / "backend" / "models"
     if local_models.exists():
         return str(local_models)
-    return "/app/models"
+    return "/opt/monitoring-system/models"
 
 
 MODEL_DIR = _default_model_dir()
 
 
-class TinyVCModel(nn.Module):
-    def __init__(self, in_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 32),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
-        )
+if HAS_TORCH:
+    class TinyVCModel(nn.Module):
+        def __init__(self, in_dim: int):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(32, 16),
+                nn.ReLU(),
+                nn.Linear(16, 1),
+            )
 
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-
-class MixerBlock(nn.Module):
-    def __init__(self, n_tokens: int, n_channels: int, hidden_dim: int = 64):
-        super().__init__()
-        self.token_mlp = nn.Sequential(
-            nn.Linear(n_tokens, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, n_tokens),
-        )
-        self.channel_mlp = nn.Sequential(
-            nn.Linear(n_channels, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, n_channels),
-        )
-        self.ln1 = nn.LayerNorm(n_channels)
-        self.ln2 = nn.LayerNorm(n_channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.ln1(x)
-        y = y.transpose(1, 2)
-        y = self.token_mlp(y)
-        y = y.transpose(1, 2)
-        x = x + y
-        z = self.ln2(x)
-        z = self.channel_mlp(z)
-        return x + z
+        def forward(self, x):
+            return self.net(x).squeeze(-1)
 
 
-class TSMixerLiquidModel(nn.Module):
-    def __init__(self, n_tokens: int, n_channels: int, n_blocks: int = 2):
-        super().__init__()
-        self.blocks = nn.ModuleList([MixerBlock(n_tokens=n_tokens, n_channels=n_channels) for _ in range(n_blocks)])
-        self.head = nn.Sequential(
-            nn.LayerNorm(n_channels),
-            nn.Flatten(),
-            nn.Linear(n_tokens * n_channels, 64),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 1),
-        )
+    class MixerBlock(nn.Module):
+        def __init__(self, n_tokens: int, n_channels: int, hidden_dim: int = 64):
+            super().__init__()
+            self.token_mlp = nn.Sequential(
+                nn.Linear(n_tokens, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, n_tokens),
+            )
+            self.channel_mlp = nn.Sequential(
+                nn.Linear(n_channels, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, n_channels),
+            )
+            self.ln1 = nn.LayerNorm(n_channels)
+            self.ln2 = nn.LayerNorm(n_channels)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for blk in self.blocks:
-            x = blk(x)
-        return self.head(x).squeeze(-1)
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            y = self.ln1(x)
+            y = y.transpose(1, 2)
+            y = self.token_mlp(y)
+            y = y.transpose(1, 2)
+            x = x + y
+            z = self.ln2(x)
+            z = self.channel_mlp(z)
+            return x + z
+
+
+    class TSMixerLiquidModel(nn.Module):
+        def __init__(self, n_tokens: int, n_channels: int, n_blocks: int = 2):
+            super().__init__()
+            self.blocks = nn.ModuleList([MixerBlock(n_tokens=n_tokens, n_channels=n_channels) for _ in range(n_blocks)])
+            self.head = nn.Sequential(
+                nn.LayerNorm(n_channels),
+                nn.Flatten(),
+                nn.Linear(n_tokens * n_channels, 64),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(64, 1),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            for blk in self.blocks:
+                x = blk(x)
+            return self.head(x).squeeze(-1)
+else:
+    class TinyVCModel:  # type: ignore[no-redef]
+        pass
+
+
+    class MixerBlock:  # type: ignore[no-redef]
+        pass
+
+
+    class TSMixerLiquidModel:  # type: ignore[no-redef]
+        pass
 
 
 class ModelRouter:
@@ -98,15 +116,15 @@ class ModelRouter:
         self.cache: Dict[str, Dict] = {}
         self.torch_cache: Dict[str, Dict[str, Any]] = {}
         self.tabular_cache: Dict[str, Dict[str, Any]] = {}
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.expected_feature_schema = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "v2.3")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if HAS_TORCH else "cpu"
+        self.expected_feature_schema = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "main")
         self.compatible_feature_schemas = self._resolve_compatible_schemas(self.expected_feature_schema)
         self.expected_data_version = os.getenv("DATA_VERSION", "v1")
 
     @staticmethod
     def _resolve_compatible_schemas(expected: str) -> set[str]:
-        cur = str(expected or "").strip() or "v2.3"
-        out = {cur, "v2.2"}
+        cur = str(expected or "").strip() or "main"
+        out = {cur, "main", "v2.3", "v2.2", "legacy"}
         return {x for x in out if x}
 
     @staticmethod
@@ -132,21 +150,46 @@ class ModelRouter:
         return (features - x_mean) / x_std
 
     @staticmethod
-    def _to_sequence(features: np.ndarray) -> np.ndarray:
+    def _to_sequence(features: np.ndarray, n_tokens: int | None = None, n_channels: int | None = None) -> np.ndarray:
         x = np.array(features, dtype=np.float32).reshape(-1)
-        if x.shape[0] < 15:
-            return x[None, None, :]
-        seq = np.stack(
-            [
-                np.stack([x[0], x[4], x[10]], axis=0),
-                np.stack([x[1], x[5], x[9]], axis=0),
-                np.stack([x[2], x[6], x[11]], axis=0),
-                np.stack([x[3], x[7], x[12]], axis=0),
-                np.stack([x[13], x[14], x[8]], axis=0),
-            ],
-            axis=0,
-        )
-        return seq[None, :, :].astype(np.float32)
+        if n_tokens is not None and n_channels is not None:
+            tok = max(1, int(n_tokens))
+            ch = max(1, int(n_channels))
+        else:
+            ch = max(1, int(os.getenv("LIQUID_SEQUENCE_CHANNELS", "5")))
+            tok = int(max(1, int(np.ceil(float(x.shape[0]) / float(ch)))))
+        target_dim = tok * ch
+        if x.shape[0] < target_dim:
+            pad = np.zeros((target_dim - x.shape[0],), dtype=np.float32)
+            x = np.concatenate([x, pad], axis=0)
+        elif x.shape[0] > target_dim:
+            x = x[:target_dim]
+        return x.reshape(1, tok, ch).astype(np.float32)
+
+    @staticmethod
+    def _sigmoid_scalar(x: float) -> float:
+        z = float(np.clip(float(x), -40.0, 40.0))
+        return float(1.0 / (1.0 + np.exp(-z)))
+
+    @staticmethod
+    def _sanitize_indices(indices: object, feature_dim: int) -> np.ndarray:
+        if isinstance(indices, np.ndarray):
+            raw = indices.reshape(-1).tolist()
+        elif isinstance(indices, list):
+            raw = indices
+        else:
+            return np.zeros((0,), dtype=np.int64)
+        out: List[int] = []
+        for idx in raw:
+            try:
+                iv = int(idx)
+            except Exception:
+                continue
+            if 0 <= iv < int(feature_dim):
+                out.append(iv)
+        if not out:
+            return np.zeros((0,), dtype=np.int64)
+        return np.array(sorted(set(out)), dtype=np.int64)
 
     def _load_json_model(self, name: str) -> Dict:
         if name in self.cache:
@@ -160,6 +203,8 @@ class ModelRouter:
         return model
 
     def _load_torch_model(self, path: str, model_type: str, in_dim: int):
+        if not HAS_TORCH:
+            return None
         key = f"{path}:{model_type}"
         if key in self.torch_cache:
             return self.torch_cache[key]
@@ -237,6 +282,10 @@ class ModelRouter:
             "x_std": np.array(model.get("x_std", []), dtype=np.float32),
             "feature_dim": int(model.get("feature_dim", 15) or 15),
         }
+        fusion_mode = str(model.get("fusion_mode") or "single_ridge").strip().lower()
+        if fusion_mode not in {"single_ridge", "residual_gate"}:
+            fusion_mode = "single_ridge"
+        loaded["fusion_mode"] = fusion_mode
         if model.get("model") == "lightgbm" and HAS_LGB and isinstance(model.get("booster_model"), str):
             try:
                 booster = lgb.Booster(model_str=str(model["booster_model"]))
@@ -245,14 +294,30 @@ class ModelRouter:
                 pass
         if isinstance(model.get("weights"), list):
             loaded["weights"] = np.array(model.get("weights", []), dtype=np.float32)
+        if fusion_mode == "residual_gate":
+            if isinstance(model.get("base_feature_indices"), list):
+                loaded["base_feature_indices"] = np.array(model.get("base_feature_indices", []), dtype=np.int64)
+            if isinstance(model.get("text_feature_indices"), list):
+                loaded["text_feature_indices"] = np.array(model.get("text_feature_indices", []), dtype=np.int64)
+            if isinstance(model.get("base_weights"), list):
+                loaded["base_weights"] = np.array(model.get("base_weights", []), dtype=np.float32)
+            if isinstance(model.get("text_weights"), list):
+                loaded["text_weights"] = np.array(model.get("text_weights", []), dtype=np.float32)
+            loaded["gate_mu"] = float(model.get("gate_mu", 0.0) or 0.0)
+            loaded["gate_sigma"] = float(model.get("gate_sigma", 0.0) or 0.0)
+            loaded["gate_multiplier"] = float(model.get("gate_multiplier", 1.0) or 1.0)
 
         self.tabular_cache[key] = loaded
         return loaded
 
     def _predict_liquid_tabular(self, symbol: str, features: np.ndarray) -> float:
+        pred, _ = self._predict_liquid_tabular_with_meta(symbol, features)
+        return float(pred)
+
+    def _predict_liquid_tabular_with_meta(self, symbol: str, features: np.ndarray) -> Tuple[float, Dict[str, float | str]]:
         bundle = self._load_liquid_tabular_model(symbol)
         if not bundle:
-            return 0.0
+            return 0.0, {"mode": "missing"}
 
         feature_dim = int(bundle.get("feature_dim", features.shape[0]))
         aligned = self._align_features(features, feature_dim)
@@ -263,17 +328,55 @@ class ModelRouter:
             x_std = np.clip(self._align_features(x_std, feature_dim), 1e-6, None)
             aligned = (aligned - x_mean) / x_std
 
+        fusion_mode = str(bundle.get("fusion_mode") or "single_ridge").strip().lower()
+        if fusion_mode == "residual_gate":
+            base_indices = self._sanitize_indices(bundle.get("base_feature_indices"), feature_dim)
+            text_indices = self._sanitize_indices(bundle.get("text_feature_indices"), feature_dim)
+            if base_indices.size == 0:
+                base_indices = np.arange(feature_dim, dtype=np.int64)
+            base_slice = aligned[base_indices]
+            base_weights = bundle.get("base_weights")
+            if isinstance(base_weights, np.ndarray) and base_weights.size > 0:
+                ww_base = self._align_features(base_weights, base_slice.shape[0])
+                base_pred = float(base_slice @ ww_base)
+            else:
+                base_pred = 0.0
+
+            text_slice = aligned[text_indices] if text_indices.size > 0 else np.zeros((0,), dtype=np.float32)
+            text_weights = bundle.get("text_weights")
+            if isinstance(text_weights, np.ndarray) and text_weights.size > 0 and text_slice.size > 0:
+                ww_text = self._align_features(text_weights, text_slice.shape[0])
+                delta_pred = float(text_slice @ ww_text)
+                text_activity = float(np.mean(np.abs(text_slice)))
+                gate_mu = float(bundle.get("gate_mu", 0.0) or 0.0)
+                gate_sigma = max(float(bundle.get("gate_sigma", 0.0) or 0.0), 1e-6)
+                gate = self._sigmoid_scalar((text_activity - gate_mu) / gate_sigma)
+            else:
+                delta_pred = 0.0
+                text_activity = 0.0
+                gate = 0.0
+            gate_multiplier = float(np.clip(float(bundle.get("gate_multiplier", 1.0) or 1.0), 0.0, 2.0))
+            pred = float(base_pred + gate_multiplier * gate * delta_pred)
+            return pred, {
+                "mode": "residual_gate",
+                "base": float(base_pred),
+                "delta": float(delta_pred),
+                "gate": float(gate),
+                "gate_multiplier": float(gate_multiplier),
+                "text_activity": float(text_activity),
+            }
+
         booster = bundle.get("booster")
         if booster is not None:
             pred = booster.predict(aligned.reshape(1, -1))
-            return float(np.array(pred, dtype=np.float32).reshape(-1)[0])
+            return float(np.array(pred, dtype=np.float32).reshape(-1)[0]), {"mode": "lightgbm"}
 
         weights = bundle.get("weights")
         if isinstance(weights, np.ndarray) and weights.size > 0:
             ww = self._align_features(weights, feature_dim)
-            return float(aligned @ ww)
+            return float(aligned @ ww), {"mode": "single_ridge"}
 
-        return 0.0
+        return 0.0, {"mode": "single_ridge"}
 
     def predict_vc(self, features: np.ndarray, model_name: str = "vc_survival_baseline") -> Dict:
         if model_name in {"vc_survival_ttm", "vc_survival_model"}:
@@ -313,7 +416,7 @@ class ModelRouter:
 
     def predict_liquid(self, symbol: str, features: np.ndarray, model_name: str = "liquid_baseline") -> Dict:
         expected_return_nn = 0.0
-        expected_return_tabular = self._predict_liquid_tabular(symbol, features)
+        expected_return_tabular, tab_meta = self._predict_liquid_tabular_with_meta(symbol, features)
         ensemble_alpha = 0.0
 
         if model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
@@ -323,7 +426,11 @@ class ModelRouter:
                 with torch.no_grad():
                     fx = np.array(features, dtype=np.float32).reshape(-1)
                     fx = self._normalize_features(fx, pt_bundle.get("normalization"))
-                    seq = self._to_sequence(fx)
+                    seq = self._to_sequence(
+                        fx,
+                        n_tokens=int(pt_bundle.get("n_tokens", 1) or 1),
+                        n_channels=int(pt_bundle.get("n_channels", 1) or 1),
+                    )
                     xt = torch.tensor(seq, dtype=torch.float32, device=self.device)
                     expected_return_nn = float(pt_bundle["model"](xt).item())
                     ensemble_alpha = float(pt_bundle.get("ensemble_alpha", 0.7) or 0.7)
@@ -352,5 +459,10 @@ class ModelRouter:
                 "nn": float(expected_return_nn),
                 "tabular": float(expected_return_tabular),
                 "alpha": float(ensemble_alpha),
+                "tabular_mode": str(tab_meta.get("mode") or "single_ridge"),
+                "tabular_base": float(tab_meta.get("base") or 0.0),
+                "tabular_delta": float(tab_meta.get("delta") or 0.0),
+                "tabular_gate": float(tab_meta.get("gate") or 0.0),
+                "tabular_gate_multiplier": float(tab_meta.get("gate_multiplier") or 0.0),
             },
         }

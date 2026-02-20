@@ -5,32 +5,11 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
 from _metrics_test_logger import record_metrics_test
-
-
-def _run_psql(sql: str) -> str:
-    cmd = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        "monitor",
-        "-d",
-        "monitor",
-        "-At",
-        "-F",
-        "|",
-        "-c",
-        sql,
-    ]
-    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+from _psql import run_psql
 
 
 def _parse_sources(raw: str) -> list[str]:
@@ -110,7 +89,7 @@ def _bt_target_map(
         + target_cond + " "
         "AND superseded_by_run_id IS NULL;"
     )
-    rows = [r for r in _run_psql(sql).splitlines() if r.strip()]
+    rows = [r for r in run_psql(sql).splitlines() if r.strip()]
     out: dict[str, dict[str, float]] = {}
     for row in rows:
         parts = row.split("|", 1)
@@ -155,7 +134,7 @@ def _paper_target_map(track: str, hours: int, targets_filter: list[str]) -> dict
         + target_cond +
         "AND status IN ('filled','partially_filled');"
     )
-    rows = [r for r in _run_psql(sql).splitlines() if r.strip()]
+    rows = [r for r in run_psql(sql).splitlines() if r.strip()]
     out: dict[str, dict[str, float]] = {}
     for row in rows:
         parts = row.split("|")
@@ -239,7 +218,7 @@ def main() -> int:
         "AND superseded_by_run_id IS NULL "
         "AND created_at > NOW() - make_interval(days => 30);"
     )
-    raw = _run_psql(sql)
+    raw = run_psql(sql)
     completed_runs = int(float(raw or 0)) if raw else 0
 
     if completed_runs < args.min_completed_runs:

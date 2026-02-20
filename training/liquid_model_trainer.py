@@ -4,7 +4,8 @@ import json
 import os
 import random
 import hashlib
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
@@ -18,8 +19,15 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from feature_pipeline import FeaturePipeline, LIQUID_FEATURE_SCHEMA_VERSION
-from validation import evaluate_regression_oos, purged_kfold_slices, summarize_fold_metrics, walk_forward_slices
+from feature_pipeline import FeaturePipeline, LIQUID_FEATURE_KEYS, LIQUID_FEATURE_SCHEMA_VERSION
+from validation import (
+    evaluate_regression_oos,
+    purged_kfold_slices,
+    resolve_validation_protocol,
+    summarize_fold_metrics,
+    validation_protocol_to_dict,
+    walk_forward_slices,
+)
 
 try:
     import lightgbm as lgb  # type: ignore
@@ -37,7 +45,7 @@ def _default_model_dir() -> str:
     repo_models = Path(__file__).resolve().parents[1] / "backend" / "models"
     if repo_models.exists():
         return str(repo_models)
-    return "/app/models"
+    return "/opt/monitoring-system/models"
 
 
 MODEL_DIR = _default_model_dir()
@@ -48,12 +56,7 @@ SEED = int(os.getenv("TRAIN_SEED", "42"))
 VAL_RATIO = float(os.getenv("LIQUID_VAL_RATIO", "0.2"))
 PATIENCE = int(os.getenv("LIQUID_EARLY_STOP_PATIENCE", "3"))
 GRAD_CLIP = float(os.getenv("TRAIN_GRAD_CLIP", "1.0"))
-WF_TRAIN_WINDOW = int(os.getenv("LIQUID_WF_TRAIN_WINDOW", "512"))
-WF_TEST_WINDOW = int(os.getenv("LIQUID_WF_TEST_WINDOW", "96"))
-WF_PURGE_WINDOW = int(os.getenv("LIQUID_WF_PURGE_WINDOW", "12"))
-WF_MIN_FOLDS = int(os.getenv("LIQUID_WF_MIN_FOLDS", "3"))
-PKF_SPLITS = int(os.getenv("LIQUID_PURGED_KFOLD_SPLITS", "5"))
-PKF_PURGE_WINDOW = int(os.getenv("LIQUID_PURGED_KFOLD_PURGE", "12"))
+VALIDATION_PROTOCOL = resolve_validation_protocol(prefix="LIQUID")
 FEATURE_VERSION = os.getenv("FEATURE_VERSION", "feature-store-v2.1")
 DATA_VERSION = os.getenv("DATA_VERSION", "v1")
 TRAIN_NUM_WORKERS = int(os.getenv("TRAIN_NUM_WORKERS", "4"))
@@ -63,6 +66,25 @@ LIQUID_SYMBOL_DDP = os.getenv("LIQUID_SYMBOL_DDP", "1").lower() in {"1", "true",
 TRAIN_DQ_GATE_MODE = str(os.getenv("TRAIN_DQ_GATE_MODE", "soft")).strip().lower()
 LIQUID_DQ_GATE_MODE = str(os.getenv("LIQUID_DQ_GATE_MODE", TRAIN_DQ_GATE_MODE)).strip().lower()
 LIQUID_DQ_HARD_BLOCK = os.getenv("LIQUID_DQ_HARD_BLOCK", "").strip().lower() in {"1", "true", "yes", "y"}
+LIQUID_TEXT_DROPOUT_PROB = float(os.getenv("LIQUID_TEXT_DROPOUT_PROB", os.getenv("MULTIMODAL_TEXT_DROPOUT_PROB", "0.1")))
+
+
+def _safe_env_int(name: str, default: int) -> int:
+    raw = str(os.getenv(name, str(default))).strip()
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+LIQUID_TRAIN_LIMIT = _safe_env_int("LIQUID_TRAIN_LIMIT", 4000)
+LIQUID_TRAIN_MAX_SAMPLES = _safe_env_int("LIQUID_TRAIN_MAX_SAMPLES", 0)
+LIQUID_TRAIN_SAMPLE_MODE = str(os.getenv("LIQUID_TRAIN_SAMPLE_MODE", "uniform")).strip().lower() or "uniform"
+LIQUID_TRAIN_START = str(os.getenv("LIQUID_TRAIN_START", "")).strip()
+LIQUID_TRAIN_END = str(os.getenv("LIQUID_TRAIN_END", "")).strip()
+LIQUID_DATA_MODE = str(os.getenv("LIQUID_DATA_MODE", "production")).strip().lower() or "production"
+LIQUID_RESEARCH_MAX_MISSING_FLAGS = _safe_env_int("LIQUID_RESEARCH_MAX_MISSING_FLAGS", 2)
+LIQUID_RESEARCH_MAX_SAMPLES = _safe_env_int("LIQUID_RESEARCH_MAX_SAMPLES", 50000)
 
 
 class MixerBlock(nn.Module):
@@ -124,6 +146,12 @@ class LiquidModelTrainer:
         rank: int = 0,
         world_size: int = 1,
         local_rank: int = 0,
+        train_start: str | datetime | None = None,
+        train_end: str | datetime | None = None,
+        train_limit: int | None = None,
+        train_max_samples: int | None = None,
+        train_sample_mode: str | None = None,
+        train_data_mode: str | None = None,
     ):
         self.pipeline = pipeline
         self.symbols = symbols
@@ -131,6 +159,12 @@ class LiquidModelTrainer:
         self.rank = int(rank)
         self.world_size = max(1, int(world_size))
         self.local_rank = int(local_rank)
+        self.train_start = self._parse_optional_utc(train_start if train_start is not None else LIQUID_TRAIN_START)
+        self.train_end = self._parse_optional_utc(train_end if train_end is not None else LIQUID_TRAIN_END)
+        self.train_limit = max(0, int(LIQUID_TRAIN_LIMIT if train_limit is None else train_limit))
+        self.train_max_samples = max(0, int(LIQUID_TRAIN_MAX_SAMPLES if train_max_samples is None else train_max_samples))
+        self.train_sample_mode = str(train_sample_mode if train_sample_mode is not None else LIQUID_TRAIN_SAMPLE_MODE).strip().lower() or "uniform"
+        self.train_data_mode = str(train_data_mode if train_data_mode is not None else LIQUID_DATA_MODE).strip().lower() or "production"
         os.makedirs(MODEL_DIR, exist_ok=True)
 
     def _connect(self):
@@ -145,6 +179,27 @@ class LiquidModelTrainer:
             torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+    @staticmethod
+    def _parse_optional_utc(raw: str | datetime | None) -> datetime | None:
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            dt = raw
+        else:
+            text = str(raw or "").strip()
+            if not text:
+                return None
+            text = text.replace(" ", "T")
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(text)
+            except Exception:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def _resolve_device(self) -> torch.device:
         if not torch.cuda.is_available():
@@ -204,20 +259,120 @@ class LiquidModelTrainer:
         return np.linalg.pinv(x_train.T @ x_train + reg) @ x_train.T @ y_train
 
     @staticmethod
-    def _to_sequence(xn: np.ndarray) -> np.ndarray:
-        if xn.shape[1] < 15:
-            return xn[:, None, :]
-        seq = np.stack(
-            [
-                np.stack([xn[:, 0], xn[:, 4], xn[:, 10]], axis=1),
-                np.stack([xn[:, 1], xn[:, 5], xn[:, 9]], axis=1),
-                np.stack([xn[:, 2], xn[:, 6], xn[:, 11]], axis=1),
-                np.stack([xn[:, 3], xn[:, 7], xn[:, 12]], axis=1),
-                np.stack([xn[:, 13], xn[:, 14], xn[:, 8]], axis=1),
-            ],
-            axis=1,
+    def _infer_text_feature_indices(keys: List[str]) -> List[int]:
+        out: List[int] = []
+        for idx, key in enumerate(keys):
+            k = str(key or "").strip().lower()
+            if not k:
+                continue
+            if k.startswith("social_") or k.startswith("event_") or k.startswith("source_") or k.startswith("sentiment_"):
+                out.append(idx)
+                continue
+            if k in {"comment_skew", "cross_source_consensus", "novelty_confidence_blend"}:
+                out.append(idx)
+                continue
+            m = re.fullmatch(r"latent_(\d+)", k)
+            if m:
+                latent_id = int(m.group(1))
+                if latent_id >= 64:
+                    out.append(idx)
+        return sorted(set(out))
+
+    @staticmethod
+    def _apply_feature_dropout(
+        X: np.ndarray,
+        indices: List[int],
+        prob: float,
+        seed: int,
+    ) -> np.ndarray:
+        if X.size == 0 or not indices:
+            return X
+        p = max(0.0, min(0.95, float(prob)))
+        if p <= 1e-9:
+            return X
+        out = X.copy()
+        rng = np.random.default_rng(int(seed))
+        mask = rng.random((out.shape[0], len(indices))) < p
+        selected = out[:, indices]
+        selected[mask] = 0.0
+        out[:, indices] = selected
+        return out
+
+    @staticmethod
+    def _apply_index_mask(batch: "SampleBatch", idx: np.ndarray) -> "SampleBatch":
+        index = np.array(idx, dtype=np.int64)
+        extra = batch.extra_labels or {}
+        filtered_extra = {
+            k: np.asarray(v)[index]
+            for k, v in extra.items()
+        }
+        meta = list(batch.meta or [])
+        filtered_meta = [meta[i] for i in index.tolist()] if meta else []
+        return type(batch)(
+            X=np.asarray(batch.X)[index],
+            y=np.asarray(batch.y)[index],
+            meta=filtered_meta,
+            extra_labels=filtered_extra,
+            sampling=dict(batch.sampling or {}),
         )
-        return seq.astype(np.float32)
+
+    def _apply_research_mode_guardrails(self, batch: "SampleBatch") -> tuple["SampleBatch", Dict[str, object]]:
+        if str(self.train_data_mode) != "research":
+            return batch, {"enabled": False}
+        n_rows = int(batch.X.shape[0]) if hasattr(batch, "X") else 0
+        if n_rows <= 0:
+            return batch, {"enabled": True, "rows_before": 0, "rows_after": 0}
+
+        missing_idx = [
+            i for i, key in enumerate(LIQUID_FEATURE_KEYS)
+            if str(key).endswith("_missing_flag")
+        ]
+        keep = np.ones((n_rows,), dtype=bool)
+        max_missing_allowed = max(0, int(LIQUID_RESEARCH_MAX_MISSING_FLAGS))
+        if missing_idx:
+            miss = np.asarray(batch.X[:, missing_idx], dtype=np.float64)
+            miss_cnt = np.sum(miss > 0.5, axis=1)
+            keep = miss_cnt <= max_missing_allowed
+        kept_idx = np.where(keep)[0].astype(np.int64)
+        guarded = self._apply_index_mask(batch, kept_idx)
+
+        rows_after_missing = int(guarded.X.shape[0])
+        cap = int(self.train_max_samples) if int(self.train_max_samples) > 0 else int(LIQUID_RESEARCH_MAX_SAMPLES)
+        downsampled = False
+        if cap > 0 and rows_after_missing > cap:
+            ds_idx = np.linspace(0, rows_after_missing - 1, cap).astype(np.int64)
+            guarded = self._apply_index_mask(guarded, ds_idx)
+            downsampled = True
+        guard = {
+            "enabled": True,
+            "rows_before": n_rows,
+            "rows_after_missing_filter": rows_after_missing,
+            "rows_after": int(guarded.X.shape[0]),
+            "missing_flag_count": int(len(missing_idx)),
+            "max_missing_flags_allowed": int(max_missing_allowed),
+            "downsampled": bool(downsampled),
+            "target_cap": int(cap),
+        }
+        sampling = dict(guarded.sampling or {})
+        sampling["data_mode"] = "research"
+        sampling["research_guardrails"] = guard
+        guarded.sampling = sampling
+        return guarded, guard
+
+    @staticmethod
+    def _to_sequence(xn: np.ndarray, n_channels: int = 5) -> np.ndarray:
+        if xn.ndim != 2:
+            raise ValueError("expected 2D feature matrix")
+        n, d = xn.shape
+        ch = max(1, int(n_channels))
+        tok = int(max(1, int(np.ceil(float(d) / float(ch)))))
+        target_dim = tok * ch
+        if target_dim > d:
+            pad = np.zeros((n, target_dim - d), dtype=np.float32)
+            xpad = np.concatenate([xn.astype(np.float32), pad], axis=1)
+        else:
+            xpad = xn[:, :target_dim].astype(np.float32)
+        return xpad.reshape(n, tok, ch)
 
     def _fit_lightgbm(self, x_train: np.ndarray, y_train: np.ndarray, x_pred: np.ndarray) -> tuple[np.ndarray, str, Dict]:
         ridge_w = self._ridge_weights(x_train, y_train)
@@ -312,9 +467,28 @@ class LiquidModelTrainer:
                 "dq_failed_reasons": dq_failed_reasons,
             }
 
-        batch = self.pipeline.load_liquid_training_batch(symbol=symbol, limit=4000, timeframe=selected_tf)
+        batch = self.pipeline.load_liquid_training_batch(
+            symbol=symbol,
+            limit=self.train_limit,
+            timeframe=selected_tf,
+            start=self.train_start,
+            end=self.train_end,
+            max_samples=self.train_max_samples,
+            sample_mode=self.train_sample_mode,
+        )
+        batch, research_guard = self._apply_research_mode_guardrails(batch)
         if batch.X.shape[0] == 0:
-            return {"symbol": symbol, "status": "no_data", "timeframe": selected_tf, "data_quality": dq}
+            return {
+                "symbol": symbol,
+                "status": "no_data",
+                "timeframe": selected_tf,
+                "data_quality": dq,
+                "sampling_strategy": {
+                    **(batch.sampling or {}),
+                    "data_mode": str(self.train_data_mode),
+                    "research_guardrails": research_guard,
+                },
+            }
 
         X, y = batch.X, batch.y
         train_lineage_id = f"train-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{symbol.lower()}"
@@ -326,6 +500,10 @@ class LiquidModelTrainer:
             for r in X
         ]
         if (not self._ddp_enabled()) or self._is_primary():
+            row_times = []
+            for m in (batch.meta or []):
+                if isinstance(m, dict) and isinstance(m.get("as_of_ts"), datetime):
+                    row_times.append(m["as_of_ts"])
             self.pipeline.save_feature_snapshots_bulk(
                 target=symbol.upper(),
                 track="liquid",
@@ -333,6 +511,7 @@ class LiquidModelTrainer:
                 version=FEATURE_VERSION,
                 lineage_id=train_lineage_id,
                 data_version=DATA_VERSION,
+                row_times=row_times,
             )
         label_1h = batch.extra_labels.get("fwd_ret_1h", y) if batch.extra_labels else y
         label_4h = batch.extra_labels.get("fwd_ret_4h", y) if batch.extra_labels else y
@@ -346,22 +525,41 @@ class LiquidModelTrainer:
         x_mean = np.mean(X[train_idx], axis=0, keepdims=True)
         x_std = np.clip(np.std(X[train_idx], axis=0, keepdims=True), 1e-6, None)
         Xn = (X - x_mean) / x_std
+        text_feature_indices = self._infer_text_feature_indices(LIQUID_FEATURE_KEYS)
+        Xn_train_drop = self._apply_feature_dropout(
+            Xn[train_idx],
+            indices=text_feature_indices,
+            prob=LIQUID_TEXT_DROPOUT_PROB,
+            seed=SEED + self.rank,
+        )
+        Xn_seq = Xn.copy()
+        Xn_seq[train_idx] = Xn_train_drop
 
         y_train = y[train_idx]
         y_val = y[val_idx]
-        lgb_all_pred, lgb_model_name, lgb_model_payload = self._fit_lightgbm(Xn[train_idx], y_train, Xn)
+        lgb_all_pred, lgb_model_name, lgb_model_payload = self._fit_lightgbm(Xn_train_drop, y_train, Xn)
         lgb_mse = float(np.mean((lgb_all_pred[val_idx] - y_val) ** 2))
         wf_folds = walk_forward_slices(
             n_samples=n,
-            train_window=WF_TRAIN_WINDOW,
-            test_window=WF_TEST_WINDOW,
-            purge_window=WF_PURGE_WINDOW,
+            train_window=VALIDATION_PROTOCOL.wf_train_window,
+            test_window=VALIDATION_PROTOCOL.wf_test_window,
+            purge_window=VALIDATION_PROTOCOL.wf_purge_window,
+            step_window=VALIDATION_PROTOCOL.wf_step_window,
         )
         wf_fold_metrics: List[Dict[str, float]] = []
         for fold_train_idx, fold_test_idx in wf_folds:
-            if fold_train_idx.size < 64 or fold_test_idx.size < 16:
+            if (
+                fold_train_idx.size < VALIDATION_PROTOCOL.min_train_points
+                or fold_test_idx.size < VALIDATION_PROTOCOL.min_test_points
+            ):
                 continue
-            fold_pred, _, _ = self._fit_lightgbm(Xn[fold_train_idx], y[fold_train_idx], Xn[fold_test_idx])
+            fold_x_train = self._apply_feature_dropout(
+                Xn[fold_train_idx],
+                indices=text_feature_indices,
+                prob=LIQUID_TEXT_DROPOUT_PROB,
+                seed=SEED + self.rank + int(fold_train_idx[0]) if fold_train_idx.size > 0 else SEED + self.rank,
+            )
+            fold_pred, _, _ = self._fit_lightgbm(fold_x_train, y[fold_train_idx], Xn[fold_test_idx])
             wf_fold_metrics.append(
                 evaluate_regression_oos(
                     y_true=y[fold_test_idx],
@@ -371,13 +569,26 @@ class LiquidModelTrainer:
                 )
             )
         wf_metrics = summarize_fold_metrics(wf_fold_metrics)
-        wf_ready = int(wf_metrics["folds"]) >= WF_MIN_FOLDS
-        pkf_folds = purged_kfold_slices(n_samples=n, n_splits=PKF_SPLITS, purge_window=PKF_PURGE_WINDOW)
+        wf_ready = int(wf_metrics["folds"]) >= VALIDATION_PROTOCOL.wf_min_folds
+        pkf_folds = purged_kfold_slices(
+            n_samples=n,
+            n_splits=VALIDATION_PROTOCOL.pkf_splits,
+            purge_window=VALIDATION_PROTOCOL.pkf_purge_window,
+        )
         pkf_metrics_per_fold: List[Dict[str, float]] = []
         for fold_train_idx, fold_test_idx in pkf_folds:
-            if fold_train_idx.size < 64 or fold_test_idx.size < 16:
+            if (
+                fold_train_idx.size < VALIDATION_PROTOCOL.min_train_points
+                or fold_test_idx.size < VALIDATION_PROTOCOL.min_test_points
+            ):
                 continue
-            fold_pred, _, _ = self._fit_lightgbm(Xn[fold_train_idx], y[fold_train_idx], Xn[fold_test_idx])
+            fold_x_train = self._apply_feature_dropout(
+                Xn[fold_train_idx],
+                indices=text_feature_indices,
+                prob=LIQUID_TEXT_DROPOUT_PROB,
+                seed=SEED + self.rank + int(fold_train_idx[0]) if fold_train_idx.size > 0 else SEED + self.rank,
+            )
+            fold_pred, _, _ = self._fit_lightgbm(fold_x_train, y[fold_train_idx], Xn[fold_test_idx])
             pkf_metrics_per_fold.append(
                 evaluate_regression_oos(
                     y_true=y[fold_test_idx],
@@ -390,7 +601,8 @@ class LiquidModelTrainer:
         teacher = lgb_all_pred.copy()
         teacher_name = lgb_model_name
 
-        seq = self._to_sequence(Xn)
+        seq_channels = int(os.getenv("LIQUID_SEQUENCE_CHANNELS", "5"))
+        seq = self._to_sequence(Xn_seq, n_channels=seq_channels)
         n_tokens = int(seq.shape[1])
         n_channels = int(seq.shape[2])
         device = self._resolve_device()
@@ -633,10 +845,18 @@ class LiquidModelTrainer:
             "grad_clip": GRAD_CLIP,
             "val_ratio": VAL_RATIO,
             "early_stop_patience": PATIENCE,
-            "wf_train_window": WF_TRAIN_WINDOW,
-            "wf_test_window": WF_TEST_WINDOW,
-            "wf_purge_window": WF_PURGE_WINDOW,
-            "wf_min_folds": WF_MIN_FOLDS,
+            "wf_train_window": VALIDATION_PROTOCOL.wf_train_window,
+            "wf_test_window": VALIDATION_PROTOCOL.wf_test_window,
+            "wf_purge_window": VALIDATION_PROTOCOL.wf_purge_window,
+            "wf_step_window": VALIDATION_PROTOCOL.wf_step_window,
+            "wf_min_folds": VALIDATION_PROTOCOL.wf_min_folds,
+            "pkf_splits": VALIDATION_PROTOCOL.pkf_splits,
+            "pkf_purge_window": VALIDATION_PROTOCOL.pkf_purge_window,
+            "validation_min_train_points": VALIDATION_PROTOCOL.min_train_points,
+            "validation_min_test_points": VALIDATION_PROTOCOL.min_test_points,
+            "validation_protocol": validation_protocol_to_dict(VALIDATION_PROTOCOL),
+            "text_dropout_prob": float(max(0.0, min(0.95, LIQUID_TEXT_DROPOUT_PROB))),
+            "text_feature_count": int(len(text_feature_indices)),
             "wf_ready": wf_ready,
             "wf_metrics": wf_metrics,
             "purged_kfold": pkf_metrics,
@@ -649,6 +869,16 @@ class LiquidModelTrainer:
             "dq_degraded": bool(dq_degraded),
             "dq_gate_mode": "hard" if (LIQUID_DQ_HARD_BLOCK or LIQUID_DQ_GATE_MODE == "hard") else "soft",
             "dq_failed_reasons": dq_failed_reasons,
+            "sampling_strategy": {
+                **(batch.sampling or {}),
+                "requested_train_start": self.train_start.isoformat().replace("+00:00", "Z") if isinstance(self.train_start, datetime) else "",
+                "requested_train_end": self.train_end.isoformat().replace("+00:00", "Z") if isinstance(self.train_end, datetime) else "",
+                "requested_limit": int(self.train_limit),
+                "requested_max_samples": int(self.train_max_samples),
+                "requested_sample_mode": str(self.train_sample_mode),
+                "data_mode": str(self.train_data_mode),
+                "research_guardrails": research_guard,
+            },
         }
         train_report_hash = hashlib.sha256(
             json.dumps(train_manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -799,6 +1029,8 @@ class LiquidModelTrainer:
             "data_quality": dq,
             "dq_degraded": bool(dq_degraded),
             "dq_failed_reasons": dq_failed_reasons,
+            "sampling_strategy": train_manifest.get("sampling_strategy", {}),
+            "data_mode": str(self.train_data_mode),
         }
 
     def train_all(self) -> Dict:

@@ -4,30 +4,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
+from _psql import run_psql
+
 
 def _run_psql(sql: str) -> str:
-    cmd = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        "monitor",
-        "-d",
-        "monitor",
-        "-At",
-        "-F",
-        "|",
-        "-c",
-        sql,
-    ]
-    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+    return run_psql(sql)
 
 
 def _parse_sources(raw: str) -> List[str]:

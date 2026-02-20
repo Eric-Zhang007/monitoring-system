@@ -11,7 +11,7 @@ import logging
 import os
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import requests
@@ -40,6 +40,14 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utcnow_iso_z() -> str:
+    return _utcnow().isoformat().replace("+00:00", "Z")
 
 COLLECTOR_CONNECTOR_FETCH_TOTAL = Counter(
     "ms_collector_connector_fetch_total",
@@ -117,9 +125,11 @@ class DataCollectorV2:
         self.cycle_error_backoff_sec = float(os.getenv("COLLECTOR_CYCLE_ERROR_BACKOFF_SEC", "30.0"))
         self.cycle_error_backoff_max_sec = float(os.getenv("COLLECTOR_CYCLE_ERROR_BACKOFF_MAX_SEC", "180.0"))
         self.metrics_port = int(os.getenv("COLLECTOR_METRICS_PORT", "9101"))
-        self.liquid_symbols = {s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK").split(",") if s.strip()}
+        self.liquid_symbols = {s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL").split(",") if s.strip()}
         self.connector_state: Dict[str, Dict[str, float]] = {}
         self._http = self._build_http_session()
+        # Route ingest requests through the configured Session so retries/pooling take effect.
+        self._http_post = self._http.post
         self.llm_enricher = LLMEnricher()
 
         rss_feeds = [
@@ -388,7 +398,7 @@ class DataCollectorV2:
                 e["symbol"] = symbol
                 seen_symbols.add(symbol)
             out.append(e)
-        if market_scope == "crypto" and not seen_symbols and self._env_flag("ENABLE_BROAD_CRYPTO_FALLBACK_LINKS", default=False):
+        if market_scope == "crypto" and not seen_symbols and self._env_flag("ENABLE_BROAD_CRYPTO_FALLBACK_LINKS", default=True):
             # Wide fallback mapping to keep liquid feature context populated.
             for sym in sorted(self.liquid_symbols):
                 out.append(
@@ -451,12 +461,15 @@ class DataCollectorV2:
     def publish_event(self, event: Dict, connector_name: str, fetch_status: str):
         state = self._state(connector_name)
         occurred_at = event["occurred_at"]
-        now_iso = datetime.utcnow().isoformat() + "Z"
+        now_iso = _utcnow_iso_z()
         dedup_key = f"{event.get('source_name', '')}|{event.get('title', '').strip().lower()}|{event.get('source_url', '')}"
         dedup_cluster_id = hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()[:24]
         latency_ms = None
         try:
-            latency_ms = int((datetime.utcnow() - datetime.fromisoformat(occurred_at.replace("Z", "+00:00")).replace(tzinfo=None)).total_seconds() * 1000)
+            occurred_dt = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
+            if occurred_dt.tzinfo is None:
+                occurred_dt = occurred_dt.replace(tzinfo=timezone.utc)
+            latency_ms = int((_utcnow() - occurred_dt.astimezone(timezone.utc)).total_seconds() * 1000)
             if latency_ms < 0:
                 latency_ms = 0
         except Exception:
@@ -476,7 +489,7 @@ class DataCollectorV2:
             fallback_summary = str(llm_enrichment.get("summary") or "").strip()
             if fallback_summary:
                 event_payload["summary"] = fallback_summary[:1200]
-        event_payload["collector_ingested_at"] = datetime.utcnow().isoformat() + "Z"
+        event_payload["collector_ingested_at"] = _utcnow_iso_z()
         event_payload["ingest_dedup_key"] = dedup_key
         event_payload["source_fetch_status"] = fetch_status
         event_payload["source_confidence"] = float(event.get("confidence_score", 0.5) or 0.5)
@@ -553,7 +566,7 @@ class DataCollectorV2:
         delay = 0.5
         for attempt in range(1, self.ingest_max_retries + 1):
             try:
-                resp = self._http.post(
+                resp = self._http_post(
                     self.ingest_endpoint,
                     json=req_body,
                     timeout=(

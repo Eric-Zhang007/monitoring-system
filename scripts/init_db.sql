@@ -394,3 +394,12 @@ CREATE TABLE IF NOT EXISTS data_quality_review_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_dq_review_logs_event_time ON data_quality_review_logs(event_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dq_review_logs_reviewer_time ON data_quality_review_logs(reviewer, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ops_control_state (
+    control_key VARCHAR(64) PRIMARY KEY,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source VARCHAR(32) NOT NULL DEFAULT 'api',
+    updated_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ops_control_state_updated_at ON ops_control_state(updated_at DESC);

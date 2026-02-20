@@ -6,12 +6,13 @@ import json
 import math
 import os
 import re
-import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any, Dict, List
 
 from _metrics_test_logger import record_metrics_test
+from _psql import run_psql
 
 
 def _sharpe(vals: List[float]) -> float:
@@ -47,27 +48,6 @@ def _max_dd(vals: List[float]) -> float:
         dd = 1.0 - (eq / peak)
         mdd = max(mdd, dd)
     return float(mdd)
-
-
-def _run_psql(sql: str) -> str:
-    cmd = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        "monitor",
-        "-d",
-        "monitor",
-        "-At",
-        "-F",
-        "|",
-        "-c",
-        sql,
-    ]
-    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
 
 
 def _parse_sources(raw: str) -> List[str]:
@@ -123,6 +103,12 @@ def _sql_target_filter(targets: List[str]) -> str:
     return " AND (" + " OR ".join(conds) + ")"
 
 
+def _default_report_path(track: str, score_source: str, started_at: datetime) -> Path:
+    ts = started_at.strftime("%Y%m%dT%H%M%SZ")
+    name = f"hard_metrics_{track}_{score_source}_{ts}.json"
+    return Path("artifacts") / "eval_reports" / "hard_metrics" / name
+
+
 def main() -> int:
     started_at = datetime.now(timezone.utc)
     ap = argparse.ArgumentParser(description="Evaluate codex-plan hard metrics")
@@ -138,6 +124,7 @@ def main() -> int:
     ap.add_argument("--min-completed-runs", type=int, default=5)
     ap.add_argument("--min-observation-days", type=int, default=int(os.getenv("BACKTEST_GATE_MIN_OBSERVATION_DAYS", "14")))
     ap.add_argument("--min-sharpe-daily", type=float, default=float(os.getenv("BACKTEST_GATE_MIN_SHARPE_DAILY", "1.5")))
+    ap.add_argument("--out", default="", help="JSON report output path (default: artifacts/eval_reports/hard_metrics/*.json)")
     args = ap.parse_args()
 
     track = str(args.track).strip().lower()
@@ -191,7 +178,7 @@ def main() -> int:
         "AND metrics ? 'max_drawdown' "
         "ORDER BY created_at DESC LIMIT 1000;"
     )
-    rows = [r for r in _run_psql(sql_runs).splitlines() if r.strip()]
+    rows = [r for r in run_psql(sql_runs).splitlines() if r.strip()]
     missing_contract_expr = " OR ".join([f"NOT (metrics ? '{k}')" for k in required_contract_keys])
     sql_contract = (
         "SELECT COUNT(*)::text "
@@ -206,7 +193,7 @@ def main() -> int:
         "AND COALESCE(metrics->>'status','')='completed' "
         f"AND ({missing_contract_expr});"
     )
-    raw_missing_contract_count = _run_psql(sql_contract)
+    raw_missing_contract_count = run_psql(sql_contract)
     missing_required_metrics_count = int(float(raw_missing_contract_count or 0)) if raw_missing_contract_count else 0
 
     completed_pnls: List[float] = []
@@ -279,7 +266,7 @@ def main() -> int:
         + " "
         f"AND created_at > NOW() - make_interval(days => {args.lookback_days});"
     )
-    out_exec = _run_psql(sql_exec)
+    out_exec = run_psql(sql_exec)
     rejected = 0
     total_orders = 0
     if out_exec and "," in out_exec:
@@ -320,8 +307,12 @@ def main() -> int:
     ]
     hard_passed = all(bool(checks.get(k, False)) for k in gate_check_keys) and (not insufficient)
     passed = True if monitor_only else hard_passed
+    pnl_after_cost_mean = float(mean(completed_pnls)) if completed_pnls else 0.0
+    sharpe_horizon = _sharpe_with_horizon(completed_pnls, completed_horizon_days) if completed_pnls else 0.0
 
     out: Dict[str, Any] = {
+        "report_schema_version": "eval_report_v1",
+        "report_type": "hard_metrics_gate",
         "track": track,
         "score_source": score_source,
         "track_mode": track_mode,
@@ -348,8 +339,10 @@ def main() -> int:
         "status": "insufficient_observation" if insufficient else ("passed" if hard_passed else "failed"),
         "failed_ratio": round(failed_ratio, 6),
         "artifact_failure_ratio": round(artifact_failure_ratio, 6),
+        "pnl_after_cost_mean": round(pnl_after_cost_mean, 6),
         "sharpe": round(sharpe_daily, 6),
         "sharpe_daily": round(sharpe_daily, 6),
+        "sharpe_horizon": round(sharpe_horizon, 6),
         "sharpe_method": "daily_agg_v1",
         "observation_days": int(observation_days),
         "min_observation_days": int(args.min_observation_days),
@@ -361,6 +354,61 @@ def main() -> int:
         "hard_passed": hard_passed,
         "passed": passed,
     }
+
+    report_payload: Dict[str, Any] = {
+        "report_schema_version": "eval_report_v1",
+        "report_type": "hard_metrics_gate",
+        "generated_at": started_at.isoformat(),
+        "context": {
+            "script": "scripts/evaluate_hard_metrics.py",
+            "track": track,
+            "score_source": score_source,
+            "track_mode": track_mode,
+        },
+        "window": {
+            "lookback_days": int(args.lookback_days),
+            "window_start": out["window_start"],
+            "window_end": out["window_end"],
+        },
+        "filters": {
+            "include_sources": include_sources,
+            "exclude_sources": exclude_sources,
+            "data_regimes": data_regimes,
+            "targets": targets,
+            "include_superseded": bool(args.include_superseded),
+        },
+        "thresholds": {
+            "min_completed_runs": int(args.min_completed_runs),
+            "min_observation_days": int(args.min_observation_days),
+            "min_sharpe_daily": float(args.min_sharpe_daily),
+            "max_drawdown_lt": 0.12,
+            "execution_reject_rate_lt": 0.01,
+        },
+        "summary": {
+            "status": out["status"],
+            "passed": bool(passed),
+            "hard_passed": bool(hard_passed),
+            "monitor_only": bool(monitor_only),
+        },
+        "metrics": {
+            "samples_completed": int(out["samples_completed"]),
+            "samples_effective_total": int(out["samples_effective_total"]),
+            "pnl_after_cost_mean": float(out["pnl_after_cost_mean"]),
+            "sharpe_daily": float(out["sharpe_daily"]),
+            "sharpe_horizon": float(out["sharpe_horizon"]),
+            "max_drawdown": float(out["max_drawdown"]),
+            "execution_reject_rate": float(out["execution_reject_rate"]),
+            "leakage_fail_runs": int(out["leakage_fail_runs"]),
+        },
+        "checks": checks,
+        "raw": out,
+    }
+
+    out_path = Path(args.out).expanduser() if str(args.out).strip() else _default_report_path(track, score_source, started_at)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    out["report_path"] = str(out_path)
+
     print(json.dumps(out, ensure_ascii=False))
     record_metrics_test(
         test_name="evaluate_hard_metrics",

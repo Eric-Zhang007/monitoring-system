@@ -10,7 +10,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
-DEFAULT_TOP10 = "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK"
+DEFAULT_TOP10 = "BTC,ETH,SOL"
 
 
 def _parse_symbols(raw: str) -> List[str]:

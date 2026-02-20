@@ -148,15 +148,15 @@
 | E-2 | Phase E | ModelOps 门禁接入新评估项 | `monitoring/model_ops_scheduler.py`, `scripts/validate_no_leakage.py` | 自动阻断不达标候选 | DONE | 2026-03-05 | 2026-03-07 | 2026-02-19 |
 | E-3 | Phase E | 发布与回滚演练 | `scripts/server_up.sh`, `scripts/server_readiness.sh` | 演练记录通过 | DONE | 2026-03-06 | 2026-03-07 | 2026-02-19 |
 | E-4 | Phase E | 更新部署与运行文档 | `README.md`, `REPOSITORY_ARCHITECTURE_GUIDE_ZH.md` | 文档与代码一致 | DONE | 2026-03-06 | 2026-03-07 | 2026-02-19 |
-| F-1 | Phase F | 数据窗口与模态完整性盘点（训练视角） | `scripts/audit_full_history_completeness.py`, `scripts/audit_training_data_completeness.py` | 输出缺口报告 + 分模态优先级 | IN_PROGRESS | 2026-02-19 | 2026-02-20 | - |
-| F-2 | Phase F | 衍生品信号采集（funding + OI proxy） | `scripts/ingest_binance_aux_signals.py` | `funding_rates/onchain_signals` 非零覆盖 | IN_PROGRESS | 2026-02-19 | 2026-02-21 | - |
-| F-3 | Phase F | 订单簿代理回填（用于冷启动） | `scripts/backfill_orderbook_from_market_bars.py` | `orderbook_l2` 冷启动窗口可用 | IN_PROGRESS | 2026-02-19 | 2026-02-21 | - |
-| F-4 | Phase F | 缺口修复编排脚本（可直上服务器） | `scripts/remediate_liquid_data_gaps.sh` | 一键执行并输出审计报告 | IN_PROGRESS | 2026-02-19 | 2026-02-21 | - |
-| F-5 | Phase F | 2026+ 额外数据路线评估与实施清单 | `MULTIMODAL_UPGRADE_PLAN_ZH.md`, `README.md` | 给出可执行的数据扩展路线图 | IN_PROGRESS | 2026-02-19 | 2026-02-20 | - |
-| F-6 | Phase F | 额外模态采集实现（优先复用现有脚本） | `scripts/orchestrate_event_social_backfill.py`, `scripts/build_multisource_events_2025.py` | 新增数据源不破坏既有回填链路 | IN_PROGRESS | 2026-02-19 | 2026-02-22 | - |
-| F-7 | Phase F | 本地采集 -> 服务器离线导入链路 | `scripts/build_offline_data_bundle.sh`, `scripts/import_offline_data_bundle.sh`, `scripts/server_import_offline_bundle.sh` | 服务器无外网时仍可完成数据导入与训练 | IN_PROGRESS | 2026-02-19 | 2026-02-22 | - |
-| F-8 | Phase F | 衍生品增强数据采集（长短仓比/主动买卖比/基差） | `scripts/ingest_binance_derivatives_signals.py` | `onchain_signals` 新增 derivatives metric 覆盖并可审计 | IN_PROGRESS | 2026-02-19 | 2026-02-22 | - |
-| F-9 | Phase F | 必要数据一键采集与就绪审计总入口 | `scripts/collect_required_data.sh`, `scripts/audit_required_data_readiness.py` | 可一键执行采集->复审->离线包，全过程落产物 | IN_PROGRESS | 2026-02-19 | 2026-02-22 | - |
+| F-1 | Phase F | 数据窗口与模态完整性盘点（训练视角） | `scripts/audit_full_history_completeness.py`, `scripts/audit_training_data_completeness.py` | 输出缺口报告 + 分模态优先级 | DONE | 2026-02-19 | 2026-02-20 | 2026-02-20 |
+| F-2 | Phase F | 衍生品信号采集（funding + OI proxy） | `scripts/ingest_binance_aux_signals.py` | `funding_rates/onchain_signals` 非零覆盖 | DONE | 2026-02-19 | 2026-02-21 | 2026-02-20 |
+| F-3 | Phase F | 订单簿代理回填（用于冷启动） | `scripts/backfill_orderbook_from_market_bars.py` | `orderbook_l2` 冷启动窗口可用 | DONE | 2026-02-19 | 2026-02-21 | 2026-02-20 |
+| F-4 | Phase F | 缺口修复编排脚本（可直上服务器） | `scripts/remediate_liquid_data_gaps.sh` | 一键执行并输出审计报告 | DONE | 2026-02-19 | 2026-02-21 | 2026-02-20 |
+| F-5 | Phase F | 2026+ 额外数据路线评估与实施清单 | `MULTIMODAL_UPGRADE_PLAN_ZH.md`, `README.md` | 给出可执行的数据扩展路线图 | DONE | 2026-02-19 | 2026-02-20 | 2026-02-20 |
+| F-6 | Phase F | 额外模态采集实现（优先复用现有脚本） | `scripts/orchestrate_event_social_backfill.py`, `scripts/build_multisource_events_2025.py` | 新增数据源不破坏既有回填链路 | DONE | 2026-02-19 | 2026-02-22 | 2026-02-20 |
+| F-7 | Phase F | 本地采集 -> 服务器离线导入链路 | `scripts/build_offline_data_bundle.sh`, `scripts/import_offline_data_bundle.sh`, `scripts/server_import_offline_bundle.sh` | 服务器无外网时仍可完成数据导入与训练 | DONE | 2026-02-19 | 2026-02-22 | 2026-02-20 |
+| F-8 | Phase F | 衍生品增强数据采集（长短仓比/主动买卖比/基差） | `scripts/ingest_binance_derivatives_signals.py` | `onchain_signals` 新增 derivatives metric 覆盖并可审计 | DONE | 2026-02-19 | 2026-02-22 | 2026-02-20 |
+| F-9 | Phase F | 必要数据一键采集与就绪审计总入口 | `scripts/collect_required_data.sh`, `scripts/audit_required_data_readiness.py` | 可一键执行采集->复审->离线包，全过程落产物 | DONE | 2026-02-19 | 2026-02-22 | 2026-02-20 |
 | G-1 | Phase G | 训练收益门禁脚本与调度接入 | `scripts/gate_training_profitability.py`, `scripts/continuous_ops_loop.py` | 可自动判定“训练是否有收益”，并可触发后续动作 | IN_PROGRESS | 2026-02-19 | 2026-02-22 | - |
 | G-2 | Phase G | 双卡 A100 NVLINK 训练启动器 | `scripts/launch_dual_a100_training.sh`, `scripts/train_gpu_stage2.py` | 启动前完成双卡/NVLINK 预检并一键发车 | IN_PROGRESS | 2026-02-19 | 2026-02-22 | - |
 | G-3 | Phase G | 首训成功后模拟盘 + 门禁失败自动微调 | `scripts/continuous_ops_loop.py`, `monitoring/paper_trading_daemon.py` | 首训前不下模拟单；收益门禁失败可自动微调 | IN_PROGRESS | 2026-02-19 | 2026-02-22 | - |
@@ -254,10 +254,19 @@
 | 2026-02-19 | Codex | 推进 G-1：新增 `scripts/gate_training_profitability.py`，支持按最近回测结果做收益门禁并输出快照。 | G |
 | 2026-02-19 | Codex | 推进 G-2：新增 `scripts/launch_dual_a100_training.sh`，并增强 `scripts/train_gpu_stage2.py` 的 GPU/NVLINK 预检与结果回传。 | G |
 | 2026-02-19 | Codex | 推进 G-3：`scripts/continuous_ops_loop.py` 新增“首训成功后再跑模拟盘 + 收益门禁失败触发微调”机制；补充 `.env.example/README.md` 说明。 | G |
+| 2026-02-20 | Codex | 本地实跑 `collect_required_data` 主链路：完成 2018-now 的 5m/1h 市场、aux、orderbook 采集；识别社媒与事件编排在默认参数下的长耗时/限流问题。 | F |
+| 2026-02-20 | Codex | 修复数据链路阻塞点：`orchestrate_event_social_backfill.py` 增加事件源开关（disable-gdelt/google/rss/source-balance）与 `event-day-step`；`collect_required_data.sh` 同步参数化。 | F |
+| 2026-02-20 | Codex | 修复社媒导入问题：`backend/v2_repository.py` 修复 `ingest_events` 的 `fetchone` 时序 bug（savepoint release 后取结果导致异常）；导入链路恢复。 | F |
+| 2026-02-20 | Codex | 完成 recent-window 事件/社媒补采与导入：事件 2589、社媒 480；`audit_required_data_readiness` 的社媒/事件门禁转绿。 | F |
+| 2026-02-20 | Codex | 升级衍生品采集：`ingest_binance_derivatives_signals.py` 新增低频指标 5m 前向扩展 + `annualized_basis_rate` 派生补齐；derivatives 覆盖门禁转绿，`ready=true`。 | F |
+| 2026-02-20 | Codex | 新增 `TRAINING_PIPELINES_SUMMARY_ZH.md`，系统梳理全部训练链路（数据使用、特征提取、标签定义、产物与限制），用于后续服务器训练与排障对照。 | G |
+| 2026-02-20 | Codex | 更新 `TRAINING_PIPELINES_SUMMARY_ZH.md` 的“当前已有数据”章节，补充最新审计口径下的数据种类、覆盖率与 420d/2018-now 双窗口状态。 | G |
 
 ## 8. 明日优先级（滚动 3 项）
 
-1. 本地执行 `bash scripts/collect_required_data.sh`（先分块 `INGEST_MAX_CHUNKS/EVENT_MAX_CHUNKS`，再全窗口）直至 `readiness_after.json` 过门禁。
+1. 进入 Phase G 实跑：按收益门禁脚本触发首轮训练（双卡服务器执行），产出第一版 `backtest_runs` 与 gate 快照。
+2. 接通“首训通过后模拟盘”闭环：完成 `continuous_ops_loop` + `paper_trading_daemon` 的端到端联调与回放验证。
+3. 执行仓库清理与结构收敛：删除无用工件/临时文件，补齐部署脚本说明后推送 GitHub。
 2. 复核 `artifacts/data_collection/run_*/readiness_after.json` 的 `missing_data_kinds`，对残余缺口按 `recommended_commands` 定点补采。
 3. 产出并上传 `offline_data_bundle_*.tar.gz`，在服务器导入后执行 Phase-D 训练与评估闭环。
 
@@ -279,3 +288,110 @@
 | 多源事件（宏观/监管/交易所） | 已有代码，待全窗口执行 | 事件密度、风险状态机 | 复用 `scripts/build_multisource_events_2025.py` + 导入脚本 | 扩展到 2018-now 分块回填 |
 | 衍生品清算/基差/期限结构 | 已接入第一版（Binance futures/data） | 高波动阶段风险控制 | `scripts/ingest_binance_derivatives_signals.py` | 下一步补“清算流/期限结构”与历史长窗口数据源 |
 | 稳定币与交易所净流（链上） | 未接入 | 流动性与风险偏好状态 | 计划新增链上采集脚本并落 `onchain_signals` | 先确定免费/付费源与覆盖窗口 |
+
+
+
+
+
+
+
+
+
+
+
+## 11. 增补执行清单（P0->P2）
+
+### 11.1 目标
+- 把“数据采集能力”与“训练链路真正吃到的数据”对齐；让评估/门禁链路稳定产出；把主训练从固定样本上限改成可配置；补齐 backbone 实验链的 tft 分支。
+
+### 11.2 状态追踪（新增）
+| ID | 优先级 | 任务 | 当前状态 |
+|---|---|---|---|
+| P0.1 | P0 | 修复多模态 OOS 评估链路崩溃 | DONE |
+| P0.2 | P0 | Liquid 主训练样本上限参数化（替代固定 limit=4000） | DONE |
+| P0.3 | P0 | 接入 derivatives 指标进入 Liquid 训练特征 | DONE |
+| P0.4 | P0 | 修复 backbone_experiments 的 tft 训练分支 | DONE |
+| P1.1 | P1 | 2018-now 全窗口补齐策略（代码+流程） | DONE |
+| P1.2 | P1 | 社媒原始明细表落地（可选但建议） | DONE |
+| P1.3 | P1 | onchain_signals 扩展与一致化 | DONE |
+| P2.1 | P2 | 可选新数据源评估（先做 feasibility report） | DONE |
+
+### 11.3 P0（必须先做：稳定性 & 训练-数据脱节）
+
+#### P0.1 修复多模态 OOS 评估链路崩溃
+- 现状：training/eval_multimodal_oos.py 末尾 print 使用未定义变量 wf_basic，导致评估链不稳定。
+- 相关：链路 D 的产物为 artifacts/models/multimodal_eval.json
+- 要求（验收）：
+  1) 脚本能稳定跑完并写出 multimodal_eval.json
+  2) 仍保持 WF + Purged KFold 协议不变
+- 建议步骤：
+  - 定位 wf_basic 来源（应来自 validation.py 的某个 wf config 或返回值）
+  - 修正输出字段名/变量名，补一个最小单测或 smoke test（可用短窗口）
+
+#### P0.2 Liquid 主训练样本上限参数化（替代固定 limit=4000）
+- 现状：每 symbol 默认 limit=4000，导致“不是全历史全量训练”。
+- 要求（验收）：
+  1) 支持 CLI 参数（例如 --start --end --max-samples/--limit 或 env）控制取数
+  2) 默认行为保持兼容（仍可用 4000 作为默认）
+  3) 在训练 manifest 里记录最终采样策略（窗口、limit/max_samples、下采样方式）
+- 影响范围：
+  - training/main.py
+  - training/liquid_model_trainer.py
+  - training/feature_pipeline.py::load_liquid_training_batch
+
+#### P0.3 接入 derivatives 指标进入 Liquid 训练特征
+- 现状：衍生品增强指标（long/short ratio、taker ratio、basis 等）审计覆盖很高，但“尚未进入训练特征集合”。
+- 要求（验收）：
+  1) FeaturePipeline.load_liquid_training_batch 能读取并对齐这些指标（5m as-of / latest_before）
+  2) LIQUID_FEATURE_KEYS / 合同特征键同步更新（inference/liquid_feature_contract.py）
+  3) 保证 no-lookahead（只能使用 timestamp<=t 或 available_at<=t 的可用数据）
+  4) 缺失要有 missing_flag，并进入模型输入
+- 附：优先接入已列出的 6 个指标，后续再扩展。
+
+#### P0.4 修复 backbone_experiments 的 tft 训练分支
+- 现状：_fold_metrics 分支未把 tft 送入 torch 训练分支，tft 被标记 unsupported。
+- 要求（验收）：
+  1) tft 能按其它神经骨干一样跑完训练+评估并写入 backbone_suite_latest.json
+  2) 明确 torch 依赖缺失时的降级行为（提示 + 跳过）
+- 影响范围：
+  - training/backbone_experiments.py
+
+### 11.4 P1（数据层补齐：从“短中期就绪”到“可全历史/可扩展”）
+
+#### P1.1 2018-now 全窗口补齐策略（代码+流程）
+- 现状：full_history_latest 显示 2018-now 覆盖不足，history_window_complete=false。
+- 目标：
+  - 明确两种模式：
+    A) “生产训练窗口模式”（比如 420 天 lookback）继续作为默认
+    B) “研究/全历史模式”（2018-now）可选开启，并且 audit 通过后才允许运行
+- 要求（验收）：
+  1) scripts/collect_required_data.sh 支持按模式回填
+  2) scripts/audit_required_data_readiness.py 输出明确的 mode + coverage + 阈值
+  3) training/main.py 在全历史模式下自动开启更严格的缺失处理/下采样策略（避免样本选择偏差）
+
+#### P1.2 社媒原始明细表落地（可选但建议）
+- 现状：social_posts_raw / social_comments_raw 不存在；训练社媒信号主要来自 events.payload 和 social_text_latent 聚合表。
+- 目标：
+  - 把“可追溯、可重算”的 raw 社媒落下来（哪怕先只覆盖近 90/180 天）
+  - build_text_latent_embeddings.py 支持从 raw 表重算（而不是强依赖 events.payload）
+- 要求（验收）：
+  1) 定义表 schema（必要字段：platform、id、ts、author、text、engagement、symbol/entity link）
+  2) 提供最小可用采集脚本/任务（或对接现有采集器）
+  3) 对齐到 5m 桶聚合，并能生成 social_text_latent（含 agg_features）
+
+#### P1.3 onchain_signals 扩展与一致化
+- 现状：Liquid 链路目前仅使用 netflow/exchange_netflow/net_inflow 等少量指标；同时衍生品指标也需要一致的 as-of 对齐。
+- 目标：
+  - 把“指标字典”集中管理（onchain + derivatives），一处定义，多处复用（特征层 & 训练层）
+  - audit 与训练读数保持同一套 key list
+
+### 11.5 P2（增量收益项：可选数据/特征）
+
+#### P2.1 可选新数据源评估（先做 feasibility report）
+- 候选：
+  - open interest / liquidation（强相关于 5m/1h 短周期）
+  - options implied vol / skew（偏中周期）
+  - 跨交易所资金费率分布、CVD/成交主动性
+  - 宏观风险因子（DXY、US10Y、VIX 等，需对齐到 1h/5m）
+- 产出：
+  - 1 页 feasibility + 采集成本 + 预期增益 + 风险（数据质量/延迟/泄露）

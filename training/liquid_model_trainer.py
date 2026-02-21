@@ -5,9 +5,9 @@ import os
 import random
 import hashlib
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import numpy as np
 import psycopg2
@@ -82,9 +82,15 @@ LIQUID_TRAIN_MAX_SAMPLES = _safe_env_int("LIQUID_TRAIN_MAX_SAMPLES", 0)
 LIQUID_TRAIN_SAMPLE_MODE = str(os.getenv("LIQUID_TRAIN_SAMPLE_MODE", "uniform")).strip().lower() or "uniform"
 LIQUID_TRAIN_START = str(os.getenv("LIQUID_TRAIN_START", "")).strip()
 LIQUID_TRAIN_END = str(os.getenv("LIQUID_TRAIN_END", "")).strip()
+LIQUID_TRAIN_LOOKBACK_DAYS = _safe_env_int("LIQUID_TRAIN_LOOKBACK_DAYS", 365)
+LIQUID_TRAIN_MODE = str(os.getenv("LIQUID_TRAIN_MODE", "production")).strip().lower() or "production"
 LIQUID_DATA_MODE = str(os.getenv("LIQUID_DATA_MODE", "production")).strip().lower() or "production"
 LIQUID_RESEARCH_MAX_MISSING_FLAGS = _safe_env_int("LIQUID_RESEARCH_MAX_MISSING_FLAGS", 2)
 LIQUID_RESEARCH_MAX_SAMPLES = _safe_env_int("LIQUID_RESEARCH_MAX_SAMPLES", 50000)
+LIQUID_MULTI_HORIZON_TRAIN_MODE = str(
+    os.getenv("LIQUID_MULTI_HORIZON_TRAIN_MODE", "single_model_multihead")
+).strip().lower() or "single_model_multihead"
+LIQUID_HORIZONS: List[str] = ["1h", "4h", "1d", "7d"]
 
 
 class MixerBlock(nn.Module):
@@ -161,10 +167,21 @@ class LiquidModelTrainer:
         self.local_rank = int(local_rank)
         self.train_start = self._parse_optional_utc(train_start if train_start is not None else LIQUID_TRAIN_START)
         self.train_end = self._parse_optional_utc(train_end if train_end is not None else LIQUID_TRAIN_END)
-        self.train_limit = max(0, int(LIQUID_TRAIN_LIMIT if train_limit is None else train_limit))
+        self.train_mode = str(os.getenv("LIQUID_TRAIN_MODE", LIQUID_TRAIN_MODE)).strip().lower() or "production"
+        self.train_lookback_days = max(1, int(os.getenv("LIQUID_TRAIN_LOOKBACK_DAYS", str(LIQUID_TRAIN_LOOKBACK_DAYS)) or LIQUID_TRAIN_LOOKBACK_DAYS))
+        requested_limit = max(0, int(LIQUID_TRAIN_LIMIT if train_limit is None else train_limit))
+        # Explicit train_limit always wins; otherwise production defaults to window-based sampling.
+        if train_limit is None:
+            self.train_limit = int(requested_limit if self.train_mode == "fast" else 0)
+        else:
+            self.train_limit = int(requested_limit)
         self.train_max_samples = max(0, int(LIQUID_TRAIN_MAX_SAMPLES if train_max_samples is None else train_max_samples))
         self.train_sample_mode = str(train_sample_mode if train_sample_mode is not None else LIQUID_TRAIN_SAMPLE_MODE).strip().lower() or "uniform"
         self.train_data_mode = str(train_data_mode if train_data_mode is not None else LIQUID_DATA_MODE).strip().lower() or "production"
+        if self.train_end is None:
+            self.train_end = datetime.now(timezone.utc)
+        if self.train_start is None and isinstance(self.train_end, datetime):
+            self.train_start = self.train_end - timedelta(days=max(1, int(self.train_lookback_days)))
         os.makedirs(MODEL_DIR, exist_ok=True)
 
     def _connect(self):
@@ -257,6 +274,176 @@ class LiquidModelTrainer:
     def _ridge_weights(x_train: np.ndarray, y_train: np.ndarray) -> np.ndarray:
         reg = np.eye(x_train.shape[1], dtype=np.float64) * 1e-3
         return np.linalg.pinv(x_train.T @ x_train + reg) @ x_train.T @ y_train
+
+    @staticmethod
+    def _resolve_horizon_labels(
+        y_default: np.ndarray,
+        extra_labels: Dict[str, np.ndarray] | None,
+    ) -> Dict[str, np.ndarray]:
+        extra = extra_labels or {}
+        out: Dict[str, np.ndarray] = {}
+        alias = {
+            "1h": ["net_ret_1h", "fwd_ret_1h"],
+            "4h": ["net_ret_4h", "fwd_ret_4h"],
+            "1d": ["net_ret_1d"],
+            "7d": ["net_ret_7d"],
+        }
+        for horizon in LIQUID_HORIZONS:
+            arr = None
+            for key in alias.get(horizon, []):
+                cur = extra.get(key)
+                if cur is not None:
+                    arr = np.asarray(cur, dtype=np.float32).reshape(-1)
+                    break
+            if arr is None or arr.size != y_default.shape[0]:
+                arr = np.asarray(y_default, dtype=np.float32).reshape(-1)
+            out[horizon] = arr
+        return out
+
+    @staticmethod
+    def _resolve_horizon_vol_targets(
+        y_by_horizon: Dict[str, np.ndarray],
+        extra_labels: Dict[str, np.ndarray] | None,
+    ) -> Dict[str, np.ndarray]:
+        extra = extra_labels or {}
+        out: Dict[str, np.ndarray] = {}
+        for horizon in LIQUID_HORIZONS:
+            key = f"vol_target_{horizon}"
+            cur = extra.get(key)
+            if cur is None:
+                cur_arr = np.abs(np.asarray(y_by_horizon[horizon], dtype=np.float32))
+            else:
+                cur_arr = np.asarray(cur, dtype=np.float32).reshape(-1)
+            out[horizon] = cur_arr
+        return out
+
+    @staticmethod
+    def _safe_sigmoid(x: np.ndarray) -> np.ndarray:
+        xx = np.clip(np.asarray(x, dtype=np.float64), -40.0, 40.0)
+        return 1.0 / (1.0 + np.exp(-xx))
+
+    def _fit_horizon_heads(
+        self,
+        Xn_train_drop: np.ndarray,
+        Xn_full: np.ndarray,
+        train_idx: np.ndarray,
+        val_idx: np.ndarray,
+        y_by_horizon: Dict[str, np.ndarray],
+        vol_targets: Dict[str, np.ndarray],
+    ) -> Dict[str, Dict[str, object]]:
+        out: Dict[str, Dict[str, object]] = {}
+        for horizon in LIQUID_HORIZONS:
+            y_h = np.asarray(y_by_horizon[horizon], dtype=np.float64)
+            vol_h = np.asarray(vol_targets[horizon], dtype=np.float64)
+            w = self._ridge_weights(Xn_train_drop.astype(np.float64), y_h[train_idx])
+            pred_all = (Xn_full.astype(np.float64) @ w).astype(np.float64)
+            pred_val = pred_all[val_idx]
+            y_val = y_h[val_idx]
+            resid_val = y_val - pred_val
+            resid_std = float(np.std(resid_val)) if resid_val.size else 0.0
+
+            wv = self._ridge_weights(Xn_train_drop.astype(np.float64), vol_h[train_idx])
+            vol_pred_all = np.clip((Xn_full.astype(np.float64) @ wv).astype(np.float64), 1e-6, None)
+            vol_pred_val = vol_pred_all[val_idx]
+            z_val = pred_val / np.clip(vol_pred_val, 1e-6, None)
+            hit_val = (np.sign(pred_val) == np.sign(y_val)).astype(np.float64) if y_val.size else np.zeros((0,), dtype=np.float64)
+
+            conf_a = 0.85
+            conf_b = -0.1
+            conf_val = self._safe_sigmoid(conf_a * np.abs(z_val) + conf_b)
+            order = np.argsort(conf_val)
+            bins = max(1, min(5, int(conf_val.size // 16) if conf_val.size > 0 else 1))
+            calib_bins: List[Dict[str, float]] = []
+            if conf_val.size > 0:
+                for b in np.array_split(order, bins):
+                    if b.size <= 0:
+                        continue
+                    calib_bins.append(
+                        {
+                            "count": int(b.size),
+                            "conf_mean": float(np.mean(conf_val[b])),
+                            "hit_rate": float(np.mean(hit_val[b])) if hit_val.size else 0.0,
+                            "score_abs_mean": float(np.mean(np.abs(pred_val[b]))),
+                        }
+                    )
+
+            out[horizon] = {
+                "weights": w.astype(np.float32).tolist(),
+                "vol_weights": wv.astype(np.float32).tolist(),
+                "residual_std": float(max(1e-6, resid_std)),
+                "calibration": {
+                    "method": "sigmoid_abs_z",
+                    "a": float(conf_a),
+                    "b": float(conf_b),
+                    "bins": calib_bins,
+                },
+                "metrics": {
+                    "mse": float(np.mean((pred_val - y_val) ** 2)) if y_val.size else 0.0,
+                    "mae": float(np.mean(np.abs(pred_val - y_val))) if y_val.size else 0.0,
+                    "hit_rate": float(np.mean(hit_val)) if hit_val.size else 0.0,
+                },
+            }
+        return out
+
+    def _fit_horizon_models_with_meta(
+        self,
+        Xn_train_drop: np.ndarray,
+        Xn_full: np.ndarray,
+        train_idx: np.ndarray,
+        val_idx: np.ndarray,
+        y_by_horizon: Dict[str, np.ndarray],
+        vol_targets: Dict[str, np.ndarray],
+    ) -> Dict[str, Any]:
+        # Multi-model mode: one submodel per horizon + a lightweight linear meta-aggregator.
+        heads = self._fit_horizon_heads(
+            Xn_train_drop=Xn_train_drop,
+            Xn_full=Xn_full,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            y_by_horizon=y_by_horizon,
+            vol_targets=vol_targets,
+        )
+        ordered_h = [h for h in LIQUID_HORIZONS if h in heads]
+        if not ordered_h:
+            return {"horizon_models": {}, "meta_aggregator": {}}
+
+        pred_cols: List[np.ndarray] = []
+        for h in ordered_h:
+            ww = np.asarray((heads.get(h) or {}).get("weights") or [], dtype=np.float64).reshape(-1)
+            if ww.size <= 0:
+                continue
+            pred_cols.append((Xn_full.astype(np.float64) @ ww).reshape(-1))
+        if not pred_cols:
+            return {"horizon_models": {}, "meta_aggregator": {}}
+        pred_mat = np.stack(pred_cols, axis=1).astype(np.float64)
+        y_meta = np.asarray(y_by_horizon.get("1h"), dtype=np.float64).reshape(-1)
+        meta_x = pred_mat[train_idx]
+        meta_y = y_meta[train_idx]
+        meta_w = self._ridge_weights(meta_x, meta_y).astype(np.float64)
+        meta_val = pred_mat[val_idx] @ meta_w
+        meta_y_val = y_meta[val_idx]
+        hit = (np.sign(meta_val) == np.sign(meta_y_val)).astype(np.float64) if meta_y_val.size else np.zeros((0,), dtype=np.float64)
+
+        horizon_models: Dict[str, Dict[str, Any]] = {}
+        for h in ordered_h:
+            item = dict(heads.get(h) or {})
+            item["model_type"] = "ridge_submodel"
+            horizon_models[h] = item
+
+        return {
+            "horizon_models": horizon_models,
+            "meta_aggregator": {
+                "model_type": "linear_meta",
+                "horizons": ordered_h,
+                "weights": meta_w.astype(np.float32).tolist(),
+                "target_horizon": "1h",
+                "metrics": {
+                    "mse": float(np.mean((meta_val - meta_y_val) ** 2)) if meta_y_val.size else 0.0,
+                    "mae": float(np.mean(np.abs(meta_val - meta_y_val))) if meta_y_val.size else 0.0,
+                    "hit_rate": float(np.mean(hit)) if hit.size else 0.0,
+                },
+            },
+        }
 
     @staticmethod
     def _infer_text_feature_indices(keys: List[str]) -> List[int]:
@@ -513,8 +700,8 @@ class LiquidModelTrainer:
                 data_version=DATA_VERSION,
                 row_times=row_times,
             )
-        label_1h = batch.extra_labels.get("fwd_ret_1h", y) if batch.extra_labels else y
-        label_4h = batch.extra_labels.get("fwd_ret_4h", y) if batch.extra_labels else y
+        y_by_horizon = self._resolve_horizon_labels(y, batch.extra_labels)
+        vol_targets = self._resolve_horizon_vol_targets(y_by_horizon, batch.extra_labels)
         n = X.shape[0]
         val_n = max(64, int(n * VAL_RATIO))
         if val_n >= n:
@@ -535,10 +722,38 @@ class LiquidModelTrainer:
         Xn_seq = Xn.copy()
         Xn_seq[train_idx] = Xn_train_drop
 
-        y_train = y[train_idx]
+        y_train = y_by_horizon["1h"][train_idx]
         y_val = y[val_idx]
         lgb_all_pred, lgb_model_name, lgb_model_payload = self._fit_lightgbm(Xn_train_drop, y_train, Xn)
         lgb_mse = float(np.mean((lgb_all_pred[val_idx] - y_val) ** 2))
+        train_mode = str(LIQUID_MULTI_HORIZON_TRAIN_MODE).strip().lower()
+        horizon_models: Dict[str, Dict[str, Any]] = {}
+        meta_aggregator: Dict[str, Any] = {}
+        if train_mode in {"multi_model_meta", "multi_model", "per_horizon_submodels"}:
+            multi_model_pack = self._fit_horizon_models_with_meta(
+                Xn_train_drop=Xn_train_drop,
+                Xn_full=Xn,
+                train_idx=train_idx,
+                val_idx=val_idx,
+                y_by_horizon=y_by_horizon,
+                vol_targets=vol_targets,
+            )
+            horizon_models = dict(multi_model_pack.get("horizon_models") or {})
+            meta_aggregator = dict(multi_model_pack.get("meta_aggregator") or {})
+            # Keep backward compatibility: expose horizon heads even when trained as multi-model.
+            horizon_heads = {
+                h: {k: v for k, v in dict(item).items() if k != "model_type"}
+                for h, item in horizon_models.items()
+            }
+        else:
+            horizon_heads = self._fit_horizon_heads(
+                Xn_train_drop=Xn_train_drop,
+                Xn_full=Xn,
+                train_idx=train_idx,
+                val_idx=val_idx,
+                y_by_horizon=y_by_horizon,
+                vol_targets=vol_targets,
+            )
         wf_folds = walk_forward_slices(
             n_samples=n,
             train_window=VALIDATION_PROTOCOL.wf_train_window,
@@ -559,10 +774,10 @@ class LiquidModelTrainer:
                 prob=LIQUID_TEXT_DROPOUT_PROB,
                 seed=SEED + self.rank + int(fold_train_idx[0]) if fold_train_idx.size > 0 else SEED + self.rank,
             )
-            fold_pred, _, _ = self._fit_lightgbm(fold_x_train, y[fold_train_idx], Xn[fold_test_idx])
+            fold_pred, _, _ = self._fit_lightgbm(fold_x_train, y_by_horizon["1h"][fold_train_idx], Xn[fold_test_idx])
             wf_fold_metrics.append(
                 evaluate_regression_oos(
-                    y_true=y[fold_test_idx],
+                    y_true=y_by_horizon["1h"][fold_test_idx],
                     y_pred=fold_pred,
                     fee_bps=5.0,
                     slippage_bps=3.0,
@@ -588,10 +803,10 @@ class LiquidModelTrainer:
                 prob=LIQUID_TEXT_DROPOUT_PROB,
                 seed=SEED + self.rank + int(fold_train_idx[0]) if fold_train_idx.size > 0 else SEED + self.rank,
             )
-            fold_pred, _, _ = self._fit_lightgbm(fold_x_train, y[fold_train_idx], Xn[fold_test_idx])
+            fold_pred, _, _ = self._fit_lightgbm(fold_x_train, y_by_horizon["1h"][fold_train_idx], Xn[fold_test_idx])
             pkf_metrics_per_fold.append(
                 evaluate_regression_oos(
-                    y_true=y[fold_test_idx],
+                    y_true=y_by_horizon["1h"][fold_test_idx],
                     y_pred=fold_pred,
                     fee_bps=5.0,
                     slippage_bps=3.0,
@@ -814,6 +1029,13 @@ class LiquidModelTrainer:
                 "trained_at": created_at,
                 "seed": SEED,
                 "feature_dim": int(X.shape[1]),
+                "default_horizon": "1h",
+                "horizons": list(LIQUID_HORIZONS),
+                "multi_horizon_train_mode": str(LIQUID_MULTI_HORIZON_TRAIN_MODE),
+                "horizon_heads": horizon_heads,
+                "horizon_models": horizon_models,
+                "meta_aggregator": meta_aggregator,
+                "cost_config": dict((batch.sampling or {}).get("cost_config") or {}),
             }
             base_payload.update(lgb_model_payload)
             json.dump(base_payload, f)
@@ -860,6 +1082,10 @@ class LiquidModelTrainer:
             "wf_ready": wf_ready,
             "wf_metrics": wf_metrics,
             "purged_kfold": pkf_metrics,
+            "horizons": list(LIQUID_HORIZONS),
+            "multi_horizon_train_mode": str(LIQUID_MULTI_HORIZON_TRAIN_MODE),
+            "horizon_head_metrics": {h: dict((horizon_heads.get(h) or {}).get("metrics") or {}) for h in LIQUID_HORIZONS},
+            "meta_aggregator_metrics": dict((meta_aggregator or {}).get("metrics") or {}),
             "feature_dim": int(X.shape[1]),
             "samples": int(X.shape[0]),
             "created_at": created_at,
@@ -876,6 +1102,8 @@ class LiquidModelTrainer:
                 "requested_limit": int(self.train_limit),
                 "requested_max_samples": int(self.train_max_samples),
                 "requested_sample_mode": str(self.train_sample_mode),
+                "train_mode": str(self.train_mode),
+                "train_lookback_days": int(self.train_lookback_days),
                 "data_mode": str(self.train_data_mode),
                 "research_guardrails": research_guard,
             },
@@ -1020,8 +1248,10 @@ class LiquidModelTrainer:
             "ensemble_alpha": round(float(ensemble_alpha), 6),
             "ensemble_metrics": {k: round(float(v), 9) for k, v in ensemble_metrics.items()},
             "labels": {
-                "fwd_ret_1h_mean": round(float(np.mean(label_1h)), 9),
-                "fwd_ret_4h_mean": round(float(np.mean(label_4h)), 9),
+                "net_ret_1h_mean": round(float(np.mean(y_by_horizon["1h"])), 9),
+                "net_ret_4h_mean": round(float(np.mean(y_by_horizon["4h"])), 9),
+                "net_ret_1d_mean": round(float(np.mean(y_by_horizon["1d"])), 9),
+                "net_ret_7d_mean": round(float(np.mean(y_by_horizon["7d"])), 9),
             },
             "train_manifest_path": manifest_path,
             "train_report_hash": train_report_hash,

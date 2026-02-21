@@ -113,6 +113,12 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _table_exists(cur, table_name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s) AS reg", (f"public.{table_name}",))
+    row = cur.fetchone() or {}
+    return bool(row.get("reg"))
+
+
 def _social_manual_from_agg(rows: List[Dict[str, Any]], as_of_ts: datetime) -> Dict[str, float]:
     if not rows:
         return {}
@@ -257,48 +263,50 @@ def main() -> int:
             social_feat_map: Dict[str, List[Dict[str, Any]]] = {}
 
             if symbols:
-                cur.execute(
-                    """
-                    SELECT symbol, as_of_ts, latent
-                    FROM market_latent
-                    WHERE symbol = ANY(%s)
-                      AND as_of_ts >= %s
-                      AND as_of_ts <= %s
-                    ORDER BY symbol ASC, as_of_ts ASC
-                    """,
-                    (symbols, start_dt - timedelta(days=7), end_dt),
-                )
-                for row in cur.fetchall() or []:
-                    sym = str(row.get("symbol") or "").upper()
-                    ts = row.get("as_of_ts")
-                    if not sym or not isinstance(ts, datetime):
-                        continue
-                    market_ts_map.setdefault(sym, []).append(ts)
-                    market_vec_map.setdefault(sym, []).append(_to_list(row.get("latent")))
+                if _table_exists(cur, "market_latent"):
+                    cur.execute(
+                        """
+                        SELECT symbol, as_of_ts, latent
+                        FROM market_latent
+                        WHERE symbol = ANY(%s)
+                          AND as_of_ts >= %s
+                          AND as_of_ts <= %s
+                        ORDER BY symbol ASC, as_of_ts ASC
+                        """,
+                        (symbols, start_dt - timedelta(days=7), end_dt),
+                    )
+                    for row in cur.fetchall() or []:
+                        sym = str(row.get("symbol") or "").upper()
+                        ts = row.get("as_of_ts")
+                        if not sym or not isinstance(ts, datetime):
+                            continue
+                        market_ts_map.setdefault(sym, []).append(ts)
+                        market_vec_map.setdefault(sym, []).append(_to_list(row.get("latent")))
 
-                cur.execute(
-                    """
-                    SELECT as_of_ts, symbols, latent, agg_features
-                    FROM social_text_latent
-                    WHERE as_of_ts >= %s
-                      AND as_of_ts <= %s
-                    ORDER BY as_of_ts ASC
-                    """,
-                    (start_dt - timedelta(hours=6), end_dt),
-                )
-                for row in cur.fetchall() or []:
-                    ts = row.get("as_of_ts")
-                    syms = row.get("symbols")
-                    if not isinstance(ts, datetime) or not isinstance(syms, list):
-                        continue
-                    vec = _to_list(row.get("latent"))
-                    feat = _to_dict(row.get("agg_features"))
-                    for s in syms:
-                        sym = str(s or "").upper()
-                        if sym in symbols:
-                            social_ts_map.setdefault(sym, []).append(ts)
-                            social_vec_map.setdefault(sym, []).append(vec)
-                            social_feat_map.setdefault(sym, []).append({**feat, "_as_of_ts": ts})
+                if _table_exists(cur, "social_text_latent"):
+                    cur.execute(
+                        """
+                        SELECT as_of_ts, symbols, latent, agg_features
+                        FROM social_text_latent
+                        WHERE as_of_ts >= %s
+                          AND as_of_ts <= %s
+                        ORDER BY as_of_ts ASC
+                        """,
+                        (start_dt - timedelta(hours=6), end_dt),
+                    )
+                    for row in cur.fetchall() or []:
+                        ts = row.get("as_of_ts")
+                        syms = row.get("symbols")
+                        if not isinstance(ts, datetime) or not isinstance(syms, list):
+                            continue
+                        vec = _to_list(row.get("latent"))
+                        feat = _to_dict(row.get("agg_features"))
+                        for s in syms:
+                            sym = str(s or "").upper()
+                            if sym in symbols:
+                                social_ts_map.setdefault(sym, []).append(ts)
+                                social_vec_map.setdefault(sym, []).append(vec)
+                                social_feat_map.setdefault(sym, []).append({**feat, "_as_of_ts": ts})
 
             insert_rows = []
             for r in base_rows:

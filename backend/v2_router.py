@@ -73,6 +73,14 @@ from schemas_v2 import (
     VCPredictRequest,
 )
 from execution_engine import ExecutionEngine
+from execution_policy import build_execution_trace
+from portfolio_allocator import AllocatorSignal, allocate_targets
+from liquid_model_registry import get_candidate_model as get_liquid_candidate_model
+from liquid_model_registry import load_registry as load_liquid_registry
+from liquid_model_registry import promote_candidate as promote_liquid_candidate
+from liquid_model_registry import rollback_active as rollback_liquid_active
+from liquid_model_registry import upsert_active as upsert_liquid_active
+from liquid_model_registry import upsert_candidate as upsert_liquid_candidate
 from execution_api import (
     infer_execution_risk_positions as _executionapi_infer_execution_risk_positions,
     normalize_execution_payload as _executionapi_normalize_execution_payload,
@@ -1939,6 +1947,113 @@ def _strategy_bucket(track: str, score: float, confidence: float, target: str) -
     )
 
 
+def _parse_horizon_float_map(raw: str, defaults: Dict[str, float]) -> Dict[str, float]:
+    out = dict(defaults)
+    text = str(raw or "").strip()
+    if not text:
+        return out
+    for token in text.split(","):
+        part = token.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        key = str(k).strip().lower()
+        try:
+            val = float(v.strip())
+        except Exception:
+            continue
+        if key in out:
+            out[key] = float(val)
+    return out
+
+
+def _liquid_cost_profile(cost_profile: str, stack: Dict[str, Any]) -> Dict[str, float]:
+    cfg = stack.get("cost_config") if isinstance(stack.get("cost_config"), dict) else {}
+    multipliers = cfg.get("horizon_multipliers") if isinstance(cfg.get("horizon_multipliers"), dict) else {}
+    fee_bps = float(cfg.get("fee_bps", 5.0) or 5.0)
+    slippage_bps = float(cfg.get("slippage_bps", 3.0) or 3.0)
+    impact_base_bps = float(cfg.get("impact_base_bps", 2.0) or 2.0)
+    base_cost = max(0.0, (fee_bps + slippage_bps + impact_base_bps) / 10000.0)
+    defaults = {
+        "1h": base_cost * float(multipliers.get("1h", 1.0) if multipliers else 1.0),
+        "4h": base_cost * float(multipliers.get("4h", 1.6) if multipliers else 1.6),
+        "1d": base_cost * float(multipliers.get("1d", 2.4) if multipliers else 2.4),
+        "7d": base_cost * float(multipliers.get("7d", 3.2) if multipliers else 3.2),
+    }
+    env_key = f"SIGNAL_COST_PROFILE_{str(cost_profile or 'standard').strip().upper()}"
+    return _parse_horizon_float_map(os.getenv(env_key, ""), defaults)
+
+
+def _horizon_signal_thresholds() -> Dict[str, Dict[str, float]]:
+    score_defaults = {"1h": 0.20, "4h": 0.16, "1d": 0.10, "7d": 0.08}
+    conf_defaults = {"1h": 0.55, "4h": 0.52, "1d": 0.50, "7d": 0.48}
+    return {
+        "score_entry": _parse_horizon_float_map(os.getenv("SIGNAL_SCORE_ENTRY_BY_HORIZON", ""), score_defaults),
+        "confidence_min": _parse_horizon_float_map(os.getenv("SIGNAL_CONFIDENCE_MIN_BY_HORIZON", ""), conf_defaults),
+    }
+
+
+def _liquid_multi_horizon_signal(
+    *,
+    pred_outputs: Dict[str, Any],
+    horizon: str,
+    cost_profile: str,
+) -> Dict[str, Any]:
+    horizon_key = str(horizon or "1h").strip().lower() or "1h"
+    expected = pred_outputs.get("expected_return_horizons") if isinstance(pred_outputs.get("expected_return_horizons"), dict) else {}
+    conf = pred_outputs.get("signal_confidence_horizons") if isinstance(pred_outputs.get("signal_confidence_horizons"), dict) else {}
+    vol = pred_outputs.get("vol_forecast_horizons") if isinstance(pred_outputs.get("vol_forecast_horizons"), dict) else {}
+    if not expected:
+        expected = {"1h": float(pred_outputs.get("expected_return", 0.0) or 0.0)}
+    if not conf:
+        conf = {"1h": float(pred_outputs.get("signal_confidence", 0.0) or 0.0)}
+    if not vol:
+        vol = {"1h": float(pred_outputs.get("vol_forecast", 0.0) or 0.0)}
+    if horizon_key not in expected:
+        horizon_key = "1h" if "1h" in expected else sorted(expected.keys())[0]
+    costs = _liquid_cost_profile(cost_profile, pred_outputs.get("stack") if isinstance(pred_outputs.get("stack"), dict) else {})
+    thresholds = _horizon_signal_thresholds()
+    eps = max(1e-6, float(os.getenv("SIGNAL_VOL_EPS", "1e-4") or 1e-4))
+    edge_map: Dict[str, float] = {}
+    score_map: Dict[str, float] = {}
+    action_map: Dict[str, str] = {}
+    for h, ret in expected.items():
+        hh = str(h).strip().lower()
+        edge = float(ret or 0.0) - float(costs.get(hh, costs.get("1h", 0.0)))
+        vv = float(vol.get(hh, vol.get("1h", 0.0)) or 0.0)
+        sc = float(edge / max(vv, eps))
+        cf = float(conf.get(hh, conf.get("1h", 0.0)) or 0.0)
+        score_th = float(thresholds["score_entry"].get(hh, thresholds["score_entry"]["1h"]))
+        conf_th = float(thresholds["confidence_min"].get(hh, thresholds["confidence_min"]["1h"]))
+        if cf < conf_th:
+            act = "hold"
+        elif sc >= score_th:
+            act = "buy"
+        elif sc <= -score_th:
+            act = "sell"
+        else:
+            act = "hold"
+        edge_map[hh] = edge
+        score_map[hh] = sc
+        action_map[hh] = act
+    selected_score = float(score_map.get(horizon_key, 0.0))
+    selected_conf = float(conf.get(horizon_key, 0.0) or 0.0)
+    selected_action = str(action_map.get(horizon_key, "hold"))
+    return {
+        "selected_horizon": horizon_key,
+        "score": selected_score,
+        "confidence": selected_conf,
+        "action": selected_action,
+        "edge_horizons": edge_map,
+        "score_horizons": score_map,
+        "action_horizons": action_map,
+        "cost_horizons": costs,
+        "expected_return_horizons": {str(k).lower(): float(v) for k, v in expected.items()},
+        "signal_confidence_horizons": {str(k).lower(): float(v) for k, v in conf.items()},
+        "vol_forecast_horizons": {str(k).lower(): float(v) for k, v in vol.items()},
+    }
+
+
 def _ks_statistic(a: List[float], b: List[float]) -> float:
     return _driftops_ks_statistic(a, b)
 
@@ -2014,24 +2129,52 @@ async def predict_vc(payload: VCPredictRequest):
 async def predict_liquid(payload: LiquidPredictRequest):
     result = _build_liquid_prediction(payload.symbol, payload.horizon)
     outputs = result.get("outputs") if isinstance(result.get("outputs"), dict) else {}
+    mh = _liquid_multi_horizon_signal(
+        pred_outputs=outputs,
+        horizon=payload.horizon,
+        cost_profile="standard",
+    )
     prediction_id = repo.insert_prediction(
         track="liquid",
         target=payload.symbol.upper(),
-        score=result["score"],
-        confidence=result["confidence"],
-        outputs=result["outputs"],
+        score=float(mh["score"]),
+        confidence=float(mh["confidence"]),
+        outputs={
+            **outputs,
+            "expected_return_horizons": mh["expected_return_horizons"],
+            "signal_confidence_horizons": mh["signal_confidence_horizons"],
+            "vol_forecast_horizons": mh["vol_forecast_horizons"],
+            "score_horizons": mh["score_horizons"],
+            "edge_horizons": mh["edge_horizons"],
+            "cost_horizons": mh["cost_horizons"],
+            "selected_horizon": mh["selected_horizon"],
+        },
         explanation=result["explanation"],
         horizon=payload.horizon,
         feature_set_id=FEATURE_VERSION,
     )
 
+    compat_horizon = str(mh.get("selected_horizon") or "1h")
+    expected_h = dict(mh.get("expected_return_horizons") or {})
+    conf_h = dict(mh.get("signal_confidence_horizons") or {})
+    vol_h = dict(mh.get("vol_forecast_horizons") or {})
     return {
         "prediction_id": prediction_id,
         "track": "liquid",
         "target": payload.symbol.upper(),
-        "expected_return": float(outputs.get("expected_return") or 0.0),
-        "signal_confidence": float(outputs.get("signal_confidence") or 0.0),
-        "vol_forecast": float(outputs.get("vol_forecast") or 0.0),
+        # Multi-horizon primary fields.
+        "expected_return": expected_h,
+        "signal_confidence": conf_h,
+        "vol_forecast": vol_h,
+        # Backward-compatible scalar fields.
+        "expected_return_legacy": float(expected_h.get(compat_horizon, 0.0) or 0.0),
+        "signal_confidence_legacy": float(conf_h.get(compat_horizon, 0.0) or 0.0),
+        "vol_forecast_legacy": float(vol_h.get(compat_horizon, 0.0) or 0.0),
+        "score_horizons": dict(mh.get("score_horizons") or {}),
+        "edge_horizons": dict(mh.get("edge_horizons") or {}),
+        "cost_horizons": dict(mh.get("cost_horizons") or {}),
+        "action_horizons": dict(mh.get("action_horizons") or {}),
+        "selected_horizon": compat_horizon,
         "stack": dict(outputs.get("stack") or {}),
         "degraded": bool(outputs.get("degraded", False)),
         "degraded_reasons": list(outputs.get("degraded_reasons") or []),
@@ -2537,8 +2680,21 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
     score = float(pred["score"])
     confidence = float(pred["confidence"])
     pred_outputs = pred.get("outputs") if isinstance(pred.get("outputs"), dict) else {}
-    predicted_score = float(pred_outputs.get("expected_return", score) or score)
-    predicted_conf = float(pred_outputs.get("signal_confidence", confidence) or confidence)
+    if payload.track == "liquid":
+        mh = _liquid_multi_horizon_signal(
+            pred_outputs=pred_outputs,
+            horizon=payload.horizon,
+            cost_profile=payload.cost_profile,
+        )
+        score = float(mh["score"])
+        confidence = float(mh["confidence"])
+        action = str(mh["action"])
+        predicted_score = float(score)
+        predicted_conf = float(confidence)
+    else:
+        mh = {}
+        predicted_score = float(pred_outputs.get("expected_return", score) or score)
+        predicted_conf = float(pred_outputs.get("signal_confidence", confidence) or confidence)
     divergence = abs(score - predicted_score) + abs(confidence - predicted_conf)
     SIGNAL_PREDICT_DIVERGENCE.labels(track=payload.track, target=payload.target.upper()).set(float(divergence))
     bucket = _strategy_bucket(payload.track, score, confidence, payload.target)
@@ -2554,11 +2710,15 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
         score = round(0.7 * score + 0.3 * fast, 6)
         confidence = round(min(0.95, confidence + 0.03), 4)
 
-    if confidence >= payload.min_confidence:
-        if score > 0.01:
-            action = "buy"
-        elif score < -0.01:
-            action = "sell"
+    if payload.track == "liquid":
+        if confidence < float(payload.min_confidence):
+            action = "hold"
+    else:
+        if confidence >= payload.min_confidence:
+            if score > 0.01:
+                action = "buy"
+            elif score < -0.01:
+                action = "sell"
 
     reason = f"policy={payload.policy};model={model_name}:{model_version};score={round(score, 6)}"
     signal_id = repo.insert_signal_candidate(
@@ -2576,6 +2736,14 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
             "strategy_id": payload.strategy_id,
             "cost_profile": payload.cost_profile,
             "risk_profile": payload.risk_profile,
+            "score_horizons": dict(mh.get("score_horizons") or {}),
+            "edge_horizons": dict(mh.get("edge_horizons") or {}),
+            "cost_horizons": dict(mh.get("cost_horizons") or {}),
+            "action_horizons": dict(mh.get("action_horizons") or {}),
+            "selected_horizon": str(mh.get("selected_horizon") or payload.horizon),
+            "expected_return_horizons": dict(mh.get("expected_return_horizons") or {}),
+            "signal_confidence_horizons": dict(mh.get("signal_confidence_horizons") or {}),
+            "vol_forecast_horizons": dict(mh.get("vol_forecast_horizons") or {}),
         },
     )
 
@@ -2718,6 +2886,70 @@ async def check_model_rollback(payload: RollbackCheckRequest) -> RollbackCheckRe
         trigger_rule=f"consecutive_windows>={required_fails}",
         metrics=metrics,
     )
+
+
+@router.get("/models/liquid/registry")
+async def get_liquid_registry(symbol: str = Query("", description="optional symbol filter")):
+    reg = load_liquid_registry()
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return reg
+    symbols = reg.get("symbols") if isinstance(reg.get("symbols"), dict) else {}
+    return {
+        "status": reg.get("status", "ok"),
+        "updated_at": reg.get("updated_at"),
+        "symbol": sym,
+        "entry": symbols.get(sym, {}),
+    }
+
+
+@router.post("/models/liquid/registry/activate")
+async def activate_liquid_registry(payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    horizon = str(payload.get("horizon") or "1h").strip().lower()
+    model_name = str(payload.get("model_name") or "").strip()
+    model_version = str(payload.get("model_version") or "").strip()
+    actor = str(payload.get("operator") or "manual")
+    if not symbol or not model_name or not model_version:
+        raise HTTPException(status_code=400, detail="symbol/model_name/model_version required")
+    out = upsert_liquid_active(symbol=symbol, horizon=horizon, model_name=model_name, model_version=model_version, actor=actor)
+    return {"status": "ok", "symbol": symbol, "horizon": horizon, "entry": out}
+
+
+@router.post("/models/liquid/registry/candidate")
+async def set_liquid_registry_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    horizon = str(payload.get("horizon") or "1h").strip().lower()
+    model_name = str(payload.get("model_name") or "").strip()
+    model_version = str(payload.get("model_version") or "").strip()
+    actor = str(payload.get("operator") or "manual")
+    if not symbol or not model_name or not model_version:
+        raise HTTPException(status_code=400, detail="symbol/model_name/model_version required")
+    out = upsert_liquid_candidate(symbol=symbol, horizon=horizon, model_name=model_name, model_version=model_version, actor=actor)
+    cand = get_liquid_candidate_model(symbol=symbol, horizon=horizon)
+    return {"status": "ok", "symbol": symbol, "horizon": horizon, "candidate": cand, "entry": out}
+
+
+@router.post("/models/liquid/registry/promote-candidate")
+async def promote_liquid_registry_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    horizon = str(payload.get("horizon") or "1h").strip().lower()
+    actor = str(payload.get("operator") or "manual")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol required")
+    out = promote_liquid_candidate(symbol=symbol, horizon=horizon, actor=actor)
+    return {"status": "ok", "symbol": symbol, "horizon": horizon, **out}
+
+
+@router.post("/models/liquid/registry/rollback")
+async def rollback_liquid_registry(payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    horizon = str(payload.get("horizon") or "1h").strip().lower()
+    actor = str(payload.get("operator") or "manual")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol required")
+    out = rollback_liquid_active(symbol=symbol, horizon=horizon, actor=actor)
+    return {"status": "ok", "symbol": symbol, "horizon": horizon, **out}
 
 
 @router.post("/models/parity/check")
@@ -2940,57 +3172,98 @@ async def portfolio_rebalance(payload: PortfolioRebalanceRequest) -> PortfolioRe
     if kill_block:
         raise HTTPException(status_code=423, detail=kill_block)
 
-    raw: List[Tuple[str, str, float, str]] = []
-    sizing_cfg = _position_sizing_settings()
-    for sig in payload.signals:
-        side = 0.0
-        if sig.action == "buy":
-            side = 1.0
-        elif sig.action == "sell":
-            side = -1.0
-        vol_bucket = _target_vol_bucket(sig.target)
-        est_cost_bps = 8.0 if sig.track == "liquid" else 12.0
-        size = _score_to_size(
-            float(sig.score),
-            float(sig.confidence),
-            est_cost_bps=est_cost_bps,
-            vol_bucket=vol_bucket,
-            sizing_cfg=sizing_cfg,
-        )
-        strength = side * size
-        bucket = _strategy_bucket(sig.track, float(sig.score), float(sig.confidence), sig.target)
-        raw.append((sig.target.upper(), sig.track, strength, bucket))
-
-    gross_strength = sum(abs(x[2]) for x in raw)
-    if gross_strength <= 0:
-        raise HTTPException(status_code=400, detail="no actionable signals")
-
-    bucket_caps = _bucket_limits()
+    allocator_mode = str(os.getenv("PORTFOLIO_ALLOCATOR_MODE", "allocator_v2")).strip().lower() or "allocator_v2"
     target_positions: List[RebalancePosition] = []
-    pre_bucket_exposure: Dict[str, float] = {}
-    for target, track, strength, bucket in raw:
-        weight = (strength / gross_strength) * payload.risk_budget
-        if abs(weight) < sizing_cfg["exit_z"]:
-            weight = 0.0
-        pre_bucket_exposure[bucket] = pre_bucket_exposure.get(bucket, 0.0) + abs(weight)
-        target_positions.append(RebalancePosition(target=target, track=track, weight=weight, style_bucket=bucket))
-
     bucket_violations: List[str] = []
-    for bucket, exposure in pre_bucket_exposure.items():
-        cap = payload.risk_budget * bucket_caps.get(bucket, 1.0)
-        if cap > 0 and exposure > cap:
-            scale = cap / exposure
-            bucket_violations.append(f"bucket_exposure_exceeded:{bucket}")
-            target_positions = [
-                RebalancePosition(
-                    target=p.target,
-                    track=p.track,
-                    weight=(p.weight * scale if p.style_bucket == bucket else p.weight),
-                    sector=p.sector,
-                    style_bucket=p.style_bucket,
+    allocator_meta: Dict[str, Any] = {}
+    if allocator_mode == "legacy":
+        raw: List[Tuple[str, str, float, str]] = []
+        sizing_cfg = _position_sizing_settings()
+        for sig in payload.signals:
+            side = 0.0
+            if sig.action == "buy":
+                side = 1.0
+            elif sig.action == "sell":
+                side = -1.0
+            vol_bucket = _target_vol_bucket(sig.target)
+            est_cost_bps = 8.0 if sig.track == "liquid" else 12.0
+            size = _score_to_size(
+                float(sig.score),
+                float(sig.confidence),
+                est_cost_bps=est_cost_bps,
+                vol_bucket=vol_bucket,
+                sizing_cfg=sizing_cfg,
+            )
+            strength = side * size
+            bucket = _strategy_bucket(sig.track, float(sig.score), float(sig.confidence), sig.target)
+            raw.append((sig.target.upper(), sig.track, strength, bucket))
+
+        gross_strength = sum(abs(x[2]) for x in raw)
+        if gross_strength <= 0:
+            raise HTTPException(status_code=400, detail="no actionable signals")
+
+        bucket_caps = _bucket_limits()
+        pre_bucket_exposure: Dict[str, float] = {}
+        for target, track, strength, bucket in raw:
+            weight = (strength / gross_strength) * payload.risk_budget
+            if abs(weight) < sizing_cfg["exit_z"]:
+                weight = 0.0
+            pre_bucket_exposure[bucket] = pre_bucket_exposure.get(bucket, 0.0) + abs(weight)
+            target_positions.append(RebalancePosition(target=target, track=track, weight=weight, style_bucket=bucket))
+
+        for bucket, exposure in pre_bucket_exposure.items():
+            cap = payload.risk_budget * bucket_caps.get(bucket, 1.0)
+            if cap > 0 and exposure > cap:
+                scale = cap / exposure
+                bucket_violations.append(f"bucket_exposure_exceeded:{bucket}")
+                target_positions = [
+                    RebalancePosition(
+                        target=p.target,
+                        track=p.track,
+                        weight=(p.weight * scale if p.style_bucket == bucket else p.weight),
+                        sector=p.sector,
+                        style_bucket=p.style_bucket,
+                    )
+                    for p in target_positions
+                ]
+    else:
+        sig_inputs: List[AllocatorSignal] = []
+        for sig in payload.signals:
+            bucket = _strategy_bucket(sig.track, float(sig.score), float(sig.confidence), sig.target)
+            sig_inputs.append(
+                AllocatorSignal(
+                    target=sig.target.upper(),
+                    track=sig.track,
+                    horizon=sig.horizon,
+                    action=sig.action,
+                    score=float(sig.score),
+                    confidence=float(sig.confidence),
+                    strategy_bucket=bucket,
                 )
-                for p in target_positions
-            ]
+            )
+        alloc = allocate_targets(
+            signals=sig_inputs,
+            risk_budget=float(payload.risk_budget),
+            load_price_history=lambda target, lookback_days: repo.load_price_history(target, lookback_days=lookback_days),
+        )
+        weights = dict(alloc.get("weights") or {})
+        allocator_meta = alloc
+        if not weights:
+            raise HTTPException(status_code=400, detail="no actionable signals")
+        for sig in sig_inputs:
+            if sig.target not in weights:
+                continue
+            # One target appears once in output position; preserve a representative bucket label for attribution.
+            if any(p.target == sig.target for p in target_positions):
+                continue
+            target_positions.append(
+                RebalancePosition(
+                    target=sig.target,
+                    track=sig.track,  # type: ignore[arg-type]
+                    weight=float(weights.get(sig.target, 0.0) or 0.0),
+                    style_bucket=f"{sig.strategy_bucket}:{sig.horizon}",
+                )
+            )
 
     adjusted, violations, gross, turnover = _evaluate_risk(
         proposed=target_positions,
@@ -3021,7 +3294,11 @@ async def portfolio_rebalance(payload: PortfolioRebalanceRequest) -> PortfolioRe
                 "est_price": est_price,
                 "est_cost_bps": 8.0,
                 "status": "simulated",
-                "metadata": {"weight_delta": delta},
+                "metadata": {
+                    "weight_delta": delta,
+                    "allocator_mode": allocator_mode,
+                    "allocator_contributions": (allocator_meta.get("contributions") or {}).get(target, {}),
+                },
             }
         )
 
@@ -3043,6 +3320,12 @@ async def portfolio_rebalance(payload: PortfolioRebalanceRequest) -> PortfolioRe
         orders=orders,
         risk_ok=len(violations) == 0,
         risk_violations=violations,
+        allocator_details={
+            "mode": allocator_mode,
+            "bucket_exposure": dict(allocator_meta.get("bucket_exposure") or {}),
+            "raw_strength": dict(allocator_meta.get("raw_strength") or {}),
+            "dedupe_factor": dict(allocator_meta.get("dedupe_factor") or {}),
+        },
     )
 
 
@@ -3273,6 +3556,7 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
     merged = []
     for order, res in zip(scaled_orders, results):
         normalized_res = _normalize_execution_payload(res)
+        exec_trace = build_execution_trace(order, normalized_res)
         status = str(normalized_res.get("status") or "rejected")
         EXECUTION_ORDERS_TOTAL.labels(adapter=payload.adapter, status=status).inc()
         if status in {"filled", "partially_filled"}:
@@ -3285,8 +3569,23 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
             reason_raw = str(normalized_res.get("reject_reason") or "").lower()
             if reason_cat == "other" and "bitget" in reason_raw:
                 BITGET_UNCLASSIFIED_ERRORS_TOTAL.labels(adapter=payload.adapter).inc()
-        repo.update_order_execution(order["id"], status=status, metadata={"execution": normalized_res})
-        merged.append({**order, "execution": normalized_res})
+        repo.update_order_execution(
+            order["id"],
+            status=status,
+            metadata={
+                "execution": normalized_res,
+                "execution_trace": exec_trace,
+                "execution_policy": str(normalized_res.get("execution_policy") or ""),
+            },
+        )
+        merged.append(
+            {
+                **order,
+                "execution": normalized_res,
+                "execution_trace": exec_trace,
+                "execution_policy": str(normalized_res.get("execution_policy") or ""),
+            }
+        )
 
     resp = ExecuteOrdersResponse(
         decision_id=payload.decision_id,

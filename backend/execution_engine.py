@@ -18,6 +18,8 @@ try:
 except Exception:
     jwt = None
 
+from execution_policy import resolve_order_execution_context
+
 
 class PaperExecutionAdapter:
     def __init__(self, reject_rate: float = 0.0, partial_fill_rate: float = 0.35):
@@ -811,4 +813,11 @@ class ExecutionEngine:
         exec_adapter = self.adapters.get(adapter)
         if not exec_adapter:
             raise ValueError(f"unsupported adapter: {adapter}")
-        return [exec_adapter.execute(o, context=context) for o in orders]
+        out: List[Dict] = []
+        for o in orders:
+            merged_context = resolve_order_execution_context(o, context or {})
+            res = exec_adapter.execute(o, context=merged_context)
+            if isinstance(res, dict):
+                res = {**res, "execution_policy": str(merged_context.get("execution_policy") or "")}
+            out.append(res)
+        return out

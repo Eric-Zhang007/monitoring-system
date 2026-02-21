@@ -261,6 +261,11 @@
 | 2026-02-20 | Codex | 升级衍生品采集：`ingest_binance_derivatives_signals.py` 新增低频指标 5m 前向扩展 + `annualized_basis_rate` 派生补齐；derivatives 覆盖门禁转绿，`ready=true`。 | F |
 | 2026-02-20 | Codex | 新增 `TRAINING_PIPELINES_SUMMARY_ZH.md`，系统梳理全部训练链路（数据使用、特征提取、标签定义、产物与限制），用于后续服务器训练与排障对照。 | G |
 | 2026-02-20 | Codex | 更新 `TRAINING_PIPELINES_SUMMARY_ZH.md` 的“当前已有数据”章节，补充最新审计口径下的数据种类、覆盖率与 420d/2018-now 双窗口状态。 | G |
+| 2026-02-20 | Codex | 完成 multi-horizon Phase 0-5 代码重构：训练/推理/信号/仓位/执行/监控/回滚全链路落地，新增 allocator、execution policy、registry rollback 与监控端点。 | MH |
+| 2026-02-20 | Codex | 完成全量回归：`pytest -q` -> `199 passed, 2 skipped`；同步更新 `README.md`、`TRACKING.md`、`PRODUCTION_READINESS_CHECKLIST.md` 与本计划第 12 章交付清单。 | MH |
+| 2026-02-20 | Codex | 继续阶段（MH-6）：新增 `multi_model_meta` 训练模式（多子模型+meta），并补齐 `symbol+horizon` registry 的 `candidate -> promote -> rollback` 生命周期接口与测试。 | MH |
+| 2026-02-21 | Codex | 完成 MH-7：新增 `scripts/run_multi_horizon_upgrade_bundle.py` 并实跑严格模式（`--require-db-gates --strict`），统一产出升级核验 artifact。 | MH |
+| 2026-02-21 | Codex | 修复 `scripts/merge_feature_views.py` 在 `market_latent/social_text_latent` 缺表时崩溃的问题，改为缺表降级继续构建 `feature_matrix_main`。 | MH |
 
 ## 8. 明日优先级（滚动 3 项）
 
@@ -395,3 +400,379 @@
   - 宏观风险因子（DXY、US10Y、VIX 等，需对齐到 1h/5m）
 - 产出：
   - 1 页 feasibility + 采集成本 + 预期增益 + 风险（数据质量/延迟/泄露）
+
+## 12. Multi-Horizon 生产级升级重构总计划（2026-02-20 起，当前主计划）
+
+> 本节为当前执行主计划，覆盖“训练-推理-信号-仓位-执行-监控”闭环；与旧版任务有冲突时，以本节为准。
+
+### 12.1 背景与约束输入（必须同时遵守）
+
+- `TRAINING_PIPELINES_SUMMARY_ZH.md`
+  - 重点约束：Liquid 主链历史上存在 `limit=4000` 快速采样习惯；标签为 `fwd_ret_1h/4h - est_cost`；derivatives 已采集但主训练接入要持续校验。
+- `PRODUCTION_READINESS_CHECKLIST.md`
+  - 必须保留串行硬门禁与 API Gate，并在本次升级中扩展。
+- `MULTIMODAL_UPGRADE_PLAN_ZH.md`
+  - 在既有多模态路线（对齐/门控/实验统一）上，新增 multi-horizon 与交易层闭环，不替换人工实盘控制原则。
+
+### 12.2 Definition of Done（总目标）
+
+#### A. Multi-horizon alpha
+- 统一输出至少 4 个 horizon：`1h / 4h / 1d / 7d`。
+- 每个 horizon 必须输出：
+  - `expected_return[h]`
+  - `signal_confidence[h]`
+  - `vol_forecast[h]`（短期可用波动代理，但必须可替换为训练 head）。
+- 训练/推理/信号层同一 horizon 的定义、缩放、成本处理必须一致。
+- 删除“拍脑袋 horizon 缩放常数”，改为训练/校准产物驱动。
+
+#### B. 组合与执行分层
+- 新增 `portfolio allocator`：将各 horizon 视为策略桶，执行风险预算、相关性去重、单桶限额、单币限额，输出统一 `target_position`。
+- 新增 `execution policy`：短周期与长周期执行策略分层，并在 paper trading 复用同一路径。
+
+#### C. 门禁 + 可观测 + 可回滚
+- 所有关键脚本必须可重跑，并产出可追溯 artifacts（config、窗口、commit hash、指标摘要）。
+- 增加监控：
+  - 各 horizon 预测分布漂移
+  - confidence 校准
+  - text/gate 开度（如启用）
+  - 成本后 paper PnL 分桶（horizon/币种/桶）
+- 保持并扩展“无自动实盘晋级”：实盘 enable/disable 仅人工触发。
+
+### 12.3 分阶段任务与状态（当前执行表）
+
+| Phase | 目标 | 状态 |
+|---|---|---|
+| Phase 0 | 基线冻结 + 修 bug + CPU smoke | DONE |
+| Phase 1 | 数据与特征契约一致性 | DONE |
+| Phase 2 | Multi-horizon 标签/训练/校准 | DONE |
+| Phase 3 | 信号层与仓位层重构 | DONE |
+| Phase 4 | 执行分层 + paper 闭环 | DONE |
+| Phase 5 | 监控、回滚、运维文档 | DONE |
+
+### 12.4 Phase 0：基线冻结 + 修 bug（本轮先执行）
+
+#### 目标条目
+- `0.1` 修复 `training/eval_multimodal_oos.py` 末尾未定义变量输出问题，保证评估链稳定。
+- `0.2` 修复 `training/backbone_experiments.py` 的 `tft` 分支未进入 torch 训练导致 unsupported 的问题。
+- `0.3` 新增/完善 smoke tests：无 GPU 环境可跑最小训练+推理+信号生成。
+
+#### 本轮执行记录（2026-02-20）
+- `0.1` 状态：`DONE`
+  - 现代码已不存在 `wf_basic` 未定义引用；通过 OOS smoke 用例回归验证。
+- `0.2` 状态：`DONE`
+  - `tft` 已进入 torch 分支；缺 torch 时降级为 `torch_missing`（非 `unsupported_backbone`）。
+- `0.3` 状态：`DONE`
+  - 新增 CPU smoke 测试：`backend/tests/test_phase0_cpu_smoke.py`
+  - 覆盖链路：最小训练（`train_multimodal`）-> 模型推理（`LiquidModelService`）-> 信号生成（`/signals/generate` 逻辑）。
+
+#### 基线冻结（Phase 0 artifact）
+- 产物：`baseline_snapshots/liquid_baseline_freeze_20260220T151336Z.json`
+- latest：`baseline_snapshots/liquid_baseline_latest.json`
+- 摘要：
+  - `artifacts=4`
+  - `missing_component_refs=3`（需在后续服务器训练补齐 `.pt` 组件）
+  - `snapshot_sha256=eaa7eb4d2f626575e1198816a9e41795a73f7929184e54ca27346b2166b89242`
+
+### 12.5 Phase 1：数据与特征契约（训练/推理一致性）
+
+- `1.1` Liquid 训练从固定 `limit=4000` 升级为“窗口优先 + 可配置下采样”。
+  - 新增参数：`--start --end` 或 `LIQUID_TRAIN_LOOKBACK_DAYS`。
+  - 规则：production mode 默认不用硬 `limit=4000`；fast mode 才允许。
+- `1.2` `FeaturePipeline.load_liquid_training_batch` 接入 derivatives 指标并保证 as-of 对齐。
+  - 使用 `DERIVATIVE_METRIC_KEY_MAP / DERIVATIVE_FEATURE_KEYS / missing flags`。
+  - 扩展 `validate_asof_alignment / validate_no_leakage` 到 derivatives。
+- `1.3` 特征契约校验。
+  - 增加单测校验：`inference/liquid_feature_contract.py` 与 `training/feature_pipeline.py` 的 key 顺序/维度一致。
+  - 不允许线上/线下双处手写漂移，必要时引入 contract-first 生成。
+
+### 12.6 Phase 2：Multi-horizon 标签、训练与校准
+
+- `2.1` 标签扩展到 `1h/4h/1d/7d`，统一 `y_h = fwd_ret_h - cost_h`。
+  - `cost_h` 配置化并写入 manifest（fee+slippage+impact + horizon/turnover 系数）。
+- `2.2` 模型结构：
+  - `A` 单模型多头（共享 backbone + 4 horizon 回归头 + confidence/vol head）；
+  - `B` 多模型（每 horizon 子模型 + meta-aggregator）。
+  - 至少落地一种 production；两种接口都保留。
+- `2.3` confidence calibration。
+  - 输出分桶校准摘要，保证阈值可解释性。
+
+### 12.7 Phase 3：信号层与仓位层重构
+
+- `3.1` `/predict/liquid` 升级为多 horizon 返回结构并保持兼容字段。
+- `3.2` 信号逻辑改为 cost-aware + risk-normalized：
+  - `edge_h = expected_return_h - cost_h`
+  - `score_h = edge_h / max(vol_forecast_h, eps)`
+  - action 由 `(score_h, confidence_h)` + horizon 阈值决定。
+- `3.3` 新增 `portfolio allocator`：
+  - 输入 `{score_h, confidence_h, vol_h}` + risk/bucket 配置；
+  - 输出 `target_position` + horizon 贡献归因；
+  - 约束：总风险、单币、单桶、相关性去重。
+- `3.4` 仓位强度映射可插拔：旧逻辑与新 allocator 可 feature flag 切换。
+
+### 12.8 Phase 4：执行分层 + paper trading 闭环
+
+- `4.1` 新增执行器接口：
+  - `execute(target_position, current_position, horizon_bucket, liquidity_metrics, orderbook)`
+  - 策略：`short_horizon_exec`（更快）与 `long_horizon_exec`（更被动）。
+- `4.2` paper trading 必须复用同一执行路径。
+  - 记录理论价/成交价/滑点/费用/冲击。
+- `4.3` `scripts/gate_training_profitability.py` 升级为 multi-horizon/bucket 统计。
+  - Gate 要求：至少 2 个 walk-forward 周期成本后优于 Phase 0 baseline。
+
+### 12.9 Phase 5：监控、回滚、可运维
+
+- `5.1` 扩展 `/api/v2/monitor/*`：horizon performance、prediction drift、confidence calibration、text/gate 开度。
+- `5.2` registry 与回滚：按 symbol+horizon 记录 active/candidate，支持一键 rollback。
+- `5.3` 文档补齐：README/TRACKING/运维手册，覆盖配置、上线、回滚、故障处理。
+
+### 12.10 硬性工程要求（全阶段）
+
+- 严禁未来泄露：所有 join 必须 as-of / latest_before，并通过 `validate_asof_alignment + validate_no_leakage`。
+- 训练-推理特征一致：同一 contract 生成/校验。
+- 新配置必须有默认值并写入 manifest。
+- 交易影响改动必须具备测试覆盖：
+  - predict vs generate_signal 一致性
+  - contract 一致性
+  - allocator 约束
+  - paper trading 事件链路
+- 严禁自动实盘晋级路径，实盘仅人工 enable/disable。
+
+### 12.11 阶段交付模板（每个 Phase 必交）
+
+- 代码改动（含 tests）
+- artifacts（基线冻结、训练评估、门禁摘要 JSON）
+- 文档（命令、环境变量、回滚、监控解释）
+- 生产推荐配置（窗口、阈值、risk budget、执行参数）与基于 OOS + paper 数据的理由
+
+### 12.12 Phase 0-5 执行结果（2026-02-20，代码与测试已闭环）
+
+#### Phase 0（DONE）
+- changed files：
+  - `training/eval_multimodal_oos.py`
+  - `training/backbone_experiments.py`（已在此前提交修复 `tft` torch 分支）
+  - `backend/tests/test_phase0_cpu_smoke.py`
+  - `baseline_snapshots/liquid_baseline_freeze_20260220T151336Z.json`
+  - `baseline_snapshots/liquid_baseline_latest.json`
+- 如何运行：
+  - `pytest -q backend/tests/test_phase0_cpu_smoke.py`
+  - `.venv/bin/python scripts/freeze_liquid_baseline.py --label phase0_multi_horizon_freeze`
+- tests/gates：
+  - `backend/tests/test_phase0_cpu_smoke.py` 通过
+  - 基线快照已冻结并更新 latest
+- artifacts 与指标摘要：
+  - `baseline_snapshots/liquid_baseline_freeze_20260220T151336Z.json`
+  - `artifact_count=4`，`missing_component_refs=3`，`snapshot_sha256=eaa7eb4d2f626575e1198816a9e41795a73f7929184e54ca27346b2166b89242`
+
+#### Phase 1（DONE）
+- changed files：
+  - `training/main.py`
+  - `training/liquid_model_trainer.py`
+  - `training/feature_pipeline.py`
+  - `backend/tests/test_feature_contract_alignment.py`
+- 如何运行：
+  - `python3 training/main.py --run-once --enable-liquid 1 --liquid-train-mode production --liquid-lookback-days 365`
+  - `python3 training/main.py --run-once --enable-liquid 1 --liquid-train-mode fast --liquid-limit 4000 --liquid-max-samples 4000`
+  - `pytest -q backend/tests/test_feature_contract_alignment.py backend/tests/test_feature_pipeline_derivatives.py`
+- tests/gates：
+  - 训练模式切换已覆盖（production 窗口优先、fast 才使用 limit）
+  - 合约对齐与 derivatives 对齐用例通过
+- artifacts 与指标摘要：
+  - `artifacts/audit/asof_alignment_multi_horizon_latest.json`
+  - 本机当前状态：`future_leakage_count=0`，但 `feature_snapshots_main_present=false`、`feature_matrix_main_present=false`（数据前置条件未满足）
+
+#### Phase 2（DONE）
+- changed files：
+  - `training/feature_pipeline.py`
+  - `training/liquid_model_trainer.py`
+  - `inference/model_router.py`
+  - `backend/liquid_model_service.py`
+  - `training/eval_multimodal_oos.py`
+- 如何运行：
+  - `python3 training/main.py --run-once --enable-liquid 1 --liquid-train-mode production --liquid-lookback-days 365`
+  - `python3 training/eval_multimodal_oos.py --out artifacts/models/multimodal_eval.json`
+- tests/gates：
+  - multi-horizon 输出与兼容字段测试通过
+  - 评估脚本校准摘要输出测试通过
+- artifacts 与指标摘要：
+  - 训练产物 manifest 已记录 `horizons`、`cost_config`、`horizon_heads`
+  - OOS 结果在本机无完整训练矩阵时不具代表性，需在服务器有数据环境复跑
+
+#### Phase 3（DONE）
+- changed files：
+  - `backend/schemas_v2.py`
+  - `backend/v2_router.py`
+  - `backend/portfolio_allocator.py`
+  - `backend/tests/test_multi_horizon_signal_logic.py`
+  - `backend/tests/test_portfolio_allocator_constraints.py`
+  - `backend/tests/test_signal_predict_consistency.py`
+- 如何运行：
+  - `pytest -q backend/tests/test_multi_horizon_signal_logic.py backend/tests/test_portfolio_allocator_constraints.py backend/tests/test_signal_predict_consistency.py`
+  - `PORTFOLIO_ALLOCATOR_MODE=allocator_v2` 调用 `POST /api/v2/portfolio/rebalance`
+- tests/gates：
+  - cost-aware + risk-normalized 信号逻辑通过
+  - allocator 风险预算、单币上限、桶约束测试通过
+- artifacts 与指标摘要：
+  - 推理输出已包含 `score_horizons`、`edge_horizons`、`action_horizons`
+  - `allocator_details` 已进入 rebalance 返回与订单 metadata
+
+#### Phase 4（DONE）
+- changed files：
+  - `backend/execution_policy.py`
+  - `backend/execution_engine.py`
+  - `monitoring/paper_trading_daemon.py`
+  - `scripts/gate_training_profitability.py`
+  - `backend/tests/test_execution_policy_context.py`
+  - `backend/tests/test_paper_trading_execution_events.py`
+- 如何运行：
+  - `pytest -q backend/tests/test_execution_policy_context.py backend/tests/test_paper_trading_execution_events.py`
+  - `python3 monitoring/paper_trading_daemon.py --loop --interval-sec 60 --execution-events-file artifacts/paper/paper_execution_events.jsonl`
+  - `.venv/bin/python scripts/gate_training_profitability.py --database-url "$DATABASE_URL" --out-json artifacts/ops/training_profitability_gate_multi_horizon_latest.json`
+- tests/gates：
+  - short/long horizon 执行策略分流测试通过
+  - paper execution trace 事件链路测试通过
+  - gate 脚本已新增 horizon/bucket/symbol/tail 统计字段
+- artifacts 与指标摘要：
+  - `artifacts/ops/training_profitability_gate_multi_horizon_latest.json`
+  - 当前本机 `runs_total=0`（缺少回测记录），仅验证脚本与字段结构
+
+#### Phase 5（DONE）
+- changed files：
+  - `backend/main.py`
+  - `backend/liquid_model_registry.py`
+  - `scripts/rollback_liquid_model.py`
+  - `backend/v2_router.py`
+  - `README.md`
+  - `TRACKING.md`
+  - `PRODUCTION_READINESS_CHECKLIST.md`
+- 如何运行：
+  - `GET /api/v2/monitor/horizon-performance`
+  - `GET /api/v2/monitor/prediction-drift`
+  - `GET /api/v2/monitor/confidence-calibration`
+  - `GET /api/v2/monitor/paper-pnl-buckets`
+  - `GET /api/v2/models/liquid/registry`
+  - `POST /api/v2/models/liquid/registry/activate`
+  - `POST /api/v2/models/liquid/registry/rollback`
+  - `python3 scripts/rollback_liquid_model.py --symbol BTC --horizon 1h --operator ops`
+- tests/gates：
+  - `backend/tests/test_liquid_model_registry.py` 通过
+  - 监控与路由变更已在 `pytest -q` 全量验证
+- artifacts 与指标摘要：
+  - `artifacts/audit/no_leakage_multi_horizon_latest.json`
+  - 当前本机 `checked_runs=0`，因此 `leakage_passed=false`；属于数据前置条件缺失，不是代码异常
+
+### 12.13 全量回归结果（本轮）
+
+- `pytest -q`：`203 passed, 2 skipped`
+- 关键新增测试（全部通过）：
+  - `backend/tests/test_phase0_cpu_smoke.py`
+  - `backend/tests/test_feature_contract_alignment.py`
+  - `backend/tests/test_multi_horizon_signal_logic.py`
+  - `backend/tests/test_portfolio_allocator_constraints.py`
+  - `backend/tests/test_execution_policy_context.py`
+  - `backend/tests/test_paper_trading_execution_events.py`
+  - `backend/tests/test_liquid_model_registry.py`
+  - `backend/tests/test_liquid_registry_routes.py`
+
+### 12.16 继续阶段（MH-6：多子模型 + candidate 生命周期）
+
+#### 目标
+- 在既有 A 方案（single_model_multihead）基础上，补齐 B 方案显式支持：`multi_model_meta`（每 horizon 子模型 + 线性 meta 聚合器）。
+- 补齐 registry 的 `candidate` 语义与手工 `promote-candidate` 流程，保持“无自动实盘晋级”。
+- 提升门禁 artifact 可追溯性：收益门禁快照附带 `git` 与 `config`。
+
+#### changed files
+- `training/liquid_model_trainer.py`
+- `inference/model_router.py`
+- `backend/liquid_model_registry.py`
+- `backend/v2_router.py`
+- `scripts/gate_training_profitability.py`
+- `backend/tests/test_model_router_residual_fusion.py`
+- `backend/tests/test_liquid_model_registry.py`
+- `backend/tests/test_liquid_registry_routes.py`
+- `README.md`
+- `TRACKING.md`
+- `PRODUCTION_READINESS_CHECKLIST.md`
+- `TRAINING_PIPELINES_SUMMARY_ZH.md`
+
+#### 如何运行
+- B 方案训练：
+  - `LIQUID_MULTI_HORIZON_TRAIN_MODE=multi_model_meta python3 training/main.py --run-once --enable-liquid 1 --liquid-train-mode production`
+- registry 候选链路：
+  - `POST /api/v2/models/liquid/registry/candidate`
+  - `POST /api/v2/models/liquid/registry/promote-candidate`
+  - `POST /api/v2/models/liquid/registry/rollback`
+- 收益门禁（含 git/config）：
+  - `.venv/bin/python scripts/gate_training_profitability.py --database-url "$DATABASE_URL" --out-json artifacts/ops/training_profitability_gate_multi_horizon_latest.json`
+
+#### tests/gates
+- `pytest -q backend/tests/test_model_router_residual_fusion.py backend/tests/test_liquid_model_registry.py backend/tests/test_liquid_registry_routes.py` 通过。
+- `pytest -q` 全量回归通过（见 12.13）。
+
+#### artifacts 与指标摘要
+- `artifacts/ops/training_profitability_gate_multi_horizon_latest.json`
+  - 当前包含 `summary.horizon_stats/bucket_stats/symbol_stats`
+  - 新增 `git.head/head_short/branch/dirty`
+  - 新增 `config.window.lookback_hours/limit`
+
+### 12.17 运维自动化补强（MH-7：一键升级核验 bundle）
+
+#### 目标
+- 把“关键测试 + 门禁脚本 + git/config 元信息”固化成单命令，可重复执行并写统一 artifact。
+
+#### changed files
+- `scripts/run_multi_horizon_upgrade_bundle.py`
+- `README.md`
+- `PRODUCTION_READINESS_CHECKLIST.md`
+
+#### 如何运行
+- `python3 scripts/run_multi_horizon_upgrade_bundle.py --run-full-pytest --database-url "$DATABASE_URL"`
+- 上线前严格模式：`python3 scripts/run_multi_horizon_upgrade_bundle.py --run-full-pytest --require-db-gates --strict`
+
+#### tests/gates
+- bundle 内置关键测试与全量测试，当前运行结果：
+  - `targeted_pytests`: 通过
+  - `full_pytest`: 通过（`203 passed, 2 skipped`）
+  - `validate_asof_alignment`: 通过（`future_leakage_count=0`，`snapshot_sample_time_match_rate=1.0`）
+  - `validate_no_leakage`: 通过（`checked_runs=4`，`violating_runs=0`）
+  - `gate_training_profitability`: 通过（默认阈值，`runs_completed=4`，`improved_wf_windows=6`）
+
+#### artifacts 与指标摘要
+- `artifacts/upgrade/multi_horizon_upgrade_bundle_latest.json`
+  - `status=passed`
+  - `summary.steps_total=5`
+  - `summary.required_failed=0`
+  - `summary.optional_failed=0`
+  - 含 `git.head/head_short/branch/dirty` 与每一步命令/耗时/输出尾部
+- 本机 gate dry-run 数据准备（用于验证脚本链路，不代表最终生产业绩）：
+  - `feature_snapshots_main_rows=43002`
+  - `feature_matrix_main_rows=43002`
+  - `feature_snapshots_seed_rows=15000`（`lineage_id=train-seed-20260221`）
+  - `backtest_seed_rows=4`（`run_name like liquid-seed%`）
+
+### 12.14 推荐生产配置（基于当前可观测结果，保守启动版）
+
+- 说明：本机当前数据库缺少可用 OOS/walk-forward 与持续 paper 记录（`runs_total=0`、`checked_runs=0`），因此此处给出“保守启动配置”；正式阈值需在服务器连续 OOS + paper 产物到齐后二次校准。
+- 推荐参数：
+  - `LIQUID_TRAIN_MODE=production`
+  - `LIQUID_TRAIN_LOOKBACK_DAYS=365`（可在 `180~420` 调优）
+  - `LIQUID_MULTI_HORIZON_TRAIN_MODE=single_model_multihead`
+  - `PORTFOLIO_ALLOCATOR_MODE=allocator_v2`
+  - `ALLOCATOR_SINGLE_SYMBOL_MAX=0.20`
+  - `ALLOCATOR_BUCKET_LIMITS=trend=0.55,event=0.70,mean_reversion=0.45`
+  - `SIGNAL_SCORE_ENTRY_BY_HORIZON=1h=0.60,4h=0.50,1d=0.35,7d=0.25`
+  - `SIGNAL_CONFIDENCE_MIN_BY_HORIZON=1h=0.55,4h=0.55,1d=0.50,7d=0.50`
+  - `EXEC_SHORT_MAX_SLIPPAGE_BPS=18`，`EXEC_LONG_MAX_SLIPPAGE_BPS=10`
+  - `EXEC_SHORT_MAX_PARTICIPATION=0.35`，`EXEC_LONG_MAX_PARTICIPATION=0.12`
+- 理由：
+  - 先以低杠杆/低参与率保证执行稳定性与可回滚。
+  - 短周期阈值更严格，降低噪声交易与过度换手。
+  - 保留人工实盘控制，不存在自动晋级路径。
+
+### 12.15 剩余运维动作（代码已完成，等待数据环境）
+
+1. 在服务器有完整特征矩阵与回测记录后，重跑：
+   - `scripts/validate_asof_alignment.py`
+   - `scripts/validate_no_leakage.py`
+   - `scripts/gate_training_profitability.py`（`min_improved_wf_windows>=2`）
+2. 运行至少 14 天 paper trading，收敛分 horizon 的 slippage/cost/turnover，再锁定最终阈值。
+3. 保持“无自动实盘晋级”，仅通过人工 `live/enable`/`live/disable` 控制。

@@ -21,6 +21,7 @@ if str(_INFER_DIR) not in sys.path:
     sys.path.append(str(_INFER_DIR))
 
 LIQUID_FEATURE_SCHEMA_VERSION = os.getenv("FEATURE_PAYLOAD_SCHEMA_VERSION", "main")
+LIQUID_HORIZONS: List[str] = ["1h", "4h", "1d", "7d"]
 ONCHAIN_FLOW_METRIC_NAMES: List[str] = [
     "netflow",
     "exchange_netflow",
@@ -275,6 +276,54 @@ class FeaturePipeline:
         if name == "annualized_basis_rate":
             return float(np.tanh(v * 5.0))
         return v
+
+    @staticmethod
+    def _parse_horizon_cost_multipliers(raw: str) -> Dict[str, float]:
+        defaults = {"1h": 1.0, "4h": 1.6, "1d": 2.4, "7d": 3.2}
+        out = dict(defaults)
+        text = str(raw or "").strip()
+        if not text:
+            return out
+        for token in text.split(","):
+            part = token.strip()
+            if not part or "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            key = str(k).strip().lower()
+            try:
+                val = float(v.strip())
+            except Exception:
+                continue
+            if key in out and val >= 0.0:
+                out[key] = val
+        return out
+
+    @staticmethod
+    def _cost_config() -> Dict[str, object]:
+        fee_bps = float(os.getenv("LIQUID_COST_FEE_BPS", "5.0") or 5.0)
+        slippage_bps = float(os.getenv("LIQUID_COST_SLIPPAGE_BPS", "3.0") or 3.0)
+        impact_base_bps = float(os.getenv("LIQUID_COST_IMPACT_BASE_BPS", "2.0") or 2.0)
+        impact_imbalance_bps = float(os.getenv("LIQUID_COST_IMPACT_IMBALANCE_BPS", "4.0") or 4.0)
+        multipliers = FeaturePipeline._parse_horizon_cost_multipliers(
+            os.getenv("LIQUID_HORIZON_COST_MULTIPLIERS", "1h=1.0,4h=1.6,1d=2.4,7d=3.2")
+        )
+        return {
+            "fee_bps": float(max(0.0, fee_bps)),
+            "slippage_bps": float(max(0.0, slippage_bps)),
+            "impact_base_bps": float(max(0.0, impact_base_bps)),
+            "impact_imbalance_bps": float(max(0.0, impact_imbalance_bps)),
+            "horizon_multipliers": multipliers,
+        }
+
+    @staticmethod
+    def _estimate_cost_bps(orderbook_imbalance: float, volume_impact: float, cfg: Dict[str, object]) -> float:
+        fee_bps = float(cfg.get("fee_bps", 5.0) or 5.0)
+        slippage_bps = float(cfg.get("slippage_bps", 3.0) or 3.0)
+        impact_base_bps = float(cfg.get("impact_base_bps", 2.0) or 2.0)
+        impact_imbalance_bps = float(cfg.get("impact_imbalance_bps", 4.0) or 4.0)
+        impact = impact_base_bps + impact_imbalance_bps * min(1.0, abs(float(orderbook_imbalance)))
+        impact += 25.0 * min(0.02, max(0.0, float(volume_impact)))
+        return float(max(0.0, fee_bps + slippage_bps + impact))
 
     @staticmethod
     def _weighted_std(values: List[float], weights: List[float]) -> float:
@@ -972,8 +1021,10 @@ class FeaturePipeline:
         tf_minutes = self._timeframe_to_minutes(effective_timeframe)
         step_1h = max(1, int(round(60.0 / max(1, tf_minutes))))
         step_4h = max(1, step_1h * 4)
+        step_1d = max(1, step_1h * 24)
+        step_7d = max(1, step_1d * 7)
         history_len = 96
-        if len(rows) < (history_len + step_4h + 2):
+        if len(rows) < (history_len + step_7d + 2):
             return SampleBatch(
                 X=np.zeros((0, len(LIQUID_FEATURE_KEYS)), dtype=np.float32),
                 y=np.zeros((0,), dtype=np.float32),
@@ -1086,11 +1137,26 @@ class FeaturePipeline:
 
         feats = []
         labels = []
-        labels_1h = []
-        labels_4h = []
-        labels_cost = []
+        labels_1h_net = []
+        labels_4h_net = []
+        labels_1d_net = []
+        labels_7d_net = []
+        labels_1h_raw = []
+        labels_4h_raw = []
+        labels_1d_raw = []
+        labels_7d_raw = []
+        labels_cost_1h = []
+        labels_cost_4h = []
+        labels_cost_1d = []
+        labels_cost_7d = []
+        labels_vol_1h = []
+        labels_vol_4h = []
+        labels_vol_1d = []
+        labels_vol_7d = []
         sample_meta: List[Dict] = []
-        for i in range(history_len, len(rows) - step_4h):
+        cost_cfg = self._cost_config()
+        horizon_mult = dict(cost_cfg.get("horizon_multipliers") or {})
+        for i in range(history_len, len(rows) - step_7d):
             price = float(rows[i].get("price") or 0.0)
             if price <= 0:
                 continue
@@ -1224,11 +1290,39 @@ class FeaturePipeline:
 
             fwd_1h = (float(rows[i + step_1h].get("price") or price) - price) / max(price, 1e-12)
             fwd_4h = (float(rows[i + step_4h].get("price") or price) - price) / max(price, 1e-12)
-            est_cost = (5.0 + 3.0) / 10000.0 + min(0.002, 0.5 * abs(orderbook_imbalance) / 1000.0)
-            labels.append(fwd_1h - est_cost)
-            labels_1h.append(fwd_1h - est_cost)
-            labels_4h.append(fwd_4h - est_cost * 2.0)
-            labels_cost.append(est_cost)
+            fwd_1d = (float(rows[i + step_1d].get("price") or price) - price) / max(price, 1e-12)
+            fwd_7d = (float(rows[i + step_7d].get("price") or price) - price) / max(price, 1e-12)
+            est_cost_bps = self._estimate_cost_bps(
+                orderbook_imbalance=float(orderbook_imbalance),
+                volume_impact=float(volume_impact),
+                cfg=cost_cfg,
+            )
+            cost_1h = (est_cost_bps * float(horizon_mult.get("1h", 1.0))) / 10000.0
+            cost_4h = (est_cost_bps * float(horizon_mult.get("4h", 1.6))) / 10000.0
+            cost_1d = (est_cost_bps * float(horizon_mult.get("1d", 2.4))) / 10000.0
+            cost_7d = (est_cost_bps * float(horizon_mult.get("7d", 3.2))) / 10000.0
+
+            y_1h = fwd_1h - cost_1h
+            y_4h = fwd_4h - cost_4h
+            y_1d = fwd_1d - cost_1d
+            y_7d = fwd_7d - cost_7d
+            labels.append(y_1h)
+            labels_1h_net.append(y_1h)
+            labels_4h_net.append(y_4h)
+            labels_1d_net.append(y_1d)
+            labels_7d_net.append(y_7d)
+            labels_1h_raw.append(fwd_1h)
+            labels_4h_raw.append(fwd_4h)
+            labels_1d_raw.append(fwd_1d)
+            labels_7d_raw.append(fwd_7d)
+            labels_cost_1h.append(cost_1h)
+            labels_cost_4h.append(cost_4h)
+            labels_cost_1d.append(cost_1d)
+            labels_cost_7d.append(cost_7d)
+            labels_vol_1h.append(abs(fwd_1h))
+            labels_vol_4h.append(abs(fwd_4h))
+            labels_vol_1d.append(abs(fwd_1d))
+            labels_vol_7d.append(abs(fwd_7d))
             sample_meta.append(
                 {
                     "as_of_ts": ts,
@@ -1236,6 +1330,10 @@ class FeaturePipeline:
                     "source_used": str(rows[i].get("source_used") or source_used),
                     "timeframe_used": str(rows[i].get("timeframe_used") or effective_timeframe),
                     "price_fallback_used": bool(rows[i].get("price_fallback_used") or source_fallback_used),
+                    "cost_config": {
+                        "est_cost_bps_base": float(est_cost_bps),
+                        "horizon_multipliers": dict(horizon_mult),
+                    },
                 }
             )
 
@@ -1247,9 +1345,22 @@ class FeaturePipeline:
             idx_list = idx.tolist()
             feats = [feats[j] for j in idx_list]
             labels = [labels[j] for j in idx_list]
-            labels_1h = [labels_1h[j] for j in idx_list]
-            labels_4h = [labels_4h[j] for j in idx_list]
-            labels_cost = [labels_cost[j] for j in idx_list]
+            labels_1h_net = [labels_1h_net[j] for j in idx_list]
+            labels_4h_net = [labels_4h_net[j] for j in idx_list]
+            labels_1d_net = [labels_1d_net[j] for j in idx_list]
+            labels_7d_net = [labels_7d_net[j] for j in idx_list]
+            labels_1h_raw = [labels_1h_raw[j] for j in idx_list]
+            labels_4h_raw = [labels_4h_raw[j] for j in idx_list]
+            labels_1d_raw = [labels_1d_raw[j] for j in idx_list]
+            labels_7d_raw = [labels_7d_raw[j] for j in idx_list]
+            labels_cost_1h = [labels_cost_1h[j] for j in idx_list]
+            labels_cost_4h = [labels_cost_4h[j] for j in idx_list]
+            labels_cost_1d = [labels_cost_1d[j] for j in idx_list]
+            labels_cost_7d = [labels_cost_7d[j] for j in idx_list]
+            labels_vol_1h = [labels_vol_1h[j] for j in idx_list]
+            labels_vol_4h = [labels_vol_4h[j] for j in idx_list]
+            labels_vol_1d = [labels_vol_1d[j] for j in idx_list]
+            labels_vol_7d = [labels_vol_7d[j] for j in idx_list]
             sample_meta = [sample_meta[j] for j in idx_list]
 
         return SampleBatch(
@@ -1257,9 +1368,30 @@ class FeaturePipeline:
             y=np.array(labels, dtype=np.float32),
             meta=sample_meta,
             extra_labels={
-                "fwd_ret_1h": np.array(labels_1h, dtype=np.float32),
-                "fwd_ret_4h": np.array(labels_4h, dtype=np.float32),
-                "est_cost": np.array(labels_cost, dtype=np.float32),
+                # Backward-compat keys keep net labels.
+                "fwd_ret_1h": np.array(labels_1h_net, dtype=np.float32),
+                "fwd_ret_4h": np.array(labels_4h_net, dtype=np.float32),
+                "est_cost": np.array(labels_cost_1h, dtype=np.float32),
+                # Multi-horizon net labels.
+                "net_ret_1h": np.array(labels_1h_net, dtype=np.float32),
+                "net_ret_4h": np.array(labels_4h_net, dtype=np.float32),
+                "net_ret_1d": np.array(labels_1d_net, dtype=np.float32),
+                "net_ret_7d": np.array(labels_7d_net, dtype=np.float32),
+                # Raw forward returns (pre-cost).
+                "raw_ret_1h": np.array(labels_1h_raw, dtype=np.float32),
+                "raw_ret_4h": np.array(labels_4h_raw, dtype=np.float32),
+                "raw_ret_1d": np.array(labels_1d_raw, dtype=np.float32),
+                "raw_ret_7d": np.array(labels_7d_raw, dtype=np.float32),
+                # Horizon-specific costs.
+                "cost_1h": np.array(labels_cost_1h, dtype=np.float32),
+                "cost_4h": np.array(labels_cost_4h, dtype=np.float32),
+                "cost_1d": np.array(labels_cost_1d, dtype=np.float32),
+                "cost_7d": np.array(labels_cost_7d, dtype=np.float32),
+                # Volatility proxies by horizon.
+                "vol_target_1h": np.array(labels_vol_1h, dtype=np.float32),
+                "vol_target_4h": np.array(labels_vol_4h, dtype=np.float32),
+                "vol_target_1d": np.array(labels_vol_1d, dtype=np.float32),
+                "vol_target_7d": np.array(labels_vol_7d, dtype=np.float32),
             },
             sampling={
                 "symbol": str(symbol).upper(),
@@ -1274,6 +1406,8 @@ class FeaturePipeline:
                 "feature_rows_after_sampling": int(len(feats)),
                 "source_used": source_used,
                 "source_fallback_used": bool(source_fallback_used),
+                "horizons": list(LIQUID_HORIZONS),
+                "cost_config": cost_cfg,
             },
         )
 

@@ -226,6 +226,8 @@ def _evaluate_single_dataset(
     )
     wf_basic_per_fold: List[Dict[str, float]] = []
     wf_oos_per_fold: List[Dict[str, float]] = []
+    wf_conf_proxy: List[float] = []
+    wf_hit_obs: List[float] = []
     for tr, te in wf_folds:
         if tr.size < protocol.min_train_points or te.size < protocol.min_test_points:
             continue
@@ -239,6 +241,12 @@ def _evaluate_single_dataset(
         mae = float(np.mean(np.abs(pred - y[te])))
         hit = float(np.mean(((pred >= 0).astype(np.int32) == (y[te] >= 0).astype(np.int32)).astype(np.float64)))
         wf_basic_per_fold.append({"mse": mse, "mae": mae, "hit_rate": hit})
+        pred_std = float(np.std(pred)) if pred.size else 0.0
+        z = np.abs(pred / max(1e-6, pred_std))
+        conf_proxy = 1.0 / (1.0 + np.exp(-(0.85 * z - 0.1)))
+        hit_obs = ((pred >= 0).astype(np.int32) == (y[te] >= 0).astype(np.int32)).astype(np.float64)
+        wf_conf_proxy.extend(conf_proxy.tolist())
+        wf_hit_obs.extend(hit_obs.tolist())
         wf_oos_per_fold.append(
             evaluate_regression_oos(
                 y_true=y[te],
@@ -283,6 +291,21 @@ def _evaluate_single_dataset(
     pkf_oos = summarize_fold_metrics(pkf_oos_per_fold)
     if int(wf_basic["folds"]) <= 0:
         return {"status": "blocked", "reason": "no_valid_wf_folds", "rows": int(X.shape[0])}
+    calibration_bins: List[Dict[str, float]] = []
+    if wf_conf_proxy and wf_hit_obs and len(wf_conf_proxy) == len(wf_hit_obs):
+        arr_c = np.asarray(wf_conf_proxy, dtype=np.float64)
+        arr_h = np.asarray(wf_hit_obs, dtype=np.float64)
+        order = np.argsort(arr_c)
+        for idx in np.array_split(order, 5):
+            if idx.size <= 0:
+                continue
+            calibration_bins.append(
+                {
+                    "count": int(idx.size),
+                    "confidence_mean": float(np.mean(arr_c[idx])),
+                    "hit_rate": float(np.mean(arr_h[idx])),
+                }
+            )
 
     return {
         "status": "ok",
@@ -296,6 +319,7 @@ def _evaluate_single_dataset(
         "walk_forward_basic": wf_basic,
         "purged_kfold": pkf_oos,
         "purged_kfold_basic": pkf_basic,
+        "confidence_calibration_bins": calibration_bins,
         "wf_metrics_per_fold": wf_basic_per_fold,
         "pkf_metrics_per_fold": pkf_basic_per_fold,
     }
@@ -381,6 +405,7 @@ def main() -> int:
         "purged_kfold": primary["purged_kfold"],
         "purged_kfold_basic": primary["purged_kfold_basic"],
         "ablation_results": ablation_results,
+        "confidence_calibration_bins": primary.get("confidence_calibration_bins") or [],
         "ablation_config": {
             "requested": ablations,
             "event_strength_threshold": float(max(0.0, float(args.event_strength_threshold))),

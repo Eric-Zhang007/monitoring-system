@@ -15,6 +15,7 @@ import json
 from datetime import datetime, timedelta
 from contextlib import suppress
 from pathlib import Path
+import numpy as np
 
 from gpu_manager import GPUManager
 from nim_integration import get_nim_cache
@@ -720,6 +721,176 @@ def _extract_multimodal_health(
     return health
 
 
+def _query_horizon_prediction_stats(lookback_hours: int = 24, reference_hours: int = 24) -> Dict[str, Any]:
+    out = {
+        "lookback_hours": int(lookback_hours),
+        "reference_hours": int(reference_hours),
+        "horizons": {},
+    }
+    try:
+        conn = get_postgres()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT horizon, score, confidence, created_at
+            FROM predictions_v2
+            WHERE created_at > NOW() - make_interval(hours => %s)
+            ORDER BY created_at DESC
+            LIMIT 20000
+            """,
+            (int(max(1, lookback_hours)),),
+        )
+        rows_cur = [dict(r) for r in (cur.fetchall() or [])]
+        cur.execute(
+            """
+            SELECT horizon, score, confidence, created_at
+            FROM predictions_v2
+            WHERE created_at <= NOW() - make_interval(hours => %s)
+              AND created_at > NOW() - make_interval(hours => %s)
+            ORDER BY created_at DESC
+            LIMIT 20000
+            """,
+            (int(max(1, lookback_hours)), int(max(2, lookback_hours + reference_hours))),
+        )
+        rows_ref = [dict(r) for r in (cur.fetchall() or [])]
+        cur.close()
+        conn.close()
+    except Exception:
+        return out
+
+    def _group(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        grp: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            h = str(r.get("horizon") or "1h").strip().lower() or "1h"
+            grp.setdefault(h, []).append(r)
+        return grp
+
+    g_cur = _group(rows_cur)
+    g_ref = _group(rows_ref)
+    for h in sorted(set(g_cur.keys()) | set(g_ref.keys())):
+        cur_scores = [_to_float(r.get("score")) for r in g_cur.get(h, [])]
+        ref_scores = [_to_float(r.get("score")) for r in g_ref.get(h, [])]
+        cur_conf = [_to_float(r.get("confidence")) for r in g_cur.get(h, [])]
+        ref_conf = [_to_float(r.get("confidence")) for r in g_ref.get(h, [])]
+        cur_mean = float(np.mean(cur_scores)) if cur_scores else 0.0
+        ref_mean = float(np.mean(ref_scores)) if ref_scores else 0.0
+        cur_std = float(np.std(cur_scores)) if cur_scores else 0.0
+        ref_std = float(np.std(ref_scores)) if ref_scores else 0.0
+        conf_shift = (float(np.mean(cur_conf)) - float(np.mean(ref_conf))) if cur_conf and ref_conf else 0.0
+        out["horizons"][h] = {
+            "current_count": len(cur_scores),
+            "reference_count": len(ref_scores),
+            "current_score_mean": round(cur_mean, 10),
+            "reference_score_mean": round(ref_mean, 10),
+            "score_mean_shift": round(cur_mean - ref_mean, 10),
+            "current_score_std": round(cur_std, 10),
+            "reference_score_std": round(ref_std, 10),
+            "score_std_shift": round(cur_std - ref_std, 10),
+            "confidence_mean_shift": round(conf_shift, 10),
+        }
+    return out
+
+
+def _query_confidence_bucket_stats(lookback_hours: int = 24) -> Dict[str, Any]:
+    out = {"lookback_hours": int(lookback_hours), "buckets": []}
+    try:
+        conn = get_postgres()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT horizon, confidence, score
+            FROM signal_candidates
+            WHERE created_at > NOW() - make_interval(hours => %s)
+            ORDER BY created_at DESC
+            LIMIT 50000
+            """,
+            (int(max(1, lookback_hours)),),
+        )
+        rows = [dict(r) for r in (cur.fetchall() or [])]
+        cur.close()
+        conn.close()
+    except Exception:
+        return out
+    if not rows:
+        return out
+    bins = [0.0, 0.4, 0.55, 0.7, 0.85, 1.0]
+    for i in range(len(bins) - 1):
+        lo, hi = bins[i], bins[i + 1]
+        block = [r for r in rows if lo <= _to_float(r.get("confidence")) < (hi if i < len(bins) - 2 else hi + 1e-9)]
+        if not block:
+            continue
+        out["buckets"].append(
+            {
+                "bucket": f"[{lo:.2f},{hi:.2f})",
+                "count": len(block),
+                "score_abs_mean": round(float(np.mean([abs(_to_float(r.get('score'))) for r in block])), 10),
+                "horizon_mix": {
+                    h: int(sum(1 for r in block if str(r.get("horizon") or "1h").strip().lower() == h))
+                    for h in ["1h", "4h", "1d", "7d"]
+                },
+            }
+        )
+    return out
+
+
+def _query_paper_pnl_buckets(lookback_hours: int = 24 * 7) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"lookback_hours": int(lookback_hours), "rows": []}
+    try:
+        conn = get_postgres()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT target, track, metadata
+            FROM orders_sim
+            WHERE created_at > NOW() - make_interval(hours => %s)
+              AND status IN ('filled', 'partially_filled', 'rejected')
+            ORDER BY created_at DESC
+            LIMIT 50000
+            """,
+            (int(max(1, lookback_hours)),),
+        )
+        rows = [dict(r) for r in (cur.fetchall() or [])]
+        cur.close()
+        conn.close()
+    except Exception:
+        return out
+    bucket_map: Dict[tuple[str, str, str], Dict[str, float]] = {}
+    for r in rows:
+        meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        exec_trace = meta.get("execution_trace") if isinstance(meta.get("execution_trace"), dict) else {}
+        horizon = str(meta.get("horizon") or meta.get("selected_horizon") or "1h").strip().lower() or "1h"
+        bucket = str(meta.get("strategy_bucket") or "unknown").strip().lower() or "unknown"
+        target = str(r.get("target") or "").upper() or "UNKNOWN"
+        key = (horizon, target, bucket)
+        slot = bucket_map.setdefault(key, {"net_pnl": 0.0, "orders": 0.0, "slippage_bps_sum": 0.0, "fees_sum": 0.0})
+        est = _to_float(exec_trace.get("theoretical_price"))
+        fill = _to_float(exec_trace.get("avg_fill_price"))
+        qty = _to_float(exec_trace.get("filled_qty"))
+        fee = _to_float(exec_trace.get("fees_paid"))
+        side = str(meta.get("side") or "").strip().lower()
+        signed = 1.0 if side == "buy" else (-1.0 if side == "sell" else 0.0)
+        edge = 0.0
+        if est > 0.0 and fill > 0.0 and qty > 0.0:
+            edge = signed * (fill - est) * qty
+        slot["net_pnl"] += edge - fee
+        slot["orders"] += 1.0
+        slot["slippage_bps_sum"] += _to_float(exec_trace.get("slippage_bps"))
+        slot["fees_sum"] += fee
+    out["rows"] = [
+        {
+            "horizon": k[0],
+            "target": k[1],
+            "bucket": k[2],
+            "orders": int(v["orders"]),
+            "net_pnl_after_cost": round(v["net_pnl"], 10),
+            "avg_slippage_bps": round(v["slippage_bps_sum"] / max(1.0, v["orders"]), 10),
+            "fees_paid": round(v["fees_sum"], 10),
+        }
+        for k, v in sorted(bucket_map.items())
+    ]
+    return out
+
+
 @app.get("/api/v2/monitor/history-completeness")
 async def monitor_history_completeness():
     try:
@@ -823,6 +994,51 @@ async def monitor_multimodal_health():
     except Exception as e:
         logger.error(f"❌ Failed to read multimodal health: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v2/monitor/horizon-performance")
+async def monitor_horizon_performance(
+    lookback_hours: int = Query(24, ge=1, le=24 * 30),
+):
+    return {
+        "status": "ok",
+        "kind": "horizon_performance",
+        **_query_horizon_prediction_stats(lookback_hours=lookback_hours, reference_hours=max(1, lookback_hours)),
+    }
+
+
+@app.get("/api/v2/monitor/prediction-drift")
+async def monitor_prediction_drift(
+    lookback_hours: int = Query(24, ge=1, le=24 * 30),
+    reference_hours: int = Query(24, ge=1, le=24 * 30),
+):
+    return {
+        "status": "ok",
+        "kind": "prediction_drift",
+        **_query_horizon_prediction_stats(lookback_hours=lookback_hours, reference_hours=reference_hours),
+    }
+
+
+@app.get("/api/v2/monitor/confidence-calibration")
+async def monitor_confidence_calibration(
+    lookback_hours: int = Query(24, ge=1, le=24 * 30),
+):
+    return {
+        "status": "ok",
+        "kind": "confidence_bucket_proxy",
+        **_query_confidence_bucket_stats(lookback_hours=lookback_hours),
+    }
+
+
+@app.get("/api/v2/monitor/paper-pnl-buckets")
+async def monitor_paper_pnl_buckets(
+    lookback_hours: int = Query(24 * 7, ge=1, le=24 * 365),
+):
+    return {
+        "status": "ok",
+        "kind": "paper_pnl_buckets",
+        **_query_paper_pnl_buckets(lookback_hours=lookback_hours),
+    }
 
 
 @app.get("/api/v2/monitor/paper-performance")

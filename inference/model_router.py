@@ -294,6 +294,64 @@ class ModelRouter:
                 pass
         if isinstance(model.get("weights"), list):
             loaded["weights"] = np.array(model.get("weights", []), dtype=np.float32)
+        loaded["default_horizon"] = str(model.get("default_horizon") or "1h").strip().lower() or "1h"
+        if isinstance(model.get("horizons"), list):
+            loaded["horizons"] = [str(x).strip().lower() for x in model.get("horizons", []) if str(x).strip()]
+        raw_heads = model.get("horizon_heads")
+        if isinstance(raw_heads, dict):
+            parsed_heads: Dict[str, Dict[str, Any]] = {}
+            for h, item in raw_heads.items():
+                if not isinstance(item, dict):
+                    continue
+                h_key = str(h).strip().lower()
+                if not h_key:
+                    continue
+                head: Dict[str, Any] = {}
+                if isinstance(item.get("weights"), list):
+                    head["weights"] = np.array(item.get("weights", []), dtype=np.float32)
+                if isinstance(item.get("vol_weights"), list):
+                    head["vol_weights"] = np.array(item.get("vol_weights", []), dtype=np.float32)
+                head["residual_std"] = float(item.get("residual_std", 0.0) or 0.0)
+                calib = item.get("calibration") if isinstance(item.get("calibration"), dict) else {}
+                head["calibration"] = {
+                    "method": str(calib.get("method") or "sigmoid_abs_z"),
+                    "a": float(calib.get("a", 0.85) or 0.85),
+                    "b": float(calib.get("b", -0.1) or -0.1),
+                    "bins": list(calib.get("bins") or []),
+                }
+                parsed_heads[h_key] = head
+            if parsed_heads:
+                loaded["horizon_heads"] = parsed_heads
+        raw_models = model.get("horizon_models")
+        if isinstance(raw_models, dict):
+            parsed_models: Dict[str, Dict[str, Any]] = {}
+            for h, item in raw_models.items():
+                if not isinstance(item, dict):
+                    continue
+                h_key = str(h).strip().lower()
+                if not h_key:
+                    continue
+                sub: Dict[str, Any] = {}
+                if isinstance(item.get("weights"), list):
+                    sub["weights"] = np.array(item.get("weights", []), dtype=np.float32)
+                if isinstance(item.get("vol_weights"), list):
+                    sub["vol_weights"] = np.array(item.get("vol_weights", []), dtype=np.float32)
+                sub["residual_std"] = float(item.get("residual_std", 0.0) or 0.0)
+                sub["model_type"] = str(item.get("model_type") or "ridge_submodel")
+                calib = item.get("calibration") if isinstance(item.get("calibration"), dict) else {}
+                sub["calibration"] = {
+                    "method": str(calib.get("method") or "sigmoid_abs_z"),
+                    "a": float(calib.get("a", 0.85) or 0.85),
+                    "b": float(calib.get("b", -0.1) or -0.1),
+                    "bins": list(calib.get("bins") or []),
+                }
+                parsed_models[h_key] = sub
+            if parsed_models:
+                loaded["horizon_models"] = parsed_models
+        if isinstance(model.get("meta_aggregator"), dict):
+            loaded["meta_aggregator"] = dict(model.get("meta_aggregator") or {})
+        if isinstance(model.get("cost_config"), dict):
+            loaded["cost_config"] = dict(model.get("cost_config") or {})
         if fusion_mode == "residual_gate":
             if isinstance(model.get("base_feature_indices"), list):
                 loaded["base_feature_indices"] = np.array(model.get("base_feature_indices", []), dtype=np.int64)
@@ -327,6 +385,55 @@ class ModelRouter:
             x_mean = self._align_features(x_mean, feature_dim)
             x_std = np.clip(self._align_features(x_std, feature_dim), 1e-6, None)
             aligned = (aligned - x_mean) / x_std
+
+        horizon_heads = bundle.get("horizon_heads")
+        horizon_models = bundle.get("horizon_models")
+        horizon_source = None
+        if isinstance(horizon_heads, dict) and horizon_heads:
+            horizon_source = horizon_heads
+        elif isinstance(horizon_models, dict) and horizon_models:
+            horizon_source = horizon_models
+        if isinstance(horizon_source, dict) and horizon_source:
+            pred_map: Dict[str, float] = {}
+            vol_map: Dict[str, float] = {}
+            conf_map: Dict[str, float] = {}
+            for horizon, head in horizon_source.items():
+                if not isinstance(head, dict):
+                    continue
+                ww = head.get("weights")
+                if not isinstance(ww, np.ndarray) or ww.size <= 0:
+                    continue
+                w = self._align_features(ww, feature_dim)
+                pred_h = float(aligned @ w)
+                wv_raw = head.get("vol_weights")
+                if isinstance(wv_raw, np.ndarray) and wv_raw.size > 0:
+                    wv = self._align_features(wv_raw, feature_dim)
+                    vol_h = float(max(1e-6, abs(float(aligned @ wv))))
+                else:
+                    vol_h = float(max(1e-6, abs(pred_h) * 0.5 + float(head.get("residual_std", 0.0) or 0.0)))
+                calib = head.get("calibration") if isinstance(head.get("calibration"), dict) else {}
+                a = float(calib.get("a", 0.85) or 0.85)
+                b = float(calib.get("b", -0.1) or -0.1)
+                z = pred_h / max(vol_h, 1e-6)
+                conf_h = self._sigmoid_scalar(a * abs(z) + b)
+                pred_map[str(horizon).lower()] = float(pred_h)
+                vol_map[str(horizon).lower()] = float(vol_h)
+                conf_map[str(horizon).lower()] = float(max(0.01, min(0.99, conf_h)))
+            if pred_map:
+                default_h = str(bundle.get("default_horizon") or "1h").strip().lower() or "1h"
+                if default_h not in pred_map:
+                    default_h = "1h" if "1h" in pred_map else sorted(pred_map.keys())[0]
+                mode = "multi_horizon_heads" if horizon_source is horizon_heads else "multi_model_meta"
+                meta_agg = dict(bundle.get("meta_aggregator") or {})
+                return float(pred_map.get(default_h, 0.0)), {
+                    "mode": mode,
+                    "default_horizon": default_h,
+                    "expected_return_horizons": pred_map,
+                    "vol_forecast_horizons": vol_map,
+                    "signal_confidence_horizons": conf_map,
+                    "meta_aggregator": meta_agg,
+                    "cost_config": dict(bundle.get("cost_config") or {}),
+                }
 
         fusion_mode = str(bundle.get("fusion_mode") or "single_ridge").strip().lower()
         if fusion_mode == "residual_gate":
@@ -450,11 +557,23 @@ class ModelRouter:
 
         vol_forecast = float(max(0.01, 0.02 + abs(expected_return) * 4))
         confidence = float(max(0.35, min(0.95, 0.75 - vol_forecast * 4)))
+        expected_return_h = tab_meta.get("expected_return_horizons") if isinstance(tab_meta.get("expected_return_horizons"), dict) else {}
+        vol_forecast_h = tab_meta.get("vol_forecast_horizons") if isinstance(tab_meta.get("vol_forecast_horizons"), dict) else {}
+        signal_conf_h = tab_meta.get("signal_confidence_horizons") if isinstance(tab_meta.get("signal_confidence_horizons"), dict) else {}
+        if not expected_return_h:
+            expected_return_h = {"1h": float(expected_return)}
+        if not vol_forecast_h:
+            vol_forecast_h = {"1h": float(vol_forecast)}
+        if not signal_conf_h:
+            signal_conf_h = {"1h": float(confidence)}
 
         return {
             "expected_return": float(expected_return),
             "vol_forecast": vol_forecast,
             "signal_confidence": confidence,
+            "expected_return_horizons": {str(k): float(v) for k, v in expected_return_h.items()},
+            "vol_forecast_horizons": {str(k): float(v) for k, v in vol_forecast_h.items()},
+            "signal_confidence_horizons": {str(k): float(v) for k, v in signal_conf_h.items()},
             "stack": {
                 "nn": float(expected_return_nn),
                 "tabular": float(expected_return_tabular),
@@ -464,5 +583,7 @@ class ModelRouter:
                 "tabular_delta": float(tab_meta.get("delta") or 0.0),
                 "tabular_gate": float(tab_meta.get("gate") or 0.0),
                 "tabular_gate_multiplier": float(tab_meta.get("gate_multiplier") or 0.0),
+                "default_horizon": str(tab_meta.get("default_horizon") or "1h"),
+                "cost_config": dict(tab_meta.get("cost_config") or {}),
             },
         }

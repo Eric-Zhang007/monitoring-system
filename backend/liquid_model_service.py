@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import HTTPException
+from liquid_model_registry import get_active_model as get_registry_active_model
 
 _ROOT = Path(__file__).resolve().parents[1]
 _INFER_DIR = _ROOT / "inference"
@@ -67,7 +68,10 @@ class LiquidModelService:
         self._model_router = ModelRouter()
         return self._model_router
 
-    def _active_liquid_model(self) -> Tuple[str, str]:
+    def _active_liquid_model(self, *, symbol: str = "", horizon: str = "1h") -> Tuple[str, str]:
+        reg_hit = get_registry_active_model(symbol=symbol, horizon=horizon)
+        if reg_hit:
+            return reg_hit
         try:
             row = self.repo.get_active_model_state("liquid")
         except Exception:
@@ -148,7 +152,7 @@ class LiquidModelService:
         use_model_name = str(model_name or "").strip()
         use_model_version = str(model_version or "").strip()
         if not use_model_name or not use_model_version:
-            use_model_name, use_model_version = self._active_liquid_model()
+            use_model_name, use_model_version = self._active_liquid_model(symbol=sym, horizon=horizon)
         if require_artifact and not self.has_required_artifacts(target=sym, model_name=use_model_name):
             if use_model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
                 if not self.has_required_artifacts(target=sym, model_name="liquid_baseline"):
@@ -158,11 +162,29 @@ class LiquidModelService:
         model_router = self._get_model_router()
         vec = self._feature_vector_from_payload(payload)
         out = model_router.predict_liquid(sym, vec, model_name=use_model_name)
-        scale = {"1h": 0.3, "1d": 1.0, "7d": 2.1}.get(str(horizon).strip().lower(), 1.0)
-        expected_return = float(out.get("expected_return") or 0.0) * float(scale)
-        signal_confidence = float(out.get("signal_confidence") or 0.0)
-        vol_forecast = float(out.get("vol_forecast") or 0.0)
+        horizon_key = str(horizon).strip().lower() or "1h"
+        expected_map = out.get("expected_return_horizons") if isinstance(out.get("expected_return_horizons"), dict) else {}
+        conf_map = out.get("signal_confidence_horizons") if isinstance(out.get("signal_confidence_horizons"), dict) else {}
+        vol_map = out.get("vol_forecast_horizons") if isinstance(out.get("vol_forecast_horizons"), dict) else {}
+        if not expected_map:
+            expected_map = {"1h": float(out.get("expected_return") or 0.0)}
+        if not conf_map:
+            conf_map = {"1h": float(out.get("signal_confidence") or 0.0)}
+        if not vol_map:
+            vol_map = {"1h": float(out.get("vol_forecast") or 0.0)}
+        if horizon_key not in expected_map:
+            horizon_key = "1h" if "1h" in expected_map else sorted(expected_map.keys())[0]
+        expected_return = float(expected_map.get(horizon_key, 0.0) or 0.0)
+        signal_confidence = float(conf_map.get(horizon_key, 0.0) or 0.0)
+        vol_forecast = float(vol_map.get(horizon_key, 0.0) or 0.0)
         stack = out.get("stack") if isinstance(out.get("stack"), dict) else {}
+        stack = {
+            **stack,
+            "expected_return_horizons": {str(k): float(v) for k, v in expected_map.items()},
+            "signal_confidence_horizons": {str(k): float(v) for k, v in conf_map.items()},
+            "vol_forecast_horizons": {str(k): float(v) for k, v in vol_map.items()},
+            "selected_horizon": horizon_key,
+        }
         degraded_reasons: List[str] = []
         if use_model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
             neural_present = self._has_neural_artifact(target=sym, model_router=model_router)
@@ -174,6 +196,9 @@ class LiquidModelService:
             "expected_return": float(expected_return),
             "signal_confidence": float(signal_confidence),
             "vol_forecast": float(vol_forecast),
+            "expected_return_horizons": {str(k): float(v) for k, v in expected_map.items()},
+            "signal_confidence_horizons": {str(k): float(v) for k, v in conf_map.items()},
+            "vol_forecast_horizons": {str(k): float(v) for k, v in vol_map.items()},
             "stack": stack,
             "model_name": use_model_name,
             "model_version": use_model_version,
@@ -226,6 +251,9 @@ class LiquidModelService:
             "expected_return": round(float(pred["expected_return"]), 6),
             "vol_forecast": round(float(pred["vol_forecast"]), 6),
             "signal_confidence": round(float(pred["signal_confidence"]), 4),
+            "expected_return_horizons": {str(k): round(float(v), 6) for k, v in dict(pred.get("expected_return_horizons") or {}).items()},
+            "signal_confidence_horizons": {str(k): round(float(v), 4) for k, v in dict(pred.get("signal_confidence_horizons") or {}).items()},
+            "vol_forecast_horizons": {str(k): round(float(v), 6) for k, v in dict(pred.get("vol_forecast_horizons") or {}).items()},
             "current_price": float(price_row.get("price") or 0.0),
             "horizon": str(horizon),
             "as_of": self._utcnow().isoformat(),

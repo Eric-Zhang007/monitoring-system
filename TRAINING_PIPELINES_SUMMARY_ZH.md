@@ -166,7 +166,7 @@
 - 产物：
   - `artifacts/models/multimodal_eval.json`
 - 当前限制：
-  - 脚本末尾 `print` 使用了未定义变量（`wf_basic`），该输出处需要修复。
+  - 无已知阻断缺陷；Phase 0 已补齐 smoke 测试覆盖该链路，防回归。
 
 ## 3.5 链路 E：候选注册与门禁链
 
@@ -205,7 +205,7 @@
   - 可由 `training/main.py` 的 `TRAIN_ENABLE_BACKBONE_EXPERIMENTS=1` 挂到主训练定时流程
 - 当前限制：
   - 需要 `torch` 才能跑神经骨干。
-  - 当前 `_fold_metrics` 分支未把 `tft` 送入 torch 训练分支，`tft` 会被标记为 unsupported。
+  - 若环境缺少 `torch`，`tft/itransformer/patchtst` 会被标记为 `torch_missing`（显式降级），仅 `ridge` 可运行。
 
 ## 3.7 链路 G：服务器双卡训练编排链
 
@@ -339,19 +339,21 @@
 ## 6. 当前“全量数据使用”状态说明
 
 - 链路 B（Liquid 主生产）：
-  - 不是全历史全量：默认每 symbol `limit=4000`。
-  - 尚未吃到 derivatives 全部指标（当前 onchain 仅 3 个 metric）。
+  - 已升级为“窗口优先”：`LIQUID_TRAIN_MODE=production` 时默认不使用硬 `limit=4000`，通过 `LIQUID_TRAIN_LOOKBACK_DAYS` 或 `--liquid-start/--liquid-end` 控窗。
+  - `LIQUID_TRAIN_MODE=fast` 才使用 `liquid_limit/liquid_max_samples` 进行快速迭代。
+  - derivatives 指标已接入主训练特征，并保留 missing_flag 与 as-of 对齐。
 - 链路 C/D/F（基于 `feature_matrix_main`）：
   - 可以按 `--start --end` 使用全窗口，受表本身覆盖与 `max_samples` 参数影响。
 - 链路 A（VC）：
   - 默认 `limit=3000`，不是全事件历史。
 
-## 7. 建议优先修复项（按影响排序）
+## 7. 当前后续重点（按影响排序）
 
-1. 修复 `training/eval_multimodal_oos.py` 末尾未定义变量输出问题，保证评估链路稳定落结果。
-2. 在 `FeaturePipeline.load_liquid_training_batch` 中接入 derivatives 指标特征，避免主训练与数据采集能力脱节。
-3. 将 `liquid_model_trainer` 的样本上限参数化（从固定 4000 改为可配置/按窗口），支持全量训练。
-4. 修正 `backbone_experiments.py` 中 `tft` 分支未进入 torch 训练的问题。
+1. 在服务器完整数据环境下重跑 multi-horizon OOS + paper，校准 `SIGNAL_SCORE_ENTRY_BY_HORIZON` 与 `SIGNAL_CONFIDENCE_MIN_BY_HORIZON`。
+2. 持续积累 `backtest_runs` 后启用严格门禁：`min_improved_wf_windows>=2` 且成本后优于 Phase 0 baseline。
+3. 执行 `symbol+horizon` 级 candidate->active->rollback 运维演练，固化值班流程。
+4. 持续监控 `/api/v2/monitor/horizon-performance`、`prediction-drift`、`confidence-calibration`、`paper-pnl-buckets`。
+5. 每次改动后运行 `scripts/run_multi_horizon_upgrade_bundle.py`，统一落 `artifacts/upgrade/multi_horizon_upgrade_bundle_latest.json`。
 
 ---
 

@@ -326,6 +326,36 @@ python3 training/eval_multimodal_oos.py
 python3 training/register_candidate_model.py
 ```
 
+Multi-horizon liquid 训练（窗口优先，生产默认不使用硬 `limit=4000`）：
+
+```bash
+python3 training/main.py \
+  --run-once \
+  --enable-liquid 1 \
+  --liquid-train-mode production \
+  --liquid-lookback-days 365 \
+  --liquid-start 2025-01-01T00:00:00Z \
+  --liquid-end 2026-02-20T00:00:00Z
+```
+
+可选 B 方案（多子模型 + meta 聚合）：
+
+```bash
+LIQUID_MULTI_HORIZON_TRAIN_MODE=multi_model_meta \
+python3 training/main.py --run-once --enable-liquid 1 --liquid-train-mode production
+```
+
+快速迭代模式（才使用 limit/max_samples）：
+
+```bash
+python3 training/main.py \
+  --run-once \
+  --enable-liquid 1 \
+  --liquid-train-mode fast \
+  --liquid-limit 4000 \
+  --liquid-max-samples 4000
+```
+
 训练收益门禁（建议每轮训练后执行）：
 
 ```bash
@@ -334,6 +364,24 @@ python3 scripts/gate_training_profitability.py \
   --lookback-hours 168 \
   --min-completed-runs 4
 ```
+
+一键 multi-horizon 升级检查与产物汇总（建议每次合并前执行）：
+
+```bash
+python3 scripts/run_multi_horizon_upgrade_bundle.py --run-full-pytest
+```
+
+上线前建议严格模式（DB gates 计入 required）：
+
+```bash
+python3 scripts/run_multi_horizon_upgrade_bundle.py \
+  --run-full-pytest \
+  --require-db-gates \
+  --strict
+```
+
+产物：
+- `artifacts/upgrade/multi_horizon_upgrade_bundle_latest.json`
 
 双卡 A100 NVLINK 训练发车（服务器）：
 
@@ -404,7 +452,8 @@ python3 training/backbone_experiments.py \
 ### 7.1 持续模拟盘守护
 
 ```bash
-python3 monitoring/paper_trading_daemon.py --loop --interval-sec 60
+python3 monitoring/paper_trading_daemon.py --loop --interval-sec 60 \
+  --execution-events-file artifacts/paper/paper_execution_events.jsonl
 ```
 
 连续运维循环（含首训后再开模拟盘 + 收益门禁失败自动微调）：
@@ -426,8 +475,26 @@ python3 scripts/continuous_ops_loop.py --loop
 - `GET /api/v2/monitor/model-status`
 - `GET /api/v2/monitor/multimodal-health`
 - `GET /api/v2/monitor/paper-performance`
+- `GET /api/v2/monitor/horizon-performance`
+- `GET /api/v2/monitor/prediction-drift`
+- `GET /api/v2/monitor/confidence-calibration`
+- `GET /api/v2/monitor/paper-pnl-buckets`
 
-### 7.3 控制接口
+### 7.3 Multi-horizon 预测与信号
+
+`/api/v2/predict/liquid` 已支持返回多 horizon 输出（`1h/4h/1d/7d`）：
+- `expected_return`（map）
+- `signal_confidence`（map）
+- `vol_forecast`（map）
+- `score_horizons` / `edge_horizons` / `action_horizons`
+- 兼容字段：`expected_return_legacy`、`signal_confidence_legacy`、`vol_forecast_legacy`
+
+`/api/v2/signals/generate`（liquid）已升级为：
+- `edge_h = expected_return_h - cost_h`
+- `score_h = edge_h / max(vol_h, eps)`
+- 阈值可按 horizon 配置：`SIGNAL_SCORE_ENTRY_BY_HORIZON`、`SIGNAL_CONFIDENCE_MIN_BY_HORIZON`
+
+### 7.4 控制接口
 
 - `POST /api/v2/control/live/enable`
 - `POST /api/v2/control/live/disable`
@@ -442,6 +509,30 @@ curl -X POST http://127.0.0.1:8000/api/v2/control/live/enable \
 curl -X POST http://127.0.0.1:8000/api/v2/control/live/disable \
   -H 'Content-Type: application/json' \
   -d '{"operator":"admin","reason":"manual_disable_live","paper_enabled":true}'
+```
+
+模型 registry（symbol+horizon）人工切换与回滚：
+
+```bash
+curl http://127.0.0.1:8000/api/v2/models/liquid/registry
+
+curl -X POST http://127.0.0.1:8000/api/v2/models/liquid/registry/candidate \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"BTC","horizon":"1h","model_name":"liquid_baseline_btc","model_version":"v2.1-candidate","operator":"ops"}'
+
+curl -X POST http://127.0.0.1:8000/api/v2/models/liquid/registry/promote-candidate \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"BTC","horizon":"1h","operator":"ops"}'
+
+curl -X POST http://127.0.0.1:8000/api/v2/models/liquid/registry/activate \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"BTC","horizon":"1h","model_name":"liquid_baseline_btc","model_version":"v2.0","operator":"ops"}'
+
+curl -X POST http://127.0.0.1:8000/api/v2/models/liquid/registry/rollback \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"BTC","horizon":"1h","operator":"ops"}'
+
+python3 scripts/rollback_liquid_model.py --symbol BTC --horizon 1h --operator ops
 ```
 
 ## 8. 前端发布

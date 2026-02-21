@@ -50,6 +50,8 @@ LIQUID_TRAIN_END = str(os.getenv("LIQUID_TRAIN_END", "")).strip()
 LIQUID_TRAIN_LIMIT = _env_int("LIQUID_TRAIN_LIMIT", 4000)
 LIQUID_TRAIN_MAX_SAMPLES = _env_int("LIQUID_TRAIN_MAX_SAMPLES", 0)
 LIQUID_TRAIN_SAMPLE_MODE = str(os.getenv("LIQUID_TRAIN_SAMPLE_MODE", "uniform")).strip().lower() or "uniform"
+LIQUID_TRAIN_MODE = str(os.getenv("LIQUID_TRAIN_MODE", "production")).strip().lower() or "production"
+LIQUID_TRAIN_LOOKBACK_DAYS = _env_int("LIQUID_TRAIN_LOOKBACK_DAYS", 365)
 LIQUID_DATA_MODE = str(os.getenv("LIQUID_DATA_MODE", "production")).strip().lower() or "production"
 
 
@@ -175,7 +177,7 @@ class TrainingServiceV2:
 
     async def run(self):
         logger.info(
-            "training-v2 started interval=%ss run_once=%s enable_vc=%s enable_liquid=%s enable_backbone_exp=%s rank=%s world_size=%s local_rank=%s liquid_data_mode=%s liquid_start=%s liquid_end=%s liquid_limit=%s liquid_max_samples=%s liquid_sample_mode=%s",
+            "training-v2 started interval=%ss run_once=%s enable_vc=%s enable_liquid=%s enable_backbone_exp=%s rank=%s world_size=%s local_rank=%s liquid_data_mode=%s liquid_train_mode=%s liquid_lookback_days=%s liquid_start=%s liquid_end=%s liquid_limit=%s liquid_max_samples=%s liquid_sample_mode=%s",
             TRAIN_INTERVAL_SEC,
             TRAIN_RUN_ONCE,
             TRAIN_ENABLE_VC,
@@ -185,6 +187,8 @@ class TrainingServiceV2:
             self.world_size,
             self.local_rank,
             getattr(self.liquid_trainer, "train_data_mode", "production"),
+            getattr(self.liquid_trainer, "train_mode", "production"),
+            getattr(self.liquid_trainer, "train_lookback_days", 0),
             (getattr(self.liquid_trainer, "train_start", None) or ""),
             (getattr(self.liquid_trainer, "train_end", None) or ""),
             getattr(self.liquid_trainer, "train_limit", 0),
@@ -215,6 +219,8 @@ if __name__ == "__main__":
     ap.add_argument("--liquid-limit", type=int, default=LIQUID_TRAIN_LIMIT)
     ap.add_argument("--liquid-max-samples", type=int, default=LIQUID_TRAIN_MAX_SAMPLES)
     ap.add_argument("--liquid-sample-mode", default=LIQUID_TRAIN_SAMPLE_MODE)
+    ap.add_argument("--liquid-train-mode", default=LIQUID_TRAIN_MODE, choices=["production", "fast"])
+    ap.add_argument("--liquid-lookback-days", type=int, default=LIQUID_TRAIN_LOOKBACK_DAYS)
     ap.add_argument("--liquid-data-mode", default=LIQUID_DATA_MODE, choices=["production", "research"])
     cli_args = ap.parse_args()
 
@@ -232,6 +238,8 @@ if __name__ == "__main__":
 
     dist_ctx = _init_distributed()
     try:
+        os.environ["LIQUID_TRAIN_MODE"] = str(cli_args.liquid_train_mode or LIQUID_TRAIN_MODE)
+        os.environ["LIQUID_TRAIN_LOOKBACK_DAYS"] = str(max(1, int(cli_args.liquid_lookback_days)))
         asyncio.run(
             TrainingServiceV2(
                 rank=dist_ctx["rank"],

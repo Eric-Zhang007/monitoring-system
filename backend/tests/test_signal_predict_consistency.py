@@ -19,6 +19,9 @@ def _stub_liquid_prediction(symbol: str, horizon: str):
             "expected_return": 0.023,
             "signal_confidence": 0.82,
             "vol_forecast": 0.11,
+            "expected_return_horizons": {"1h": 0.018, "4h": 0.021, "1d": 0.023, "7d": 0.027},
+            "signal_confidence_horizons": {"1h": 0.80, "4h": 0.81, "1d": 0.82, "7d": 0.79},
+            "vol_forecast_horizons": {"1h": 0.09, "4h": 0.10, "1d": 0.11, "7d": 0.13},
             "stack": {"nn": 0.02, "tabular": 0.026, "alpha": 0.7},
             "degraded": False,
             "degraded_reasons": [],
@@ -57,5 +60,8 @@ def test_predict_and_signal_share_same_liquid_scores(monkeypatch):
             )
         )
     )
-    assert abs(float(pred_resp["expected_return"]) - float(sig_resp.score)) < 1e-12
-    assert abs(float(pred_resp["signal_confidence"]) - float(sig_resp.confidence)) < 1e-12
+    assert abs(float(pred_resp["score_horizons"]["1d"]) - float(sig_resp.score)) < 1e-12
+    assert abs(float(pred_resp["signal_confidence"]["1d"]) - float(sig_resp.confidence)) < 1e-12
+    assert str(pred_resp["selected_horizon"]) == "1d"
+    assert isinstance(pred_resp["expected_return"], dict)
+    assert "4h" in pred_resp["expected_return"]

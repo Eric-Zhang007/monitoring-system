@@ -71,3 +71,28 @@ def test_predict_liquid_stack_exposes_tabular_fusion_fields(monkeypatch):
     assert str(stack.get("tabular_mode")) == "residual_gate"
     assert abs(float(stack.get("tabular_base") or 0.0) - 0.07) < 1e-12
     assert abs(float(stack.get("tabular_gate") or 0.0) - 0.5) < 1e-12
+
+
+def test_tabular_multi_model_meta_prediction_returns_horizon_maps(monkeypatch):
+    router = ModelRouter()
+    bundle = {
+        "feature_dim": 3,
+        "x_mean": np.zeros(3, dtype=np.float32),
+        "x_std": np.ones(3, dtype=np.float32),
+        "default_horizon": "4h",
+        "horizon_models": {
+            "1h": {"weights": np.array([0.1, 0.0, 0.0], dtype=np.float32), "vol_weights": np.array([0.2, 0.0, 0.0], dtype=np.float32)},
+            "4h": {"weights": np.array([0.0, 0.2, 0.0], dtype=np.float32), "vol_weights": np.array([0.0, 0.1, 0.0], dtype=np.float32)},
+            "1d": {"weights": np.array([0.0, 0.0, 0.3], dtype=np.float32), "vol_weights": np.array([0.0, 0.0, 0.1], dtype=np.float32)},
+            "7d": {"weights": np.array([0.1, 0.1, 0.1], dtype=np.float32), "vol_weights": np.array([0.1, 0.1, 0.1], dtype=np.float32)},
+        },
+        "meta_aggregator": {"model_type": "linear_meta", "weights": [0.25, 0.25, 0.25, 0.25], "horizons": ["1h", "4h", "1d", "7d"]},
+    }
+    monkeypatch.setattr(router, "_load_liquid_tabular_model", lambda _symbol: bundle)
+
+    pred, meta = router._predict_liquid_tabular_with_meta("BTC", np.array([1.0, 2.0, 3.0], dtype=np.float32))
+    assert str(meta.get("mode")) == "multi_model_meta"
+    assert str(meta.get("default_horizon")) == "4h"
+    expected = meta.get("expected_return_horizons") if isinstance(meta.get("expected_return_horizons"), dict) else {}
+    assert set(expected.keys()) == {"1h", "4h", "1d", "7d"}
+    assert abs(float(pred) - float(expected.get("4h") or 0.0)) < 1e-12

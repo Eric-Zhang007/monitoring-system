@@ -81,7 +81,7 @@ class VCPredictRequest(BaseModel):
 
 class LiquidPredictRequest(BaseModel):
     symbol: str
-    horizon: Literal["1h", "1d", "7d"] = "1d"
+    horizon: Literal["1h", "4h", "1d", "7d"] = "1d"
 
 
 class PredictionExplanation(BaseModel):
@@ -131,7 +131,7 @@ class BacktestRunRequest(BaseModel):
     data_regime: DataRegimeType = "prod_live"
     score_source: Literal["model", "heuristic"] = "model"
     require_model_artifact: bool = True
-    horizon: Literal["1h", "1d", "7d"] = "1d"
+    horizon: Literal["1h", "4h", "1d", "7d"] = "1d"
     model_name: Optional[str] = None
     model_version: Optional[str] = None
     data_version: str = Field(default="v1", min_length=1, max_length=64)
@@ -187,7 +187,7 @@ class TaskStatusResponse(BaseModel):
 class SignalGenerateRequest(BaseModel):
     track: TrackType
     target: str
-    horizon: Literal["1h", "1d", "7d"] = "1d"
+    horizon: Literal["1h", "4h", "1d", "7d"] = "1d"
     policy: str = "baseline-v2"
     min_confidence: float = Field(default=0.4, ge=0.0, le=1.0)
     strategy_id: str = Field(default="default-liquid-v1", min_length=1, max_length=64)
@@ -215,7 +215,7 @@ class SignalInput(BaseModel):
     action: Literal["buy", "sell", "hold"]
     score: float
     confidence: float = Field(ge=0.0, le=1.0)
-    horizon: Literal["1h", "1d", "7d"] = "1d"
+    horizon: Literal["1h", "4h", "1d", "7d"] = "1d"
 
 
 class RebalancePosition(BaseModel):
@@ -241,6 +241,7 @@ class PortfolioRebalanceResponse(BaseModel):
     orders: List[Dict[str, Any]]
     risk_ok: bool
     risk_violations: List[str]
+    allocator_details: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RiskLimitsResponse(BaseModel):

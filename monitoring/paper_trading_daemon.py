@@ -111,6 +111,7 @@ def _run_cycle(
     timeout_sec: float,
     state_path: Path,
     history_path: Path,
+    execution_event_path: Path,
     control_path: Path,
 ) -> Dict[str, Any]:
     state = _load_json(state_path)
@@ -207,6 +208,9 @@ def _run_cycle(
                     "source": "paper_trading_daemon",
                     "signal_confidence": confidence,
                     "signal_id": sig.get("signal_id"),
+                    "horizon": horizon,
+                    "selected_horizon": horizon,
+                    "strategy_bucket": str(sig.get("strategy_bucket") or "event"),
                 },
             }
         )
@@ -268,6 +272,21 @@ def _run_cycle(
         },
         timeout_sec=timeout_sec,
     )
+    for ord_row in list(run_out.get("orders") or []):
+        if not isinstance(ord_row, dict):
+            continue
+        event_payload = {
+            "timestamp": _now_iso(),
+            "decision_id": decision_id,
+            "symbol": str(ord_row.get("target") or ""),
+            "horizon": str(((ord_row.get("metadata") or {}) if isinstance(ord_row.get("metadata"), dict) else {}).get("horizon") or horizon),
+            "strategy_bucket": str(((ord_row.get("metadata") or {}) if isinstance(ord_row.get("metadata"), dict) else {}).get("strategy_bucket") or ""),
+            "execution_policy": str(ord_row.get("execution_policy") or ""),
+            "execution_trace": dict(ord_row.get("execution_trace") or {}),
+            "execution": dict(ord_row.get("execution") or {}),
+            "status": str(((ord_row.get("execution") or {}) if isinstance(ord_row.get("execution"), dict) else {}).get("status") or ""),
+        }
+        _append_jsonl(execution_event_path, event_payload)
 
     cycle = {
         **base_cycle,
@@ -292,7 +311,7 @@ def main() -> int:
     parser.add_argument("--api-base", default=os.getenv("API_BASE", "http://localhost:8000"))
     parser.add_argument("--database-url", default=os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor"))
     parser.add_argument("--symbols", default=os.getenv("LIQUID_SYMBOLS", DEFAULT_SYMBOLS))
-    parser.add_argument("--horizon", default=os.getenv("PAPER_HORIZON", "1d"), choices=["1h", "1d", "7d"])
+    parser.add_argument("--horizon", default=os.getenv("PAPER_HORIZON", "1d"), choices=["1h", "4h", "1d", "7d"])
     parser.add_argument("--min-confidence", type=float, default=float(os.getenv("PAPER_MIN_CONFIDENCE", "0.45")))
     parser.add_argument("--strategy-id", default=os.getenv("PAPER_STRATEGY_ID", "continuous-paper-v1"))
     parser.add_argument("--capital-per-order-usd", type=float, default=float(os.getenv("PAPER_CAPITAL_PER_ORDER_USD", "300.0")))
@@ -301,6 +320,10 @@ def main() -> int:
     parser.add_argument("--interval-sec", type=float, default=float(os.getenv("PAPER_DAEMON_INTERVAL_SEC", "60")))
     parser.add_argument("--state-file", default=os.getenv("PAPER_STATE_FILE", "artifacts/paper/paper_state.json"))
     parser.add_argument("--history-file", default=os.getenv("PAPER_HISTORY_FILE", "artifacts/paper/paper_history.jsonl"))
+    parser.add_argument(
+        "--execution-events-file",
+        default=os.getenv("PAPER_EXECUTION_EVENTS_FILE", "artifacts/paper/paper_execution_events.jsonl"),
+    )
     parser.add_argument("--control-file", default=os.getenv("LIVE_CONTROL_FILE", "artifacts/ops/live_control_state.json"))
     parser.add_argument("--loop", action="store_true")
     args = parser.parse_args()
@@ -311,6 +334,7 @@ def main() -> int:
 
     state_path = Path(args.state_file)
     history_path = Path(args.history_file)
+    execution_event_path = Path(args.execution_events_file)
     control_path = Path(args.control_file)
 
     if bool(args.loop):
@@ -327,6 +351,7 @@ def main() -> int:
                     timeout_sec=float(args.request_timeout_sec),
                     state_path=state_path,
                     history_path=history_path,
+                    execution_event_path=execution_event_path,
                     control_path=control_path,
                 )
             except Exception as exc:
@@ -352,9 +377,10 @@ def main() -> int:
             max_orders=int(args.max_orders),
             timeout_sec=float(args.request_timeout_sec),
             state_path=state_path,
-            history_path=history_path,
-            control_path=control_path,
-        )
+                history_path=history_path,
+                execution_event_path=execution_event_path,
+                control_path=control_path,
+            )
         print(json.dumps(cycle, ensure_ascii=False))
 
     return 0

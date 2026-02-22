@@ -72,11 +72,17 @@
   - `backend/tests/test_liquid_model_service_artifact_fallback.py`
 
 ## Validation Results
-- `pytest -q tests`
-  - `13 passed, 8 skipped`
-- `pytest -q backend/tests/test_model_artifact_manifest_validation.py backend/tests/test_model_router_core.py backend/tests/test_model_router_residual_fusion.py backend/tests/test_liquid_model_service_artifact_fallback.py`
-  - `4 passed, 1 skipped`
+- `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 pytest -q tests/test_strict_train_artifact_can_infer.py tests/test_model_output_contract.py tests/test_backbone_registry.py tests/test_dist_head_shapes.py tests/test_patchtst_patchify.py tests/test_itransformer_shapes.py tests/test_tft_minimal.py tests/test_gate_behavior.py tests/test_vc_train_infer_parity.py`
+  - `12 passed, 1 warning`
+- `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 pytest -q tests/test_train_infer_parity.py`
+  - `1 passed`
+- Combined strict-model + OMS chain:
+  - `46 passed, 1 warning` (see `EXECUTION_OMS_PROGRESS.md` command list)
 
 ## Active Issues
-- Runtime environment currently has no `torch` installed for tests; torch-dependent tests are guarded with `importorskip` and show as skipped.
-- Full backend test suite was not run in this pass; strict-path and touched tests were run.
+- Resolved: installed `torch` into the pytest runtime (`/usr/bin/python3`) and removed torch-skip from strict model gate tests.
+- Fixed in this pass:
+  - `training/train_liquid.py` accepted small walk-forward windows (`train_days` no longer hard-clamped to 14).
+  - `backend/liquid_model_service.py` quantile tensor rank handling fixed (`q.shape[-1]` based checks).
+  - `tests/test_execution_e2e_paper.py` torch stub no longer pollutes global `sys.modules` across suite.
+- Residual warning: torch nested-tensor prototype warning during strict artifact integration test (non-failing).

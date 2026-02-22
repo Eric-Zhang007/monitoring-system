@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
@@ -197,6 +198,7 @@ def insert_fills(connector, child_id: int, fills: Sequence[Dict[str, Any]]) -> L
             rows = [
                 (
                     int(child_id),
+                    _fill_key(int(child_id), f),
                     f.get("fill_ts") or _utcnow(),
                     float(f.get("qty") or 0.0),
                     float(f.get("price") or 0.0),
@@ -214,15 +216,38 @@ def insert_fills(connector, child_id: int, fills: Sequence[Dict[str, Any]]) -> L
                 cur,
                 """
                 INSERT INTO execution_fills (
-                    child_order_id, fill_ts, qty, price, fee, fee_currency, liquidity_flag, raw
+                    child_order_id, fill_key, fill_ts, qty, price, fee, fee_currency, liquidity_flag, raw
                 ) VALUES %s
+                ON CONFLICT (fill_key) DO NOTHING
                 RETURNING id
                 """,
                 rows,
-                template="(%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+                template="(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
                 fetch=True,
             )
             return [int(r["id"]) for r in inserted]
+
+
+def _fill_key(child_id: int, fill: Dict[str, Any]) -> str:
+    ts = fill.get("fill_ts")
+    if isinstance(ts, datetime):
+        ts_str = ts.isoformat()
+    else:
+        ts_str = str(ts or "")
+    raw = fill.get("raw") if isinstance(fill.get("raw"), dict) else {}
+    base = "|".join(
+        [
+            str(int(child_id)),
+            ts_str,
+            f"{float(fill.get('qty') or 0.0):.12f}",
+            f"{float(fill.get('price') or 0.0):.12f}",
+            f"{float(fill.get('fee') or 0.0):.12f}",
+            str(fill.get("fee_currency") or ""),
+            str(fill.get("liquidity_flag") or ""),
+            json.dumps(raw, sort_keys=True, ensure_ascii=True, separators=(",", ":")),
+        ]
+    )
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 
 def update_parent_from_fills(connector, parent_order_id: int) -> Dict[str, Any]:

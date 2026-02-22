@@ -142,17 +142,17 @@ class LiquidModelService:
         horizons = [str(h) for h in list(self.ckpt.get("horizons") or ["1h", "4h", "1d", "7d"])]
         pred_map = {h: float(mu[i]) for i, h in enumerate(horizons)}
         conf_map = {h: float(conf[i]) for i, h in enumerate(horizons)}
-        if q is not None and q.shape[2] >= 3:
+        if q is not None and q.ndim >= 2 and q.shape[-1] >= 3:
             vol_map = {h: float(max(1e-6, (q[i, -1] - q[i, 0]) / 2.56)) for i, h in enumerate(horizons)}
         else:
             vol_map = {h: float(max(1e-6, sigma_map[i])) for i, h in enumerate(horizons)}
 
         quantiles_map = None
-        if q is not None:
+        if q is not None and q.ndim >= 2:
             quantiles_map = {
                 h: {
                     "p10": float(q[i, 0]),
-                    "p50": float(q[i, 1] if q.shape[2] > 1 else q[i, 0]),
+                    "p50": float(q[i, 1] if q.shape[-1] > 1 else q[i, 0]),
                     "p90": float(q[i, -1]),
                 }
                 for i, h in enumerate(horizons)

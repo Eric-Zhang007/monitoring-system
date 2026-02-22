@@ -1,17 +1,33 @@
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
+import yaml
 
 
-VC_FEATURE_KEYS = [
-    "event_type_score",
-    "source_tier_norm",
-    "confidence_score",
-    "event_importance",
-    "novelty_score",
-]
+VC_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "vc_feature_schema.yaml"
+
+
+def _load_vc_feature_keys() -> List[str]:
+    raw = yaml.safe_load(VC_SCHEMA_PATH.read_text(encoding="utf-8"))
+    feats = raw.get("features") if isinstance(raw, dict) else []
+    out: List[str] = []
+    for item in feats if isinstance(feats, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name:
+            out.append(name)
+    if not out:
+        raise RuntimeError("vc_feature_schema_empty")
+    return out
+
+
+VC_FEATURE_KEYS = _load_vc_feature_keys()
+VC_SCHEMA_HASH = hashlib.sha256(VC_SCHEMA_PATH.read_bytes()).hexdigest()
 
 
 def event_type_score(event_type: str) -> float:
@@ -50,4 +66,15 @@ def label_from_event_row(row: Dict[str, Any]) -> int:
 def vector_from_context(events: List[Dict[str, Any]]) -> np.ndarray:
     if not events:
         return np.zeros((len(VC_FEATURE_KEYS),), dtype=np.float32)
-    return vector_from_event_row(dict(events[0]))
+    if len(events) == 1:
+        return vector_from_event_row(dict(events[0]))
+    mats = []
+    weights = []
+    n = len(events)
+    for i, ev in enumerate(events):
+        mats.append(vector_from_event_row(dict(ev)))
+        # recency weight (earlier list item assumed newer)
+        weights.append(float(np.exp(-(i / max(1.0, n / 3.0)))))
+    mat = np.stack(mats, axis=0)
+    w = np.array(weights, dtype=np.float32).reshape(-1, 1)
+    return (mat * w).sum(axis=0) / np.clip(w.sum(axis=0), 1e-8, None)

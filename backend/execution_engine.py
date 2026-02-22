@@ -371,6 +371,7 @@ class CoinbaseLiveAdapter(ExecutionAdapterBase):
         adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        self._idempotency: Dict[str, Dict[str, Any]] = {}
 
     def _build_jwt(self, method: str, path: str) -> str:
         if jwt is None:
@@ -490,6 +491,9 @@ class CoinbaseLiveAdapter(ExecutionAdapterBase):
         limit_price = child_order.get("limit_price")
         tif = str(child_order.get("tif") or context.get("time_in_force") or "IOC").upper()
         client_order_id = str(child_order.get("client_order_id") or uuid.uuid4().hex)
+        if client_order_id in self._idempotency:
+            hit = dict(self._idempotency[client_order_id])
+            return hit.get("venue_order_id"), {**hit, "idempotency_hit": True}
         if qty <= 0:
             return None, {"status": "rejected", "reject_reason": "invalid_quantity", "filled_qty": 0.0, "avg_fill_price": None, "fees_paid": 0.0}
         cfg_key = "limit_limit_gtc"
@@ -512,7 +516,7 @@ class CoinbaseLiveAdapter(ExecutionAdapterBase):
         snap = self._extract_order_snapshot(resp)
         order_id = str(snap.get("order_id") or "") or None
         status = self._map_status(str(snap.get("status") or ""), float(snap.get("filled_qty") or 0.0), qty)
-        return order_id, {
+        out = {
             "status": status if code < 400 else "rejected",
             "filled_qty": float(snap.get("filled_qty") or 0.0),
             "avg_fill_price": snap.get("avg_fill_price"),
@@ -522,6 +526,8 @@ class CoinbaseLiveAdapter(ExecutionAdapterBase):
             "client_order_id": client_order_id,
             "venue_order_id": order_id,
         }
+        self._idempotency[client_order_id] = dict(out)
+        return order_id, out
 
     def poll_order(self, venue_order_id: str, timeout: float) -> Dict[str, Any]:
         polled = self._poll_order(str(venue_order_id), timeout_sec=float(timeout or 2.0), poll_interval=0.4)
@@ -885,6 +891,7 @@ class BitgetLiveAdapter(ExecutionAdapterBase):
         self.session.mount("http://", adapter)
         self._rules_cache: Dict[str, Dict[str, Any]] = {}
         self._order_lookup: Dict[str, Dict[str, Any]] = {}
+        self._idempotency: Dict[str, Dict[str, Any]] = {}
 
     def _sign(self, ts_ms: str, method: str, path: str, body: str) -> str:
         prehash = f"{ts_ms}{method.upper()}{path}{body}"
@@ -1006,6 +1013,9 @@ class BitgetLiveAdapter(ExecutionAdapterBase):
         qty = float(child_order.get("qty") or 0.0)
         tif = str(child_order.get("tif") or context.get("time_in_force") or "IOC").upper()
         client_oid = str(child_order.get("client_order_id") or f"ms-{uuid.uuid4().hex[:16]}")
+        if client_oid in self._idempotency:
+            hit = dict(self._idempotency[client_oid])
+            return hit.get("venue_order_id"), {**hit, "idempotency_hit": True}
         limit_price = child_order.get("limit_price")
         if not self.api_key or not self.api_secret or not self.api_passphrase:
             return None, {"status": "rejected", "filled_qty": 0.0, "avg_fill_price": None, "fees_paid": 0.0, "reject_reason": "bitget_credentials_not_configured"}
@@ -1071,7 +1081,7 @@ class BitgetLiveAdapter(ExecutionAdapterBase):
             "product_type": product_type,
             "requested_qty": qty,
         }
-        return order_id, {
+        out = {
             "status": "submitted",
             "filled_qty": 0.0,
             "avg_fill_price": None,
@@ -1081,6 +1091,8 @@ class BitgetLiveAdapter(ExecutionAdapterBase):
             "venue_order_id": order_id,
             "client_order_id": client_oid,
         }
+        self._idempotency[client_oid] = dict(out)
+        return order_id, out
 
     def poll_order(self, venue_order_id: str, timeout: float) -> Dict[str, Any]:
         _ = timeout
@@ -1432,6 +1444,27 @@ class ExecutionEngine:
         return "submit"
 
     @staticmethod
+    def _reject_category(reason: str) -> str:
+        r = str(reason or "").strip().lower()
+        if not r:
+            return "none"
+        if "invalid_quantity" in r:
+            return "invalid_quantity"
+        if "slippage" in r:
+            return "slippage"
+        if "precision" in r:
+            return "precision"
+        if "rate" in r:
+            return "rate_limited"
+        if "timeout" in r or "no_fill" in r:
+            return "timeout_or_no_fill"
+        if "risk" in r:
+            return "risk_blocked"
+        if "credential" in r or "signature" in r:
+            return "auth_error"
+        return "other"
+
+    @staticmethod
     def _ts_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
 
@@ -1486,6 +1519,7 @@ class ExecutionEngine:
         filled_parents = 0
         rejected_parents = 0
         market_missing = 0
+        t_decision_start = time.perf_counter()
 
         for order in orders:
             parent_id = int(order["id"])
@@ -1506,9 +1540,13 @@ class ExecutionEngine:
                 "market_type": market_type,
                 "est_price": float(order.get("est_price") or 0.0),
             }
+            if "allow_market_fallback" not in context:
+                context["allow_market_fallback"] = True
+            if "twap_interval_sec" not in context:
+                context["twap_interval_sec"] = float(os.getenv("EXEC_TWAP_INTERVAL_SEC", "0.5") or 0.5)
             plan = build_execution_plan(order=order, context=context, market_state=market_state)
             market_missing += int(plan.market_state_missing)
-            child_rows = [
+            child_template_rows = [
                 {
                     "decision_id": decision_id,
                     "client_order_id": c.client_order_id,
@@ -1524,13 +1562,23 @@ class ExecutionEngine:
                 }
                 for c in plan.child_orders
             ]
-            child_ids = repo.create_child_orders(parent_id, child_rows)
+            child_queue: List[Dict[str, Any]] = [dict(r) for r in child_template_rows]
             child_out: List[Dict[str, Any]] = []
             all_fills: List[Dict[str, Any]] = []
             saw_reject = False
-
-            for idx, child_id in enumerate(child_ids):
-                child_payload = dict(child_rows[idx])
+            market_fallback_count = 0
+            max_market_fallback = max(0, int(context.get("max_retries") or 0)) + 1
+            twap_interval_sec = float(context.get("twap_interval_sec") or 0.0)
+            requested_qty = float(order.get("quantity") or 0.0)
+            queue_idx = 0
+            while queue_idx < len(child_queue):
+                child_payload = dict(child_queue[queue_idx])
+                queue_idx += 1
+                created = repo.create_child_orders(parent_id, [child_payload])
+                if not created:
+                    saw_reject = True
+                    continue
+                child_id = int(created[0])
                 c_state = transition_child("new", "submit")
                 repo.update_child_order_status(
                     int(child_id),
@@ -1591,6 +1639,8 @@ class ExecutionEngine:
                     str(venue_order_id),
                     str(polled.get("status") or ""),
                 )
+                child_requested_qty = float(child_payload.get("qty") or 0.0)
+                child_polled_qty = float(polled.get("filled_qty") or 0.0)
                 pevent = self._status_event(str(polled.get("status") or "submitted"))
                 if pevent != "submit":
                     c_state = transition_child("submitted", pevent)
@@ -1610,6 +1660,31 @@ class ExecutionEngine:
                         },
                     },
                 )
+
+                # Non-terminal and under-filled limit child should be explicitly canceled before replacement.
+                if (
+                    str(c_state) in {"submitted", "partially_filled"}
+                    and child_payload.get("limit_price") is not None
+                    and child_polled_qty + 1e-12 < child_requested_qty
+                ):
+                    cancel_snapshot = exec_adapter.cancel_order(str(venue_order_id))
+                    cancel_status = str(cancel_snapshot.get("status") or "").lower()
+                    if cancel_status == "canceled":
+                        try:
+                            c_state = transition_child(str(c_state), "cancel")
+                        except Exception:
+                            c_state = "canceled"
+                        repo.update_child_order_status(
+                            int(child_id),
+                            status=str(c_state),
+                            venue_order_id=str(venue_order_id),
+                            lifecycle_append={
+                                "event": "cancel",
+                                "status": "canceled",
+                                "time": self._ts_iso(),
+                                "metrics": {},
+                            },
+                        )
 
                 fills = exec_adapter.fetch_fills(str(venue_order_id))
                 if not fills and float(polled.get("filled_qty") or 0.0) > 0 and float(polled.get("avg_fill_price") or 0.0) > 0:
@@ -1640,10 +1715,47 @@ class ExecutionEngine:
                         "poll": polled,
                     }
                 )
-                repo.update_parent_from_fills(parent_id)
+                parent_agg_now = repo.update_parent_from_fills(parent_id)
+
+                # marketable_limit residual routing: promote remaining qty to market IOC children.
+                if plan.style == "marketable_limit":
+                    remaining_qty = max(0.0, requested_qty - float(parent_agg_now.get("filled_qty") or 0.0))
+                    is_underfilled = remaining_qty > 1e-12
+                    if (
+                        bool(context.get("allow_market_fallback", True))
+                        and
+                        is_underfilled
+                        and market_fallback_count < max_market_fallback
+                        and str(c_state) in {"submitted", "partially_filled", "rejected", "canceled", "expired"}
+                    ):
+                        retry_idx = market_fallback_count + 1
+                        market_fallback_count += 1
+                        new_slice = int(child_payload.get("slice_index") or 0) + 1000 + retry_idx
+                        child_queue.append(
+                            {
+                                "decision_id": decision_id,
+                                "client_order_id": f"{decision_id}:{parent_id}:{new_slice}:{retry_idx}",
+                                "venue_order_id": None,
+                                "symbol": symbol,
+                                "side": side,
+                                "qty": float(round(remaining_qty, 12)),
+                                "limit_price": None,
+                                "tif": "IOC",
+                                "status": "new",
+                                "slice_index": new_slice,
+                                "lifecycle": [],
+                            }
+                        )
+
+                if (
+                    plan.style == "passive_twap"
+                    and adapter != "paper"
+                    and twap_interval_sec > 0.0
+                    and queue_idx < len(child_queue)
+                ):
+                    time.sleep(min(5.0, max(0.0, twap_interval_sec)))
 
             agg = repo.update_parent_from_fills(parent_id)
-            requested_qty = float(order.get("quantity") or 0.0)
             filled_qty_now = float(agg.get("filled_qty") or 0.0)
             if filled_qty_now >= max(0.0, requested_qty) - 1e-12 and requested_qty > 0:
                 agg_status = "filled"
@@ -1720,7 +1832,8 @@ class ExecutionEngine:
             else:
                 rejected_parents += 1
                 reason = str(execution.get("reject_reason") or "other")
-                reject_breakdown[reason] = reject_breakdown.get(reason, 0) + 1
+                reason_cat = self._reject_category(reason)
+                reject_breakdown[reason_cat] = reject_breakdown.get(reason_cat, 0) + 1
 
             merged_rows.append(
                 {
@@ -1739,6 +1852,7 @@ class ExecutionEngine:
             "rejected": rejected_parents,
             "reject_breakdown": reject_breakdown,
             "market_state_missing": market_missing,
+            "latency_sec": float(max(0.0, time.perf_counter() - t_decision_start)),
         }
         d_state = transition_decision("running", "complete")
         repo.finish_execution_decision(decision_id, d_state, summary=summary)

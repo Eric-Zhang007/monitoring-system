@@ -8,7 +8,13 @@ from typing import Any, Dict, List
 
 # v2_router imports model modules that depend on torch; this test only exercises
 # execution endpoints and can run with a tiny torch stub.
+_torch_stubbed = False
 if "torch" not in sys.modules:
+    try:
+        import torch  # type: ignore  # noqa: F401
+    except Exception:
+        _torch_stubbed = True
+if _torch_stubbed:
     torch_stub = types.ModuleType("torch")
     nn_stub = types.ModuleType("torch.nn")
     nn_func_stub = types.ModuleType("torch.nn.functional")
@@ -37,6 +43,11 @@ if "torch" not in sys.modules:
 import v2_router as router_mod
 from execution_engine import ExecutionEngine
 from schemas_v2 import ExecuteOrdersRequest, ExecutionOrderInput, SubmitExecutionOrdersRequest
+
+if _torch_stubbed:
+    sys.modules.pop("torch", None)
+    sys.modules.pop("torch.nn", None)
+    sys.modules.pop("torch.nn.functional", None)
 
 
 class _FakeRepo:

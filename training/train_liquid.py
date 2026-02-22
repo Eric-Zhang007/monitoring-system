@@ -116,7 +116,7 @@ def _build_cfg() -> TrainConfig:
         out_dir=Path(args.out_dir),
         model_id=str(args.model_id),
         cost_profile=str(args.cost_profile),
-        train_days=max(14, int(args.train_days)),
+        train_days=max(1, int(args.train_days)),
         val_days=max(1, int(args.val_days)),
         test_days=max(1, int(args.test_days)),
         purge_gap_hours=max(0, int(args.purge_gap_hours)),

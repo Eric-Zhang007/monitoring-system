@@ -324,6 +324,7 @@ CREATE INDEX IF NOT EXISTS idx_execution_child_orders_venue_order_id ON executio
 CREATE TABLE IF NOT EXISTS execution_fills (
     id BIGSERIAL PRIMARY KEY,
     child_order_id BIGINT NOT NULL REFERENCES execution_child_orders(id) ON DELETE CASCADE,
+    fill_key TEXT,
     fill_ts TIMESTAMPTZ NOT NULL,
     qty DOUBLE PRECISION NOT NULL,
     price DOUBLE PRECISION NOT NULL,
@@ -333,6 +334,8 @@ CREATE TABLE IF NOT EXISTS execution_fills (
     raw JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE execution_fills ADD COLUMN IF NOT EXISTS fill_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_fills_fill_key ON execution_fills(fill_key);
 CREATE INDEX IF NOT EXISTS idx_execution_fills_child_ts ON execution_fills(child_order_id, fill_ts);
 
 CREATE TABLE IF NOT EXISTS reconciliation_logs (

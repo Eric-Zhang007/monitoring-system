@@ -7,42 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict
 
-try:
-    import torch
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore[assignment]
+import numpy as np
+import torch
 
 from artifacts.validate import validate_manifest_dir
 from features.feature_contract import FEATURE_DIM, SCHEMA_HASH
 from inference.feature_reader import fetch_sequence
-from models.multimodal_gate import ResidualGateHead
-from models.patchtst import PatchTSTBackbone
-
-
-if torch is not None:
-    class LiquidSequenceModel(torch.nn.Module):
-        def __init__(self, *, lookback: int, feature_dim: int, d_model: int, n_layers: int, dropout: float, text_indices, quality_indices):
-            super().__init__()
-            self.backbone = PatchTSTBackbone(
-                feature_dim=feature_dim,
-                lookback=lookback,
-                d_model=d_model,
-                n_layers=n_layers,
-                dropout=dropout,
-            )
-            self.text_indices = list(text_indices)
-            self.quality_indices = list(quality_indices)
-            self.head = ResidualGateHead(hidden_dim=d_model, text_dim=len(self.text_indices), quality_dim=len(self.quality_indices), out_dim=4)
-
-        def forward(self, x_values: torch.Tensor, x_mask: torch.Tensor):
-            h = self.backbone(x_values, x_mask)
-            last_values = x_values[:, -1, :]
-            text_vec = last_values[:, self.text_indices]
-            quality_vec = last_values[:, self.quality_indices]
-            return self.head(h, text_vec, quality_vec)
-else:  # pragma: no cover
-    class LiquidSequenceModel:  # type: ignore[no-redef]
-        pass
+from models.liquid_model import build_liquid_model_from_checkpoint
 
 
 def _parse_ts(raw: str) -> datetime:
@@ -56,8 +27,6 @@ def _parse_ts(raw: str) -> datetime:
 
 
 def _load_model(model_dir: Path):
-    if torch is None:
-        raise RuntimeError("torch_required_for_inference")
     manifest = validate_manifest_dir(model_dir, expected_schema_hash=SCHEMA_HASH)
     weights_path = model_dir / manifest["files"]["weights"]
     ckpt = torch.load(weights_path, map_location="cpu")
@@ -71,34 +40,45 @@ def _load_model(model_dir: Path):
     if feature_dim != FEATURE_DIM:
         raise RuntimeError(f"feature_dim_mismatch_weights:{feature_dim}:{FEATURE_DIM}")
 
-    model = LiquidSequenceModel(
-        lookback=lookback,
-        feature_dim=feature_dim,
-        d_model=int(ckpt.get("d_model") or 128),
-        n_layers=int(ckpt.get("n_layers") or 2),
-        dropout=float(ckpt.get("dropout") or 0.1),
-        text_indices=list(ckpt.get("text_indices") or []),
-        quality_indices=list(ckpt.get("quality_indices") or []),
-    )
-    model.load_state_dict(ckpt["state_dict"])
+    model = build_liquid_model_from_checkpoint(ckpt)
     model.eval()
-    return model, manifest, lookback
+    return model, manifest, ckpt, lookback
 
 
-def _predict(model, values, mask) -> Dict[str, float]:
+def _predict(model, ckpt, values, mask) -> Dict[str, object]:
     xv = torch.tensor(values, dtype=torch.float32).unsqueeze(0)
     xm = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
     with torch.no_grad():
-        pred, gate = model(xv, xm)
-    p = pred.squeeze(0).cpu().numpy().tolist()
-    g = float(gate.squeeze(0).item())
-    return {
-        "ret_1h": float(p[0]),
-        "ret_4h": float(p[1]),
-        "ret_1d": float(p[2]),
-        "ret_7d": float(p[3]),
-        "gate": g,
+        out = model(xv, xm)
+    mu = out.mu.squeeze(0).cpu().numpy()
+    sigma = torch.exp(out.log_sigma).squeeze(0).cpu().numpy()
+    q = out.q.squeeze(0).cpu().numpy() if out.q is not None else None
+    dlogit = out.direction_logit.squeeze(0).cpu().numpy() if out.direction_logit is not None else None
+
+    cal = ckpt.get("calibration") if isinstance(ckpt.get("calibration"), dict) else {}
+    sigma_scale = float(cal.get("sigma_scale", 1.0) or 1.0)
+    direction_temperature = float(cal.get("direction_temperature", 1.0) or 1.0)
+
+    sigma_cal = np.clip(sigma * sigma_scale, 1e-6, None)
+    if dlogit is not None:
+        probs = 1.0 / (1.0 + np.exp(-np.clip(dlogit / max(1e-6, direction_temperature), -40.0, 40.0)))
+    else:
+        probs = 1.0 / (1.0 + np.exp(-np.clip(mu / np.clip(sigma_cal, 1e-6, None), -40.0, 40.0)))
+
+    horizons = [str(h) for h in list(ckpt.get("horizons") or ["1h", "4h", "1d", "7d"])]
+    payload: Dict[str, object] = {
+        "mu": {h: float(mu[i]) for i, h in enumerate(horizons)},
+        "sigma": {h: float(sigma_cal[i]) for i, h in enumerate(horizons)},
+        "confidence": {h: float(np.clip(probs[i], 0.01, 0.99)) for i, h in enumerate(horizons)},
     }
+    if q is not None:
+        payload["quantiles"] = {
+            h: {"p10": float(q[i, 0]), "p50": float(q[i, 1]), "p90": float(q[i, 2])}
+            for i, h in enumerate(horizons)
+        }
+    if dlogit is not None:
+        payload["direction_logit"] = {h: float(dlogit[i]) for i, h in enumerate(horizons)}
+    return payload
 
 
 def main() -> int:
@@ -110,7 +90,7 @@ def main() -> int:
     args = ap.parse_args()
 
     model_dir = Path(args.model_dir)
-    model, manifest, lookback = _load_model(model_dir)
+    model, manifest, ckpt, lookback = _load_model(model_dir)
 
     end_ts = _parse_ts(args.end_ts) if str(args.end_ts).strip() else datetime.now(timezone.utc)
     seq = fetch_sequence(
@@ -122,7 +102,7 @@ def main() -> int:
     if str(seq["schema_hash"]) != SCHEMA_HASH:
         raise RuntimeError("schema_hash_mismatch_sequence")
 
-    pred = _predict(model, seq["values"], seq["mask"])
+    pred = _predict(model, ckpt, seq["values"], seq["mask"])
 
     out = {
         "status": "ok",

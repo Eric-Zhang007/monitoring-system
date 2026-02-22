@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, List, Sequence
 
 import numpy as np
@@ -14,9 +14,12 @@ except Exception:  # pragma: no cover
     torch = None  # type: ignore[assignment]
     Dataset = object  # type: ignore[assignment]
 
-from features.feature_contract import FEATURE_DIM, SCHEMA_HASH
+from features.feature_contract import FEATURE_DIM, FEATURE_INDEX, SCHEMA_HASH
 from features.sequence import build_sequence
 from training.labels.liquid_labels import compute_label_targets
+
+
+HORIZONS = ("1h", "4h", "1d", "7d")
 
 
 @dataclass(frozen=True)
@@ -42,13 +45,20 @@ class LiquidSequenceDataset(Dataset):
         s = self.samples[idx]
         x_values = torch.tensor(s.x_values, dtype=torch.float32)
         x_mask = torch.tensor(s.x_mask, dtype=torch.float32)
-        y = torch.tensor([float(s.y[k]) for k in ("ret_1h_net", "ret_4h_net", "ret_1d_net", "ret_7d_net")], dtype=torch.float32)
+        y_raw = torch.tensor([float(s.y[f"ret_{h}_raw"]) for h in HORIZONS], dtype=torch.float32)
+        y_net = torch.tensor([float(s.y[f"ret_{h}_net"]) for h in HORIZONS], dtype=torch.float32)
+        cost_bps = torch.tensor([float(s.y[f"cost_{h}_bps"]) for h in HORIZONS], dtype=torch.float32)
+        direction = torch.tensor([float(s.y[f"direction_{h}"]) for h in HORIZONS], dtype=torch.float32)
         return {
             "symbol": s.symbol,
             "end_ts": s.end_ts.isoformat(),
             "x_values": x_values,
             "x_mask": x_mask,
-            "y": y,
+            "y_raw": y_raw,
+            "y": y_net,
+            "y_net": y_net,
+            "cost_bps": cost_bps,
+            "direction": direction,
             "schema_hash": s.schema_hash,
         }
 
@@ -66,6 +76,17 @@ def _parse_ts(raw: object) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _liquidity_context(last_values: np.ndarray) -> Dict[str, float]:
+    depth_idx = FEATURE_INDEX.get("orderbook_depth_total")
+    vol_idx = FEATURE_INDEX.get("vol_12")
+    context: Dict[str, float] = {}
+    if depth_idx is not None:
+        context["orderbook_depth_total"] = float(last_values[int(depth_idx)])
+    if vol_idx is not None:
+        context["realized_vol"] = float(abs(last_values[int(vol_idx)]))
+    return context
+
+
 def load_training_samples(
     *,
     db_url: str,
@@ -74,6 +95,7 @@ def load_training_samples(
     end_ts: datetime,
     lookback: int,
     max_samples_per_symbol: int = 0,
+    cost_profile_name: str = "standard",
 ) -> List[SequenceSample]:
     out: List[SequenceSample] = []
     horizon_steps = {
@@ -112,10 +134,21 @@ def load_training_samples(
                         continue
                     if px_list[i] <= 0:
                         continue
-                    labels = compute_label_targets(prices=px_list, index=i, horizon_steps=horizon_steps)
+
                     seq = build_sequence(db_url=db_url, symbol=sym, end_ts=ts, lookback=lookback)
                     if seq.values.shape != (lookback, FEATURE_DIM):
                         continue
+
+                    liq_ctx = _liquidity_context(seq.values[-1, :])
+                    labels = compute_label_targets(
+                        prices=px_list,
+                        index=i,
+                        horizon_steps=horizon_steps,
+                        market_state={"realized_vol": float(abs(liq_ctx.get("realized_vol", 0.0)))},
+                        liquidity_features=liq_ctx,
+                        turnover_estimate=0.5,
+                        cost_profile_name=cost_profile_name,
+                    )
                     out.append(
                         SequenceSample(
                             symbol=sym,

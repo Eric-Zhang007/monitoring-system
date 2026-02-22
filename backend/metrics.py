@@ -1,6 +1,41 @@
 from __future__ import annotations
 
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+try:
+    from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+except Exception:  # pragma: no cover
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
+
+    class _DummyMetric:
+        def labels(self, **kwargs):
+            _ = kwargs
+            return self
+
+        def inc(self, amount: float = 1.0):
+            _ = amount
+            return None
+
+        def observe(self, value: float):
+            _ = value
+            return None
+
+        def set(self, value: float):
+            _ = value
+            return None
+
+    def Counter(*args, **kwargs):  # type: ignore
+        _ = (args, kwargs)
+        return _DummyMetric()
+
+    def Gauge(*args, **kwargs):  # type: ignore
+        _ = (args, kwargs)
+        return _DummyMetric()
+
+    def Histogram(*args, **kwargs):  # type: ignore
+        _ = (args, kwargs)
+        return _DummyMetric()
+
+    def generate_latest() -> bytes:
+        return b""
 
 HTTP_REQUESTS_TOTAL = Counter(
     "ms_http_requests_total",
@@ -31,6 +66,37 @@ EXECUTION_REJECTS_TOTAL = Counter(
     "ms_execution_rejects_total",
     "Execution rejects by adapter and normalized reason.",
     ["adapter", "reason"],
+)
+
+EXEC_CHILD_ORDERS_TOTAL = Counter(
+    "ms_exec_child_orders_total",
+    "Child-order lifecycle outcomes by venue/adapter/status.",
+    ["venue", "adapter", "status"],
+)
+
+EXEC_FILLS_TOTAL = Counter(
+    "ms_exec_fills_total",
+    "Execution fills count by venue/adapter.",
+    ["venue", "adapter"],
+)
+
+EXEC_SLIPPAGE_BPS = Histogram(
+    "ms_exec_slippage_bps",
+    "Execution slippage distribution (bps) by venue/adapter/horizon bucket.",
+    ["venue", "adapter", "horizon_bucket"],
+    buckets=(-100, -50, -25, -10, -5, -2, -1, 0, 1, 2, 5, 10, 25, 50, 100),
+)
+
+EXEC_RECON_DRIFT_EVENTS_TOTAL = Counter(
+    "ms_exec_recon_drift_events_total",
+    "Count of reconciliation drift events by venue.",
+    ["venue"],
+)
+
+EXEC_IDEMPOTENCY_HITS_TOTAL = Counter(
+    "ms_exec_idempotency_hits_total",
+    "Count of idempotent duplicate submit hits by venue.",
+    ["venue"],
 )
 
 SIGNAL_LATENCY_SECONDS = Histogram(
@@ -225,6 +291,11 @@ __all__ = [
     "EXECUTION_ORDERS_TOTAL",
     "EXECUTION_REJECT_RATE",
     "EXECUTION_REJECTS_TOTAL",
+    "EXEC_CHILD_ORDERS_TOTAL",
+    "EXEC_FILLS_TOTAL",
+    "EXEC_SLIPPAGE_BPS",
+    "EXEC_RECON_DRIFT_EVENTS_TOTAL",
+    "EXEC_IDEMPOTENCY_HITS_TOTAL",
     "SIGNAL_LATENCY_SECONDS",
     "EXECUTION_LATENCY_SECONDS",
     "DATA_FRESHNESS_SECONDS",

@@ -284,6 +284,8 @@ def _run_cycle(
             "execution_policy": str(ord_row.get("execution_policy") or ""),
             "execution_trace": dict(ord_row.get("execution_trace") or {}),
             "execution": dict(ord_row.get("execution") or {}),
+            "child_orders": list(ord_row.get("child_orders") or []),
+            "fills": list(ord_row.get("fills") or []),
             "status": str(((ord_row.get("execution") or {}) if isinstance(ord_row.get("execution"), dict) else {}).get("status") or ""),
         }
         _append_jsonl(execution_event_path, event_payload)

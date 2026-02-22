@@ -7,44 +7,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import HTTPException
+import torch
 
 from artifacts.validate import validate_manifest_dir
 from features.feature_contract import FEATURE_DIM, SCHEMA_HASH
 from inference.feature_reader import fetch_sequence
 from liquid_model_registry import get_active_model as get_registry_active_model
-from models.multimodal_gate import ResidualGateHead
-from models.patchtst import PatchTSTBackbone
-
-try:
-    import torch
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore[assignment]
-
-
-if torch is not None:
-    class _LiquidSequenceModel(torch.nn.Module):
-        def __init__(self, *, lookback: int, feature_dim: int, d_model: int, n_layers: int, dropout: float, text_indices, quality_indices):
-            super().__init__()
-            self.backbone = PatchTSTBackbone(
-                feature_dim=feature_dim,
-                lookback=lookback,
-                d_model=d_model,
-                n_layers=n_layers,
-                dropout=dropout,
-            )
-            self.text_indices = list(text_indices)
-            self.quality_indices = list(quality_indices)
-            self.head = ResidualGateHead(hidden_dim=d_model, text_dim=len(self.text_indices), quality_dim=len(self.quality_indices), out_dim=4)
-
-        def forward(self, x_values: torch.Tensor, x_mask: torch.Tensor):
-            h = self.backbone(x_values, x_mask)
-            last_values = x_values[:, -1, :]
-            text_vec = last_values[:, self.text_indices]
-            quality_vec = last_values[:, self.quality_indices]
-            return self.head(h, text_vec, quality_vec)
-else:  # pragma: no cover
-    class _LiquidSequenceModel:  # type: ignore[no-redef]
-        pass
+from models.liquid_model import build_liquid_model_from_checkpoint
 
 
 class LiquidModelService:
@@ -66,15 +35,13 @@ class LiquidModelService:
         self.default_model_version = str(default_model_version)
         self.model_dir = Path(str(os.getenv("LIQUID_MODEL_DIR", "artifacts/models/liquid_main")))
 
-        self.model, self.manifest, self.lookback = self._load_model_or_fail()
+        self.model, self.manifest, self.ckpt, self.lookback = self._load_model_or_fail()
 
     @staticmethod
     def _utcnow() -> datetime:
         return datetime.now(timezone.utc)
 
     def _load_model_or_fail(self):
-        if torch is None:
-            raise RuntimeError("torch_required_for_liquid_inference")
         manifest = validate_manifest_dir(self.model_dir, expected_schema_hash=SCHEMA_HASH)
         weights = self.model_dir / manifest["files"]["weights"]
         ckpt = torch.load(weights, map_location="cpu")
@@ -87,18 +54,9 @@ class LiquidModelService:
         if fdim != FEATURE_DIM:
             raise RuntimeError(f"feature_dim_mismatch_weights:{fdim}:{FEATURE_DIM}")
 
-        model = _LiquidSequenceModel(
-            lookback=lookback,
-            feature_dim=fdim,
-            d_model=int(ckpt.get("d_model") or 128),
-            n_layers=int(ckpt.get("n_layers") or 2),
-            dropout=float(ckpt.get("dropout") or 0.1),
-            text_indices=list(ckpt.get("text_indices") or []),
-            quality_indices=list(ckpt.get("quality_indices") or []),
-        )
-        model.load_state_dict(ckpt["state_dict"])
+        model = build_liquid_model_from_checkpoint(ckpt)
         model.eval()
-        return model, manifest, lookback
+        return model, manifest, ckpt, lookback
 
     def _active_liquid_model(self, *, symbol: str = "", horizon: str = "1h") -> Tuple[str, str]:
         reg_hit = get_registry_active_model(symbol=symbol, horizon=horizon)
@@ -143,6 +101,19 @@ class LiquidModelService:
         except Exception:
             return False
 
+    def _calibrated_confidence(self, mu: np.ndarray, sigma: np.ndarray, direction_logit: Optional[np.ndarray]) -> np.ndarray:
+        cal = self.ckpt.get("calibration") if isinstance(self.ckpt.get("calibration"), dict) else {}
+        sigma_scale = float(cal.get("sigma_scale", 1.0) or 1.0)
+        direction_temperature = float(cal.get("direction_temperature", 1.0) or 1.0)
+
+        sigma_cal = np.clip(sigma * sigma_scale, 1e-6, None)
+        if direction_logit is not None:
+            z = direction_logit / max(1e-6, direction_temperature)
+        else:
+            z = mu / sigma_cal
+        p = 1.0 / (1.0 + np.exp(-np.clip(z, -40.0, 40.0)))
+        return np.clip(p, 0.01, 0.99)
+
     def _predict_sequence(self, *, symbol: str, horizon: str, as_of: datetime) -> Dict[str, Any]:
         seq = fetch_sequence(
             db_url=str(self.repo.db_url),
@@ -152,25 +123,45 @@ class LiquidModelService:
         )
         if str(seq["schema_hash"]) != SCHEMA_HASH:
             raise RuntimeError("schema_hash_mismatch_sequence")
-        values = np.array(seq["values"], dtype=np.float32)
-        mask = np.array(seq["mask"], dtype=np.float32)
-        xv = torch.tensor(values, dtype=torch.float32).unsqueeze(0)
-        xm = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
+
+        xv = torch.tensor(np.array(seq["values"], dtype=np.float32), dtype=torch.float32).unsqueeze(0)
+        xm = torch.tensor(np.array(seq["mask"], dtype=np.float32), dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
-            pred, gate = self.model(xv, xm)
-        p = pred.squeeze(0).cpu().numpy().tolist()
-        g = float(gate.squeeze(0).item())
-        pred_map = {
-            "1h": float(p[0]),
-            "4h": float(p[1]),
-            "1d": float(p[2]),
-            "7d": float(p[3]),
-        }
-        conf_map = {k: float(max(0.01, min(0.99, 0.5 + abs(v) * 5.0))) for k, v in pred_map.items()}
-        vol_map = {k: float(max(1e-6, abs(v))) for k, v in pred_map.items()}
+            pred = self.model(xv, xm)
+
+        mu = pred.mu.squeeze(0).cpu().numpy().astype(np.float64)
+        sigma = torch.exp(pred.log_sigma).squeeze(0).cpu().numpy().astype(np.float64)
+        q = pred.q.squeeze(0).cpu().numpy().astype(np.float64) if pred.q is not None else None
+        dlogit = pred.direction_logit.squeeze(0).cpu().numpy().astype(np.float64) if pred.direction_logit is not None else None
+
+        conf = self._calibrated_confidence(mu=mu, sigma=sigma, direction_logit=dlogit)
+        cal = self.ckpt.get("calibration") if isinstance(self.ckpt.get("calibration"), dict) else {}
+        sigma_scale = float(cal.get("sigma_scale", 1.0) or 1.0)
+        sigma_map = sigma * sigma_scale
+
+        horizons = [str(h) for h in list(self.ckpt.get("horizons") or ["1h", "4h", "1d", "7d"])]
+        pred_map = {h: float(mu[i]) for i, h in enumerate(horizons)}
+        conf_map = {h: float(conf[i]) for i, h in enumerate(horizons)}
+        if q is not None and q.shape[2] >= 3:
+            vol_map = {h: float(max(1e-6, (q[i, -1] - q[i, 0]) / 2.56)) for i, h in enumerate(horizons)}
+        else:
+            vol_map = {h: float(max(1e-6, sigma_map[i])) for i, h in enumerate(horizons)}
+
+        quantiles_map = None
+        if q is not None:
+            quantiles_map = {
+                h: {
+                    "p10": float(q[i, 0]),
+                    "p50": float(q[i, 1] if q.shape[2] > 1 else q[i, 0]),
+                    "p90": float(q[i, -1]),
+                }
+                for i, h in enumerate(horizons)
+            }
+
         h = str(horizon or "1h").strip().lower()
         if h not in pred_map:
-            h = "1h"
+            h = "1h" if "1h" in pred_map else sorted(pred_map.keys())[0]
+
         return {
             "expected_return": float(pred_map[h]),
             "signal_confidence": float(conf_map[h]),
@@ -178,11 +169,15 @@ class LiquidModelService:
             "expected_return_horizons": pred_map,
             "signal_confidence_horizons": conf_map,
             "vol_forecast_horizons": vol_map,
+            "direction_logit_horizons": {hh: float(dlogit[i]) for i, hh in enumerate(horizons)} if dlogit is not None else {},
+            "quantiles_horizons": quantiles_map or {},
             "stack": {
                 "model_id": str(self.manifest.get("model_id") or "liquid_main"),
-                "gate": float(g),
-                "coverage_summary": dict(seq.get("coverage_summary") or {}),
                 "schema_hash": SCHEMA_HASH,
+                "backbone": str(self.ckpt.get("backbone_name") or "patchtst"),
+                "calibration": cal,
+                "coverage_summary": dict(seq.get("coverage_summary") or {}),
+                "gate": float(np.mean(pred.aux["gate"].detach().cpu().numpy())) if isinstance(pred.aux, dict) and isinstance(pred.aux.get("gate"), torch.Tensor) else 0.0,
             },
             "model_name": str(self.manifest.get("model_id") or self.default_model_name),
             "model_version": str(self.default_model_version),
@@ -200,7 +195,6 @@ class LiquidModelService:
         model_version: Optional[str] = None,
         require_artifact: bool = True,
     ) -> Dict[str, Any]:
-        # Strict mode: online inference must come from feature_matrix_main sequence.
         _ = payload
         _ = model_name
         _ = model_version
@@ -248,6 +242,8 @@ class LiquidModelService:
             "expected_return_horizons": {str(k): round(float(v), 6) for k, v in dict(pred.get("expected_return_horizons") or {}).items()},
             "signal_confidence_horizons": {str(k): round(float(v), 4) for k, v in dict(pred.get("signal_confidence_horizons") or {}).items()},
             "vol_forecast_horizons": {str(k): round(float(v), 6) for k, v in dict(pred.get("vol_forecast_horizons") or {}).items()},
+            "direction_logit_horizons": {str(k): round(float(v), 6) for k, v in dict(pred.get("direction_logit_horizons") or {}).items()},
+            "quantiles_horizons": dict(pred.get("quantiles_horizons") or {}),
             "current_price": float(price_row.get("price") or 0.0),
             "horizon": str(horizon),
             "as_of": self._utcnow().isoformat(),

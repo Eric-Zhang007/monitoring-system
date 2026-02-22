@@ -6,11 +6,9 @@ NIM Integration - Offline Feature Extraction + Online Cache (Fixed v3)
 """
 import asyncio
 import psycopg2
-import numpy as np
 import logging
 import os
 import requests
-import hashlib
 
 try:
     from pgvector.psycopg2 import register_vector  # type: ignore
@@ -64,7 +62,9 @@ class NIMFeatureCache:
             """)
             self.conn.commit()
 
-    def _adapt_feature_vector(self, feature_vector: list):
+    def _adapt_feature_vector(self, feature_vector: list | None):
+        if feature_vector is None:
+            return None
         vals = [float(x) for x in feature_vector]
         if not self.vector_enabled:
             return vals
@@ -111,7 +111,10 @@ class NIMFeatureCache:
                     len(filtered_news)
                 ))
                 self.conn.commit()
-                logger.info(f"✅ {symbol}: Extracted semantic features from {len(filtered_news)} news items")
+                if feature_vector is None:
+                    logger.warning(f"⚠️  {symbol}: NIM embedding unavailable, stored as missing")
+                else:
+                    logger.info(f"✅ {symbol}: Extracted semantic features from {len(filtered_news)} news items")
             except Exception as e:
                 logger.error(f"❌ {symbol}: Failed to store features: {e}")
                 self.conn.rollback()
@@ -135,6 +138,9 @@ class NIMFeatureCache:
                 result = cur.fetchone()
                 if result:
                     feature_vector, last_news_time, news_count = result
+                    if feature_vector is None:
+                        logger.info(f"⚠️  {symbol}: Cached semantic features are missing")
+                        return None
                     logger.debug(f"📦 {symbol}: Retrieved cached features (age < {max_age_hours}h)")
                     return feature_vector
                 logger.info(f"⏰ {symbol}: No cached features (expired or not found)")
@@ -166,7 +172,7 @@ class NIMFeatureCache:
 
 Extract key investment insights and output structured analysis results."""
 
-    async def _call_nim_embedding(self, prompt: str) -> list:
+    async def _call_nim_embedding(self, prompt: str) -> list | None:
         """
         Call NIM to generate embedding vector
         Cost estimate: ~¥0.01 per call
@@ -198,13 +204,8 @@ Extract key investment insights and output structured analysis results."""
                             return [float(x) for x in emb[:384]]
                         return [float(x) for x in emb] + [0.0] * (384 - len(emb))
             except Exception as e:
-                logger.warning(f"NIM endpoint failed, fallback to deterministic local embedding: {e}")
-
-        # deterministic fallback instead of random for reproducibility
-        await asyncio.sleep(0.005)
-        seed = int(hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8], 16)
-        rs = np.random.default_rng(seed)
-        return rs.standard_normal(384).astype(np.float32).tolist()
+                logger.warning(f"NIM endpoint failed, mark embedding missing: {e}")
+        return None
 
     def close(self):
         """Close database connection"""

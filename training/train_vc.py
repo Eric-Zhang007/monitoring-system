@@ -6,7 +6,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 import numpy as np
 import psycopg2
@@ -15,6 +15,8 @@ import torch
 
 from artifacts.pack import pack_model_artifact
 from features.feature_contract import SCHEMA_HASH
+from training.calibration.calibrate import fit_temperature_scaling
+from vc.feature_spec import VC_FEATURE_KEYS, label_from_event_row, vector_from_context, vector_from_event_row
 
 
 class VCModel(torch.nn.Module):
@@ -48,20 +50,11 @@ def _build_dataset(db_url: str, limit: int = 8000):
             )
             rows = [dict(r) for r in cur.fetchall()]
     for r in rows:
-        et = str(r.get("event_type") or "")
-        lbl = 1 if et in {"funding", "mna"} else 0
-        tier = float(r.get("source_tier") or 5)
-        conf = float(r.get("confidence_score") or 0.0)
-        imp = float(r.get("event_importance") or 0.0)
-        nov = float(r.get("novelty_score") or 0.0)
-        type_score = 1.0 if et == "funding" else 0.7 if et == "mna" else 0.4 if et == "product" else -0.3 if et == "regulatory" else 0.0
-        X.append([type_score, (6.0 - tier) / 5.0, conf, imp, nov])
-        y.append(lbl)
+        X.append(vector_from_event_row(r).tolist())
+        y.append(label_from_event_row(r))
     if len(X) < 128:
         raise RuntimeError(f"insufficient_vc_samples:{len(X)}")
-    arr_x = np.array(X, dtype=np.float32)
-    arr_y = np.array(y, dtype=np.int64)
-    return arr_x, arr_y
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64)
 
 
 def main() -> int:
@@ -93,15 +86,18 @@ def main() -> int:
         opt.step()
 
     with torch.no_grad():
-        logits_te = model(torch.tensor(Xte, dtype=torch.float32))
-        prob_te = torch.softmax(logits_te, dim=-1)[:, 1].numpy()
+        logits_te = model(torch.tensor(Xte, dtype=torch.float32)).cpu().numpy()
+        prob_te = torch.softmax(torch.tensor(logits_te), dim=-1)[:, 1].numpy()
         pred_te = (prob_te >= 0.5).astype(np.int64)
     acc = float(np.mean((pred_te == yte).astype(np.float32)))
+    temperature = float(fit_temperature_scaling(logits_te[:, 1], yte.astype(np.float64)))
 
     state = {
         "state_dict": model.state_dict(),
         "in_dim": int(X.shape[1]),
         "schema_hash": SCHEMA_HASH,
+        "feature_keys": list(VC_FEATURE_KEYS),
+        "temperature": temperature,
     }
 
     manifest = pack_model_artifact(
@@ -117,6 +113,8 @@ def main() -> int:
             "train_samples": int(len(Xtr)),
             "oos_samples": int(len(Xte)),
             "trained_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "feature_keys": list(VC_FEATURE_KEYS),
+            "temperature": temperature,
         },
     )
     print(json.dumps({"status": "ok", "manifest": manifest, "oos_acc": acc}, ensure_ascii=False))

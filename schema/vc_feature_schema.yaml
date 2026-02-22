@@ -1,0 +1,13 @@
+schema_name: vc_feature_schema
+schema_version: main
+features:
+  - name: event_type_score
+    dtype: float32
+  - name: source_tier_norm
+    dtype: float32
+  - name: confidence_score
+    dtype: float32
+  - name: event_importance
+    dtype: float32
+  - name: novelty_score
+    dtype: float32

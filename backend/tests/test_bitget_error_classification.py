@@ -2,10 +2,32 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import types
 
 import requests
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.append(str(ROOT))
+sys.path.append(str(ROOT / "backend"))
+
+if "torch" not in sys.modules:
+    torch_stub = types.ModuleType("torch")
+    nn_stub = types.ModuleType("torch.nn")
+    nn_func_stub = types.ModuleType("torch.nn.functional")
+
+    class _Module:
+        pass
+
+    nn_stub.Module = _Module
+    torch_stub.nn = nn_stub
+    torch_stub.Tensor = object
+    torch_stub.float32 = "float32"
+    torch_stub.no_grad = lambda: types.SimpleNamespace(__enter__=lambda self: self, __exit__=lambda self, exc_type, exc, tb: False)
+    torch_stub.tensor = lambda *args, **kwargs: None
+    torch_stub.load = lambda *args, **kwargs: {}
+    sys.modules["torch"] = torch_stub
+    sys.modules["torch.nn"] = nn_stub
+    sys.modules["torch.nn.functional"] = nn_func_stub
 
 from execution_engine import BitgetLiveAdapter  # noqa: E402
 import v2_router as router_mod  # noqa: E402

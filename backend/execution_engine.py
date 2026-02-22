@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import logging
 import os
 import random
 import time
@@ -13,21 +15,36 @@ from urllib.parse import urlparse
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 try:
     import jwt
 except Exception:
     jwt = None
 
-from execution_policy import resolve_order_execution_context
+from execution_adapters.base import ExecutionAdapterBase
+from execution_fsm import transition_child, transition_decision, transition_parent
+from execution_planner import build_execution_plan
+from execution_policy import build_execution_trace, resolve_order_execution_context
+from position_accounting import apply_fills_to_position, compute_realized_pnl, compute_unrealized_pnl
+
+logger = logging.getLogger(__name__)
 
 
-class PaperExecutionAdapter:
+class PaperExecutionAdapter(ExecutionAdapterBase):
+    name = "paper"
+
     def __init__(self, reject_rate: float = 0.0, partial_fill_rate: float = 0.35):
         self.enable_random_reject = os.getenv("PAPER_ENABLE_RANDOM_REJECT", "0").strip().lower() in {"1", "true", "yes", "y"}
         self.reject_rate = reject_rate
         self.partial_fill_rate = partial_fill_rate
         self.timeout_reject_guard = float(os.getenv("PAPER_MAX_TIMEOUT_REJECT_RATE_GUARD", "0.0") or 0.0)
         self.timeout_by_symbol = self._parse_timeout_by_symbol(os.getenv("PAPER_TIMEOUT_BY_SYMBOL", "BTC=0.07,ETH=0.08,SOL=0.10"))
+        self.seed = int(os.getenv("PAPER_SEED", "20260222") or 20260222)
+        self._orders: Dict[str, Dict[str, Any]] = {}
+        self._fills_by_order: Dict[str, List[Dict[str, Any]]] = {}
+        self._positions: Dict[str, Dict[str, float]] = {}
 
     @staticmethod
     def _parse_timeout_by_symbol(raw: str) -> Dict[str, float]:
@@ -41,6 +58,184 @@ class PaperExecutionAdapter:
                 out[k.strip().upper()] = max(0.0, min(1.0, float(v.strip())))
             except Exception:
                 continue
+        return out
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _rng(self, key: str) -> random.Random:
+        digest = hashlib.sha256(f"{self.seed}:{key}".encode("utf-8")).hexdigest()[:16]
+        return random.Random(int(digest, 16))
+
+    def prepare(self, symbol: str) -> Dict[str, Any]:
+        return {
+            "symbol": str(symbol or "").upper(),
+            "min_qty": float(os.getenv("PAPER_MIN_QTY", "0.000001") or 0.000001),
+            "qty_step": float(os.getenv("PAPER_QTY_STEP", "0.000001") or 0.000001),
+        }
+
+    def submit_order(self, child_order: Dict[str, Any], context: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
+        symbol = str(child_order.get("symbol") or "").upper()
+        side = str(child_order.get("side") or "buy").lower()
+        qty = float(child_order.get("qty") or 0.0)
+        client_order_id = str(child_order.get("client_order_id") or "").strip()
+        if not client_order_id:
+            client_order_id = f"paper:{uuid.uuid4().hex[:20]}"
+        if client_order_id in self._orders:
+            old = self._orders[client_order_id]
+            return str(old.get("venue_order_id") or ""), {**old, "idempotency_hit": True}
+
+        if qty <= 0:
+            snap = {
+                "client_order_id": client_order_id,
+                "venue_order_id": None,
+                "status": "rejected",
+                "requested_qty": qty,
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "fees_paid": 0.0,
+                "reject_reason": "invalid_quantity",
+                "submitted_at": self._utcnow().isoformat(),
+            }
+            self._orders[client_order_id] = snap
+            return None, snap
+
+        rng = self._rng(client_order_id)
+        if self.enable_random_reject and rng.random() < self.reject_rate:
+            snap = {
+                "client_order_id": client_order_id,
+                "venue_order_id": None,
+                "status": "rejected",
+                "requested_qty": qty,
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "fees_paid": 0.0,
+                "reject_reason": "paper_reject_simulated",
+                "submitted_at": self._utcnow().isoformat(),
+            }
+            self._orders[client_order_id] = snap
+            return None, snap
+
+        market_state = context.get("market_state") if isinstance(context.get("market_state"), dict) else {}
+        limit_price = child_order.get("limit_price")
+        est_price = float(context.get("est_price") or 0.0)
+        if est_price <= 0:
+            est_price = float(limit_price or 0.0)
+        bid = float(market_state.get("bid_px") or 0.0)
+        ask = float(market_state.get("ask_px") or 0.0)
+        spread_bps = float(market_state.get("spread_bps") or 0.0)
+        if spread_bps <= 0.0 and bid > 0 and ask > 0:
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                spread_bps = (ask - bid) / mid * 10000.0
+        if est_price <= 0 and bid > 0 and ask > 0:
+            est_price = (bid + ask) / 2.0
+        if est_price <= 0:
+            est_price = 1.0
+        imbalance = float(market_state.get("imbalance") or 0.0)
+        max_slippage_bps = float(context.get("max_slippage_bps", 20.0) or 20.0)
+        fill_ratio = 1.0
+        if rng.random() < self.partial_fill_rate:
+            fill_ratio = float(np.clip(rng.uniform(0.35, 0.95), 0.0, 1.0))
+        liq_factor = max(0.4, min(1.0, 1.0 - min(0.6, abs(imbalance) * 0.5)))
+        fill_ratio = max(0.0, min(1.0, fill_ratio * liq_factor))
+        fill_qty = float(round(qty * fill_ratio, 12))
+        tif = str(child_order.get("tif") or context.get("time_in_force") or "IOC").upper()
+        if tif == "FOK" and fill_qty + 1e-12 < qty:
+            fill_qty = 0.0
+        if fill_qty <= 1e-12:
+            venue_order_id = f"paper-{hashlib.sha1(client_order_id.encode('utf-8')).hexdigest()[:18]}"
+            snap = {
+                "client_order_id": client_order_id,
+                "venue_order_id": venue_order_id,
+                "status": "rejected",
+                "requested_qty": qty,
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "fees_paid": 0.0,
+                "reject_reason": "no_fill_after_retries",
+                "submitted_at": self._utcnow().isoformat(),
+            }
+            self._orders[client_order_id] = snap
+            self._fills_by_order[venue_order_id] = []
+            return venue_order_id, snap
+
+        base_slip = max(0.2, min(max_slippage_bps, max(0.2, spread_bps * 0.8 + abs(imbalance) * 4.0 + rng.uniform(0.0, 1.0))))
+        side_sign = 1.0 if side == "buy" else -1.0
+        fill_price = est_price * (1.0 + side_sign * (base_slip / 10000.0))
+        fee_bps = float(context.get("fee_bps", 5.0) or 5.0)
+        fee = float(fill_qty * fill_price * fee_bps / 10000.0)
+        status = "filled" if fill_qty + 1e-12 >= qty else "partially_filled"
+        venue_order_id = f"paper-{hashlib.sha1(client_order_id.encode('utf-8')).hexdigest()[:18]}"
+        fill_row = {
+            "fill_ts": self._utcnow(),
+            "qty": fill_qty,
+            "price": float(round(fill_price, 8)),
+            "fee": float(round(fee, 10)),
+            "fee_currency": str(context.get("fee_currency") or "USD"),
+            "liquidity_flag": "maker" if str(context.get("execution_style") or "") == "passive_twap" else "taker",
+            "raw": {
+                "adapter": "paper",
+                "spread_bps": spread_bps,
+                "imbalance": imbalance,
+                "seed": self.seed,
+            },
+        }
+        self._fills_by_order[venue_order_id] = [fill_row]
+        snap = {
+            "client_order_id": client_order_id,
+            "venue_order_id": venue_order_id,
+            "status": status,
+            "requested_qty": qty,
+            "filled_qty": fill_qty,
+            "avg_fill_price": float(round(fill_price, 8)),
+            "fees_paid": float(round(fee, 10)),
+            "reject_reason": None if status != "partially_filled" else "residual_unfilled",
+            "submitted_at": self._utcnow().isoformat(),
+        }
+        self._orders[client_order_id] = snap
+        pos = self._positions.get(symbol, {"position_qty": 0.0, "avg_cost": 0.0})
+        signed = fill_qty if side == "buy" else -fill_qty
+        new_qty = float(pos["position_qty"]) + signed
+        if abs(new_qty) <= 1e-12:
+            self._positions[symbol] = {"position_qty": 0.0, "avg_cost": 0.0}
+        elif abs(float(pos["position_qty"])) <= 1e-12 or (float(pos["position_qty"]) > 0 and signed > 0) or (
+            float(pos["position_qty"]) < 0 and signed < 0
+        ):
+            total_notional = float(pos["position_qty"]) * float(pos["avg_cost"]) + signed * fill_price
+            self._positions[symbol] = {"position_qty": float(new_qty), "avg_cost": float(total_notional / new_qty)}
+        else:
+            self._positions[symbol] = {"position_qty": float(new_qty), "avg_cost": float(fill_price)}
+        return venue_order_id, snap
+
+    def poll_order(self, venue_order_id: str, timeout: float) -> Dict[str, Any]:
+        _ = timeout
+        if not venue_order_id:
+            return {"venue_order_id": None, "status": "rejected", "filled_qty": 0.0, "avg_fill_price": None, "fees_paid": 0.0}
+        for row in self._orders.values():
+            if str(row.get("venue_order_id") or "") == str(venue_order_id):
+                return dict(row)
+        return {"venue_order_id": venue_order_id, "status": "rejected", "filled_qty": 0.0, "avg_fill_price": None, "fees_paid": 0.0}
+
+    def cancel_order(self, venue_order_id: str) -> Dict[str, Any]:
+        for key, row in self._orders.items():
+            if str(row.get("venue_order_id") or "") != str(venue_order_id):
+                continue
+            if str(row.get("status") or "") in {"filled", "rejected", "canceled"}:
+                return {"venue_order_id": venue_order_id, "status": str(row.get("status") or "unknown")}
+            row["status"] = "canceled"
+            self._orders[key] = row
+            return {"venue_order_id": venue_order_id, "status": "canceled"}
+        return {"venue_order_id": venue_order_id, "status": "unknown"}
+
+    def fetch_fills(self, venue_order_id: str) -> List[Dict[str, Any]]:
+        return list(self._fills_by_order.get(str(venue_order_id), []))
+
+    def fetch_positions(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for symbol, row in self._positions.items():
+            out.append({"symbol": symbol, "position_qty": float(row.get("position_qty") or 0.0), "avg_cost": float(row.get("avg_cost") or 0.0)})
         return out
 
     def execute(self, order: Dict, context: Optional[Dict] = None) -> Dict:
@@ -154,13 +349,28 @@ class PaperExecutionAdapter:
         }
 
 
-class CoinbaseLiveAdapter:
+class CoinbaseLiveAdapter(ExecutionAdapterBase):
+    name = "coinbase_live"
+
     def __init__(self):
         self.base_url = os.getenv("COINBASE_ADVANCED_TRADE_API", "https://api.coinbase.com").strip().rstrip("/")
         self.api_key_name = os.getenv("COINBASE_API_KEY", "").strip()
         self.api_private_key = os.getenv("COINBASE_API_SECRET", "").replace("\\n", "\n").strip()
         self.timeout_sec = float(os.getenv("COINBASE_EXEC_TIMEOUT_SEC", "5"))
         self.quote_currency = os.getenv("COINBASE_QUOTE_CURRENCY", "USD").strip().upper() or "USD"
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.35,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
+        )
+        self.session = requests.Session()
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _build_jwt(self, method: str, path: str) -> str:
         if jwt is None:
@@ -186,14 +396,23 @@ class CoinbaseLiveAdapter:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        resp = requests.request(
-            method=method.upper(),
-            url=f"{self.base_url}{path}",
-            headers=headers,
-            json=payload,
-            params=params,
-            timeout=self.timeout_sec,
-        )
+        resp = None
+        max_attempts = int(os.getenv("COINBASE_HTTP_MAX_RETRIES", "3") or 3)
+        for i in range(max(1, max_attempts)):
+            resp = requests.request(
+                method=method.upper(),
+                url=f"{self.base_url}{path}",
+                headers=headers,
+                json=payload,
+                params=params,
+                timeout=self.timeout_sec,
+            )
+            if resp.status_code not in {429, 500, 502, 503, 504}:
+                break
+            if i + 1 < max_attempts:
+                time.sleep(0.2 * (2**i))
+        if resp is None:
+            raise RuntimeError("coinbase_request_failed")
         body: Dict[str, Any] = {}
         if resp.content:
             try:
@@ -258,6 +477,122 @@ class CoinbaseLiveAdapter:
         if filled_qty >= requested_qty - 1e-10:
             return "filled"
         return "submitted"
+
+    def prepare(self, symbol: str) -> Dict[str, Any]:
+        product_id = self._to_product_id(str(symbol or ""), self.quote_currency)
+        return {"symbol": str(symbol or "").upper(), "product_id": product_id}
+
+    def submit_order(self, child_order: Dict[str, Any], context: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
+        symbol = str(child_order.get("symbol") or "")
+        product_id = self._to_product_id(symbol, self.quote_currency)
+        qty = float(child_order.get("qty") or 0.0)
+        side = "BUY" if str(child_order.get("side") or "").lower() == "buy" else "SELL"
+        limit_price = child_order.get("limit_price")
+        tif = str(child_order.get("tif") or context.get("time_in_force") or "IOC").upper()
+        client_order_id = str(child_order.get("client_order_id") or uuid.uuid4().hex)
+        if qty <= 0:
+            return None, {"status": "rejected", "reject_reason": "invalid_quantity", "filled_qty": 0.0, "avg_fill_price": None, "fees_paid": 0.0}
+        cfg_key = "limit_limit_gtc"
+        if tif == "IOC":
+            cfg_key = "limit_limit_ioc"
+        elif tif == "FOK":
+            cfg_key = "limit_limit_fok"
+        body: Dict[str, Any] = {"client_order_id": client_order_id, "product_id": product_id, "side": side}
+        if limit_price is not None:
+            body["order_configuration"] = {
+                cfg_key: {
+                    "base_size": f"{qty:.8f}",
+                    "limit_price": f"{float(limit_price):.8f}",
+                    "post_only": False,
+                }
+            }
+        else:
+            body["order_configuration"] = {"market_market_ioc": {"base_size": f"{qty:.8f}"}}
+        code, resp = self._request("POST", "/api/v3/brokerage/orders", payload=body)
+        snap = self._extract_order_snapshot(resp)
+        order_id = str(snap.get("order_id") or "") or None
+        status = self._map_status(str(snap.get("status") or ""), float(snap.get("filled_qty") or 0.0), qty)
+        return order_id, {
+            "status": status if code < 400 else "rejected",
+            "filled_qty": float(snap.get("filled_qty") or 0.0),
+            "avg_fill_price": snap.get("avg_fill_price"),
+            "fees_paid": float(snap.get("fees_paid") or 0.0),
+            "reject_reason": str(snap.get("reject_reason") or (f"venue_http_{code}" if code >= 400 else "")) or None,
+            "http_code": code,
+            "client_order_id": client_order_id,
+            "venue_order_id": order_id,
+        }
+
+    def poll_order(self, venue_order_id: str, timeout: float) -> Dict[str, Any]:
+        polled = self._poll_order(str(venue_order_id), timeout_sec=float(timeout or 2.0), poll_interval=0.4)
+        return {
+            "venue_order_id": str(venue_order_id),
+            "status": self._map_status(str(polled.get("status") or ""), float(polled.get("filled_qty") or 0.0), max(1e-12, float(polled.get("filled_qty") or 0.0))),
+            "filled_qty": float(polled.get("filled_qty") or 0.0),
+            "avg_fill_price": polled.get("avg_fill_price"),
+            "fees_paid": float(polled.get("fees_paid") or 0.0),
+            "reject_reason": str(polled.get("reject_reason") or "") or None,
+        }
+
+    def cancel_order(self, venue_order_id: str) -> Dict[str, Any]:
+        code, body = self._cancel_order(str(venue_order_id))
+        snap = self.poll_order(str(venue_order_id), timeout=1.2)
+        return {
+            "venue_order_id": str(venue_order_id),
+            "status": "canceled" if code < 400 else "cancel_failed",
+            "http_code": code,
+            "poll_status": str(snap.get("status") or ""),
+            "raw": body,
+        }
+
+    def fetch_fills(self, venue_order_id: str) -> List[Dict[str, Any]]:
+        code, body = self._request("GET", "/api/v3/brokerage/orders/historical/fills", params={"order_id": str(venue_order_id)})
+        if code >= 400:
+            return []
+        rows = body.get("fills")
+        if not isinstance(rows, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                qty = float(r.get("size") or r.get("filled_size") or 0.0)
+                price = float(r.get("price") or 0.0)
+            except Exception:
+                continue
+            if qty <= 0 or price <= 0:
+                continue
+            out.append(
+                {
+                    "fill_ts": datetime.now(timezone.utc),
+                    "qty": qty,
+                    "price": price,
+                    "fee": float(r.get("commission") or r.get("fee") or 0.0),
+                    "fee_currency": r.get("fee_currency"),
+                    "liquidity_flag": r.get("liquidity_indicator"),
+                    "raw": r,
+                }
+            )
+        return out
+
+    def fetch_positions(self) -> List[Dict[str, Any]]:
+        code, body = self._request("GET", "/api/v3/brokerage/accounts")
+        if code >= 400:
+            return []
+        accounts = body.get("accounts")
+        if not isinstance(accounts, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for a in accounts:
+            if not isinstance(a, dict):
+                continue
+            currency = str(a.get("currency") or "").upper()
+            bal = a.get("available_balance") if isinstance(a.get("available_balance"), dict) else {}
+            qty = float(bal.get("value") or 0.0) if isinstance(bal, dict) else 0.0
+            if currency and abs(qty) > 0:
+                out.append({"symbol": currency, "position_qty": qty, "avg_cost": 0.0, "raw": a})
+        return out
 
     def _place_limit_order(self, order: Dict, context: Dict, product_id: str) -> tuple[int, Dict[str, Any], Dict[str, Any]]:
         qty = float(order.get("quantity") or 0.0)
@@ -524,7 +859,9 @@ class CoinbaseLiveAdapter:
             }
 
 
-class BitgetLiveAdapter:
+class BitgetLiveAdapter(ExecutionAdapterBase):
+    name = "bitget_live"
+
     def __init__(self):
         self.base_url = os.getenv("BITGET_BASE_URL", "https://api.bitget.com").strip().rstrip("/")
         self.api_key = os.getenv("BITGET_API_KEY", "").strip()
@@ -533,6 +870,21 @@ class BitgetLiveAdapter:
         self.timeout_sec = float(os.getenv("BITGET_TIMEOUT_SEC", "6") or 6.0)
         self.recv_window_ms = str(int(float(os.getenv("BITGET_RECV_WINDOW_MS", "5000") or 5000)))
         self.default_margin_coin = os.getenv("BITGET_DEFAULT_MARGIN_COIN", "USDT").strip().upper() or "USDT"
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.4,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
+        )
+        self.session = requests.Session()
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self._rules_cache: Dict[str, Dict[str, Any]] = {}
+        self._order_lookup: Dict[str, Dict[str, Any]] = {}
 
     def _sign(self, ts_ms: str, method: str, path: str, body: str) -> str:
         prehash = f"{ts_ms}{method.upper()}{path}{body}"
@@ -554,13 +906,22 @@ class BitgetLiveAdapter:
                     "locale": "en-US",
                 }
             )
-        resp = requests.request(
-            method=method.upper(),
-            url=f"{self.base_url}{path}",
-            headers=headers,
-            data=body_str if payload is not None else None,
-            timeout=self.timeout_sec,
-        )
+        resp = None
+        max_attempts = int(os.getenv("BITGET_HTTP_MAX_RETRIES", "3") or 3)
+        for i in range(max(1, max_attempts)):
+            resp = requests.request(
+                method=method.upper(),
+                url=f"{self.base_url}{path}",
+                headers=headers,
+                data=body_str if payload is not None else None,
+                timeout=self.timeout_sec,
+            )
+            if resp.status_code not in {429, 500, 502, 503, 504}:
+                break
+            if i + 1 < max_attempts:
+                time.sleep(0.2 * (2**i))
+        if resp is None:
+            raise RuntimeError("bitget_request_failed")
         parsed: Dict[str, Any] = {}
         if resp.content:
             try:
@@ -612,6 +973,239 @@ class BitgetLiveAdapter:
         if filled_qty > 1e-10:
             return "partially_filled"
         return "submitted"
+
+    def prepare(self, symbol: str) -> Dict[str, Any]:
+        sym = self._symbol(str(symbol or ""), "spot")
+        if sym in self._rules_cache:
+            return dict(self._rules_cache[sym])
+        rules = {"symbol": sym, "min_qty": 0.000001, "qty_step": 0.000001, "price_step": 0.000001}
+        if not sym:
+            return rules
+        code, body = self._request("GET", f"/api/v2/spot/public/symbols?symbol={sym}")
+        if code < 400 and str(body.get("code") or "00000") == "00000":
+            data = body.get("data")
+            row = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+            try:
+                rules["min_qty"] = float(row.get("minTradeAmount") or row.get("minTradeNum") or rules["min_qty"])
+                rules["qty_step"] = float(row.get("quantityScale") or row.get("sizeMultiplier") or rules["qty_step"])
+                rules["price_step"] = float(row.get("priceScale") or row.get("priceMultiplier") or rules["price_step"])
+            except Exception:
+                pass
+        self._rules_cache[sym] = dict(rules)
+        return rules
+
+    def submit_order(self, child_order: Dict[str, Any], context: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
+        market_type = str(context.get("market_type") or "spot").strip().lower()
+        product_type = str(context.get("product_type") or "USDT-FUTURES").strip()
+        margin_mode = str(context.get("margin_mode") or "cross").strip().lower()
+        position_mode = str(context.get("position_mode") or "one_way").strip().lower()
+        reduce_only = bool(context.get("reduce_only") or False)
+        leverage = context.get("leverage")
+        symbol = self._symbol(str(child_order.get("symbol") or ""), market_type)
+        side = "buy" if str(child_order.get("side") or "").lower() == "buy" else "sell"
+        qty = float(child_order.get("qty") or 0.0)
+        tif = str(child_order.get("tif") or context.get("time_in_force") or "IOC").upper()
+        client_oid = str(child_order.get("client_order_id") or f"ms-{uuid.uuid4().hex[:16]}")
+        limit_price = child_order.get("limit_price")
+        if not self.api_key or not self.api_secret or not self.api_passphrase:
+            return None, {"status": "rejected", "filled_qty": 0.0, "avg_fill_price": None, "fees_paid": 0.0, "reject_reason": "bitget_credentials_not_configured"}
+        if qty <= 0:
+            return None, {"status": "rejected", "filled_qty": 0.0, "avg_fill_price": None, "fees_paid": 0.0, "reject_reason": "invalid_quantity"}
+        rules = self.prepare(symbol)
+        min_qty = float(rules.get("min_qty") or 0.0)
+        if qty + 1e-12 < min_qty:
+            return None, {"status": "rejected", "filled_qty": 0.0, "avg_fill_price": None, "fees_paid": 0.0, "reject_reason": "bitget_precision_invalid:min_qty"}
+        order_type = "limit" if limit_price is not None else "market"
+        req: Dict[str, Any]
+        path: str
+        if market_type == "perp_usdt":
+            path = "/api/v2/mix/order/place-order"
+            req = {
+                "symbol": symbol,
+                "productType": product_type,
+                "marginMode": margin_mode,
+                "marginCoin": self.default_margin_coin,
+                "side": side,
+                "orderType": order_type,
+                "size": f"{qty:.8f}",
+                "force": tif,
+                "clientOid": client_oid,
+                "reduceOnly": "YES" if reduce_only else "NO",
+                "tradeSide": "open" if not reduce_only else "close",
+                "posMode": "hedge_mode" if position_mode == "hedge" else "one_way_mode",
+            }
+            if order_type == "limit":
+                req["price"] = f"{float(limit_price):.8f}"
+            if leverage is not None:
+                req["leverage"] = f"{float(leverage):.2f}"
+        else:
+            path = "/api/v2/spot/trade/place-order"
+            req = {
+                "symbol": symbol,
+                "side": side,
+                "orderType": order_type,
+                "size": f"{qty:.8f}",
+                "force": tif,
+                "clientOid": client_oid,
+            }
+            if order_type == "limit":
+                req["price"] = f"{float(limit_price):.8f}"
+        code, body = self._request("POST", path, payload=req)
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        order_id = str(data.get("orderId") or data.get("ordId") or "")
+        if code >= 400 or str(body.get("code") or "00000") != "00000" or not order_id:
+            return (
+                None,
+                {
+                    "status": "rejected",
+                    "filled_qty": 0.0,
+                    "avg_fill_price": None,
+                    "fees_paid": 0.0,
+                    "reject_reason": self._classify_error(code, body),
+                    "http_code": code,
+                },
+            )
+        self._order_lookup[order_id] = {
+            "symbol": symbol,
+            "market_type": market_type,
+            "product_type": product_type,
+            "requested_qty": qty,
+        }
+        return order_id, {
+            "status": "submitted",
+            "filled_qty": 0.0,
+            "avg_fill_price": None,
+            "fees_paid": 0.0,
+            "reject_reason": None,
+            "http_code": code,
+            "venue_order_id": order_id,
+            "client_order_id": client_oid,
+        }
+
+    def poll_order(self, venue_order_id: str, timeout: float) -> Dict[str, Any]:
+        _ = timeout
+        ctx = self._order_lookup.get(str(venue_order_id), {})
+        symbol = str(ctx.get("symbol") or "")
+        market_type = str(ctx.get("market_type") or "spot")
+        product_type = str(ctx.get("product_type") or "USDT-FUTURES")
+        requested_qty = float(ctx.get("requested_qty") or 0.0)
+        path = "/api/v2/mix/order/detail" if market_type == "perp_usdt" else "/api/v2/spot/trade/orderInfo"
+        payload = {"symbol": symbol, "orderId": str(venue_order_id)}
+        if market_type == "perp_usdt":
+            payload["productType"] = product_type
+        code, body = self._request("POST", path, payload=payload)
+        if code >= 400 or str(body.get("code") or "00000") != "00000":
+            return {
+                "venue_order_id": str(venue_order_id),
+                "status": "rejected",
+                "filled_qty": 0.0,
+                "avg_fill_price": None,
+                "fees_paid": 0.0,
+                "reject_reason": self._classify_error(code, body, fallback="no_fill_after_retries"),
+            }
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        filled_qty = float(data.get("baseVolume") or data.get("filledQty") or data.get("filledSize") or 0.0)
+        avg_fill_price = data.get("priceAvg") or data.get("fillPrice") or data.get("avgPrice")
+        avg_fill_price_f = float(avg_fill_price) if avg_fill_price not in (None, "") else None
+        status = self._map_status(str(data.get("status") or data.get("state") or "submitted"), filled_qty, max(requested_qty, filled_qty))
+        return {
+            "venue_order_id": str(venue_order_id),
+            "status": status,
+            "filled_qty": filled_qty,
+            "avg_fill_price": avg_fill_price_f,
+            "fees_paid": 0.0,
+            "reject_reason": None if status in {"filled", "partially_filled", "submitted"} else "no_fill_after_retries",
+        }
+
+    def cancel_order(self, venue_order_id: str) -> Dict[str, Any]:
+        ctx = self._order_lookup.get(str(venue_order_id), {})
+        symbol = str(ctx.get("symbol") or "")
+        market_type = str(ctx.get("market_type") or "spot")
+        product_type = str(ctx.get("product_type") or "USDT-FUTURES")
+        path = "/api/v2/mix/order/cancel-order" if market_type == "perp_usdt" else "/api/v2/spot/trade/cancel-order"
+        payload = {"symbol": symbol, "orderId": str(venue_order_id)}
+        if market_type == "perp_usdt":
+            payload["productType"] = product_type
+        code, body = self._request("POST", path, payload=payload)
+        polled = self.poll_order(str(venue_order_id), timeout=1.0)
+        return {
+            "venue_order_id": str(venue_order_id),
+            "status": "canceled" if code < 400 and str(body.get("code") or "00000") == "00000" else "cancel_failed",
+            "poll_status": str(polled.get("status") or ""),
+            "http_code": code,
+            "raw": body,
+        }
+
+    def fetch_fills(self, venue_order_id: str) -> List[Dict[str, Any]]:
+        ctx = self._order_lookup.get(str(venue_order_id), {})
+        symbol = str(ctx.get("symbol") or "")
+        market_type = str(ctx.get("market_type") or "spot")
+        product_type = str(ctx.get("product_type") or "USDT-FUTURES")
+        if not symbol:
+            return []
+        path = "/api/v2/mix/order/fills" if market_type == "perp_usdt" else "/api/v2/spot/trade/fills"
+        payload = {"symbol": symbol, "orderId": str(venue_order_id)}
+        if market_type == "perp_usdt":
+            payload["productType"] = product_type
+        code, body = self._request("POST", path, payload=payload)
+        if code >= 400 or str(body.get("code") or "00000") != "00000":
+            return []
+        data = body.get("data")
+        rows = data if isinstance(data, list) else (data.get("fills") if isinstance(data, dict) else [])
+        if not isinstance(rows, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                qty = float(r.get("sizeQty") or r.get("fillQty") or r.get("baseVolume") or 0.0)
+                price = float(r.get("priceAvg") or r.get("fillPrice") or r.get("price") or 0.0)
+            except Exception:
+                continue
+            if qty <= 0 or price <= 0:
+                continue
+            out.append(
+                {
+                    "fill_ts": datetime.now(timezone.utc),
+                    "qty": qty,
+                    "price": price,
+                    "fee": float(r.get("fee") or 0.0),
+                    "fee_currency": r.get("feeCoin"),
+                    "liquidity_flag": r.get("execType"),
+                    "raw": r,
+                }
+            )
+        return out
+
+    def fetch_positions(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        code, body = self._request("GET", "/api/v2/spot/account/assets")
+        if code < 400 and str(body.get("code") or "00000") == "00000":
+            data = body.get("data")
+            rows = data if isinstance(data, list) else (data.get("assets") if isinstance(data, dict) else [])
+            if isinstance(rows, list):
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    coin = str(r.get("coin") or "").upper()
+                    qty = float(r.get("available") or r.get("availableAmount") or 0.0)
+                    if coin and abs(qty) > 0:
+                        out.append({"symbol": coin, "position_qty": qty, "avg_cost": 0.0, "raw": r})
+        code2, body2 = self._request("POST", "/api/v2/mix/position/all-position", payload={"productType": "USDT-FUTURES"})
+        if code2 < 400 and str(body2.get("code") or "00000") == "00000":
+            data2 = body2.get("data")
+            rows2 = data2 if isinstance(data2, list) else (data2.get("positions") if isinstance(data2, dict) else [])
+            if isinstance(rows2, list):
+                for r in rows2:
+                    if not isinstance(r, dict):
+                        continue
+                    symbol = str(r.get("symbol") or "").upper()
+                    qty = float(r.get("total") or r.get("holdVol") or r.get("available") or 0.0)
+                    avg = float(r.get("openPriceAvg") or r.get("averageOpenPrice") or 0.0)
+                    if symbol and abs(qty) > 0:
+                        out.append({"symbol": symbol, "position_qty": qty, "avg_cost": avg, "raw": r})
+        return out
 
     def execute(self, order: Dict, context: Optional[Dict] = None) -> Dict:
         context = context or {}
@@ -821,3 +1415,339 @@ class ExecutionEngine:
                 res = {**res, "execution_policy": str(merged_context.get("execution_policy") or "")}
             out.append(res)
         return out
+
+    @staticmethod
+    def _status_event(status: str) -> str:
+        s = str(status or "").strip().lower()
+        if s == "filled":
+            return "fill"
+        if s == "partially_filled":
+            return "partial_fill"
+        if s == "canceled":
+            return "cancel"
+        if s == "expired":
+            return "expire"
+        if s == "rejected":
+            return "reject"
+        return "submit"
+
+    @staticmethod
+    def _ts_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def run_decision(
+        self,
+        repo: Any,
+        decision_id: str,
+        *,
+        adapter: str,
+        venue: str,
+        market_type: str,
+        max_orders: int,
+        base_context: Optional[Dict[str, Any]] = None,
+        orders_override: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        exec_adapter = self.adapters.get(str(adapter))
+        if not exec_adapter:
+            raise ValueError(f"unsupported adapter: {adapter}")
+
+        decision = repo.get_execution_decision(decision_id)
+        if not decision:
+            repo.create_execution_decision(
+                {
+                    "decision_id": decision_id,
+                    "adapter": adapter,
+                    "venue": venue,
+                    "market_type": market_type,
+                    "requested_by": "api",
+                    "status": "created",
+                    "policy_snapshot": dict(base_context or {}),
+                }
+            )
+            decision = repo.get_execution_decision(decision_id) or {"status": "created"}
+
+        d_state = str(decision.get("status") or "created")
+        if d_state == "created":
+            d_state = transition_decision(d_state, "start")
+            repo.start_execution_decision(decision_id)
+        elif d_state != "running":
+            raise ValueError(f"decision_not_runnable:{decision_id}:{d_state}")
+
+        orders = list(orders_override or [])
+        if not orders:
+            orders = repo.fetch_orders_for_decision(decision_id, limit=max(1, int(max_orders)))
+        if not orders:
+            d_state = transition_decision("running", "fail")
+            repo.finish_execution_decision(decision_id, d_state, summary={"total": 0, "filled": 0, "rejected": 0}, error="no_orders_for_decision")
+            raise ValueError("no_orders_for_decision")
+
+        merged_rows: List[Dict[str, Any]] = []
+        reject_breakdown: Dict[str, int] = {}
+        filled_parents = 0
+        rejected_parents = 0
+        market_missing = 0
+
+        for order in orders:
+            parent_id = int(order["id"])
+            symbol = str(order.get("target") or "").upper()
+            side = str(order.get("side") or "buy").lower()
+            parent_state = transition_parent("submitted", "start_exec")
+            market_state = repo.latest_orderbook_l2(symbol) or {}
+            context = resolve_order_execution_context(order, base_context or {})
+            if isinstance(base_context, dict) and base_context.get("max_slippage_bps") is not None:
+                try:
+                    context["max_slippage_bps"] = min(float(context.get("max_slippage_bps") or 0.0), float(base_context.get("max_slippage_bps") or 0.0))
+                except Exception:
+                    pass
+            context = {
+                **context,
+                "market_state": market_state,
+                "venue": venue,
+                "market_type": market_type,
+                "est_price": float(order.get("est_price") or 0.0),
+            }
+            plan = build_execution_plan(order=order, context=context, market_state=market_state)
+            market_missing += int(plan.market_state_missing)
+            child_rows = [
+                {
+                    "decision_id": decision_id,
+                    "client_order_id": c.client_order_id,
+                    "venue_order_id": None,
+                    "symbol": c.symbol,
+                    "side": c.side,
+                    "qty": c.qty,
+                    "limit_price": c.limit_price,
+                    "tif": c.tif,
+                    "status": "new",
+                    "slice_index": c.slice_index,
+                    "lifecycle": [],
+                }
+                for c in plan.child_orders
+            ]
+            child_ids = repo.create_child_orders(parent_id, child_rows)
+            child_out: List[Dict[str, Any]] = []
+            all_fills: List[Dict[str, Any]] = []
+            saw_reject = False
+
+            for idx, child_id in enumerate(child_ids):
+                child_payload = dict(child_rows[idx])
+                c_state = transition_child("new", "submit")
+                repo.update_child_order_status(
+                    int(child_id),
+                    status=c_state,
+                    lifecycle_append={"event": "submit", "status": "submitted", "time": self._ts_iso(), "metrics": {}},
+                )
+                venue_order_id, ack = exec_adapter.submit_order(child_payload, context)
+                logger.info(
+                    "exec_child_submit decision_id=%s parent_order_id=%s child_order_id=%s symbol=%s side=%s qty=%.12f venue=%s adapter=%s client_order_id=%s venue_order_id=%s",
+                    decision_id,
+                    parent_id,
+                    int(child_id),
+                    symbol,
+                    side,
+                    float(child_payload.get("qty") or 0.0),
+                    venue,
+                    adapter,
+                    str(child_payload.get("client_order_id") or ""),
+                    str(venue_order_id or ""),
+                )
+                if not venue_order_id:
+                    c_state = transition_child(c_state, "reject")
+                    repo.update_child_order_status(
+                        int(child_id),
+                        status=c_state,
+                        lifecycle_append={"event": "submit_ack", "status": "rejected", "time": self._ts_iso(), "metrics": {}},
+                    )
+                    saw_reject = True
+                    child_out.append(
+                        {
+                            "id": int(child_id),
+                            **child_payload,
+                            "status": c_state,
+                            "venue_order_id": None,
+                            "ack": ack,
+                        }
+                    )
+                    continue
+
+                repo.update_child_order_status(
+                    int(child_id),
+                    status="submitted",
+                    venue_order_id=str(venue_order_id),
+                    lifecycle_append={"event": "submit_ack", "status": "accepted", "time": self._ts_iso(), "metrics": {}},
+                )
+                polled = exec_adapter.poll_order(str(venue_order_id), timeout=float(context.get("limit_timeout_sec") or 2.0))
+                logger.info(
+                    "exec_child_poll decision_id=%s parent_order_id=%s child_order_id=%s symbol=%s side=%s qty=%.12f venue=%s adapter=%s client_order_id=%s venue_order_id=%s status=%s",
+                    decision_id,
+                    parent_id,
+                    int(child_id),
+                    symbol,
+                    side,
+                    float(child_payload.get("qty") or 0.0),
+                    venue,
+                    adapter,
+                    str(child_payload.get("client_order_id") or ""),
+                    str(venue_order_id),
+                    str(polled.get("status") or ""),
+                )
+                pevent = self._status_event(str(polled.get("status") or "submitted"))
+                if pevent != "submit":
+                    c_state = transition_child("submitted", pevent)
+                else:
+                    c_state = "submitted"
+                repo.update_child_order_status(
+                    int(child_id),
+                    status=c_state,
+                    venue_order_id=str(venue_order_id),
+                    lifecycle_append={
+                        "event": "poll",
+                        "status": str(polled.get("status") or "submitted"),
+                        "time": self._ts_iso(),
+                        "metrics": {
+                            "filled_qty": float(polled.get("filled_qty") or 0.0),
+                            "avg_fill_price": float(polled.get("avg_fill_price") or 0.0) if polled.get("avg_fill_price") is not None else 0.0,
+                        },
+                    },
+                )
+
+                fills = exec_adapter.fetch_fills(str(venue_order_id))
+                if not fills and float(polled.get("filled_qty") or 0.0) > 0 and float(polled.get("avg_fill_price") or 0.0) > 0:
+                    fills = [
+                        {
+                            "fill_ts": datetime.now(timezone.utc),
+                            "qty": float(polled.get("filled_qty") or 0.0),
+                            "price": float(polled.get("avg_fill_price") or 0.0),
+                            "fee": float(polled.get("fees_paid") or 0.0),
+                            "fee_currency": "USD",
+                            "liquidity_flag": None,
+                            "raw": {"synthetic_from_poll": True},
+                        }
+                    ]
+                repo.insert_execution_fills(int(child_id), fills)
+                for f in fills:
+                    all_fills.append({**f, "child_order_id": int(child_id)})
+
+                if str(c_state) in {"rejected", "expired"}:
+                    saw_reject = True
+                child_out.append(
+                    {
+                        "id": int(child_id),
+                        **child_payload,
+                        "status": str(c_state),
+                        "venue_order_id": str(venue_order_id),
+                        "ack": ack,
+                        "poll": polled,
+                    }
+                )
+                repo.update_parent_from_fills(parent_id)
+
+            agg = repo.update_parent_from_fills(parent_id)
+            requested_qty = float(order.get("quantity") or 0.0)
+            filled_qty_now = float(agg.get("filled_qty") or 0.0)
+            if filled_qty_now >= max(0.0, requested_qty) - 1e-12 and requested_qty > 0:
+                agg_status = "filled"
+            elif filled_qty_now > 1e-12:
+                agg_status = "partially_filled"
+            elif saw_reject:
+                agg_status = "rejected"
+            else:
+                agg_status = str(agg.get("status") or "submitted")
+            pevent = self._status_event(agg_status)
+            if pevent != "submit":
+                try:
+                    parent_state = transition_parent(parent_state, pevent)
+                except Exception:
+                    if agg_status in {"filled", "partially_filled", "rejected", "canceled"}:
+                        parent_state = agg_status
+            else:
+                parent_state = "executing"
+
+            execution = {
+                "status": parent_state if parent_state != "executing" else agg_status,
+                "filled_qty": float(agg.get("filled_qty") or 0.0),
+                "avg_fill_price": agg.get("avg_fill_price"),
+                "fees_paid": float(agg.get("fees_paid") or 0.0),
+                "reject_reason": "no_fill_after_retries" if float(agg.get("filled_qty") or 0.0) <= 1e-12 and saw_reject else None,
+                "venue_order_id": agg.get("last_venue_order_id"),
+                "execution_policy": str(context.get("execution_policy") or ""),
+                "market_state_missing": int(plan.market_state_missing),
+            }
+            execution_trace = build_execution_trace(order, execution)
+            execution_trace["market_state_missing"] = int(plan.market_state_missing)
+            fills_for_meta: List[Dict[str, Any]] = []
+            for f in all_fills:
+                ff = dict(f)
+                ts = ff.get("fill_ts")
+                if isinstance(ts, datetime):
+                    ff["fill_ts"] = ts.isoformat()
+                fills_for_meta.append(ff)
+            repo.update_order_execution(
+                parent_id,
+                status=str(execution.get("status") or "rejected"),
+                metadata={
+                    "execution": execution,
+                    "execution_trace": execution_trace,
+                    "execution_policy": str(context.get("execution_policy") or ""),
+                    "child_orders": child_out,
+                    "fills": fills_for_meta,
+                },
+            )
+
+            prev_pos = repo.get_position_live(venue=venue, symbol=symbol, account_id="")
+            next_pos = apply_fills_to_position(prev_pos or {}, all_fills, side=side)
+            mark_price = float(order.get("est_price") or execution.get("avg_fill_price") or 0.0)
+            realized = compute_realized_pnl(prev_pos or {}, all_fills, side=side)
+            unrealized = compute_unrealized_pnl(next_pos, mark_price)
+            repo.upsert_position_live(
+                venue=venue,
+                symbol=symbol,
+                account_id="",
+                position_qty=float(next_pos.get("position_qty") or 0.0),
+                avg_cost=float(next_pos.get("avg_cost") or 0.0),
+                unrealized_pnl=float(unrealized),
+                raw={
+                    "decision_id": decision_id,
+                    "parent_order_id": parent_id,
+                    "realized_pnl": float(realized),
+                    "last_mark_price": mark_price,
+                },
+            )
+
+            final_status = str(execution.get("status") or "rejected")
+            if final_status in {"filled", "partially_filled"}:
+                filled_parents += 1
+            else:
+                rejected_parents += 1
+                reason = str(execution.get("reject_reason") or "other")
+                reject_breakdown[reason] = reject_breakdown.get(reason, 0) + 1
+
+            merged_rows.append(
+                {
+                    **order,
+                    "execution": execution,
+                    "execution_trace": execution_trace,
+                    "execution_policy": str(context.get("execution_policy") or ""),
+                    "child_orders": child_out,
+                    "fills": fills_for_meta,
+                }
+            )
+
+        summary = {
+            "total": len(orders),
+            "filled": filled_parents,
+            "rejected": rejected_parents,
+            "reject_breakdown": reject_breakdown,
+            "market_state_missing": market_missing,
+        }
+        d_state = transition_decision("running", "complete")
+        repo.finish_execution_decision(decision_id, d_state, summary=summary)
+        return {
+            "decision_id": decision_id,
+            "adapter": adapter,
+            "total": len(orders),
+            "filled": filled_parents,
+            "rejected": rejected_parents,
+            "reject_breakdown": reject_breakdown,
+            "orders": merged_rows,
+        }

@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import pytest
+torch = pytest.importorskip("torch")
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -26,7 +27,7 @@ def _build_service(monkeypatch) -> LiquidModelService:
     monkeypatch.setattr(
         LiquidModelService,
         "_load_model_or_fail",
-        lambda self: (object(), {"model_id": "liquid_main"}, 12),
+        lambda self: (object(), {"model_id": "liquid_main"}, {"horizons": ["1h", "4h", "1d", "7d"]}, 12),
     )
     return LiquidModelService(
         repo=_FakeRepo(),

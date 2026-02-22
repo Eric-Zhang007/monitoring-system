@@ -166,32 +166,48 @@ def main() -> int:
                     trow = None
 
                 if isinstance(trow, dict):
-                    emb = trow.get("embedding") if isinstance(trow.get("embedding"), list) else []
+                    emb = trow.get("embedding") if isinstance(trow.get("embedding"), list) else None
                     quality = trow.get("text_quality") if isinstance(trow.get("text_quality"), dict) else {}
-                    for i, k in enumerate(TEXT_EMB_KEYS):
-                        j = FEATURE_INDEX[k]
-                        if i < len(emb):
-                            vals[j] = float(emb[i])
-                            msk[j] = 0
-                        else:
-                            vals[j] = 0.0
-                            msk[j] = 1
-                    mapping = {
-                        "text_item_count": float(quality.get("num_items", 0.0) or 0.0),
-                        "text_unique_authors": float(quality.get("unique_authors", 0.0) or 0.0),
-                        "text_dup_ratio": float(quality.get("dup_ratio", 0.0) or 0.0),
-                        "text_disagreement": float(quality.get("disagreement", 0.0) or 0.0),
-                        "text_avg_lag_sec": float(quality.get("avg_lag_sec", 0.0) or 0.0),
-                        "text_coverage": float(quality.get("coverage", 0.0) or 0.0),
-                    }
-                    for k, v in mapping.items():
-                        idx = FEATURE_INDEX[k]
-                        vals[idx] = float(v)
-                        msk[idx] = 0
-                    idx_ft = FEATURE_INDEX.get("freshness_text_sec")
-                    if idx_ft is not None:
-                        vals[idx_ft] = float(max(0.0, (ts - trow["as_of_ts"]).total_seconds()))
-                        msk[idx_ft] = 0
+                    has_embedding = isinstance(emb, list) and len(emb) > 0
+                    if has_embedding:
+                        for i, k in enumerate(TEXT_EMB_KEYS):
+                            j = FEATURE_INDEX[k]
+                            if i < len(emb):
+                                vals[j] = float(emb[i])
+                                msk[j] = 0
+                            else:
+                                vals[j] = 0.0
+                                msk[j] = 1
+                        mapping = {
+                            "text_item_count": float(quality.get("num_items", 0.0) or 0.0),
+                            "text_unique_authors": float(quality.get("unique_authors", 0.0) or 0.0),
+                            "text_dup_ratio": float(quality.get("dup_ratio", 0.0) or 0.0),
+                            "text_disagreement": float(quality.get("disagreement", 0.0) or 0.0),
+                            "text_avg_lag_sec": float(quality.get("avg_lag_sec", 0.0) or 0.0),
+                            "text_coverage": float(quality.get("coverage", 0.0) or 0.0),
+                        }
+                        for k, v in mapping.items():
+                            idx = FEATURE_INDEX[k]
+                            vals[idx] = float(v)
+                            msk[idx] = 0
+                        idx_ft = FEATURE_INDEX.get("freshness_text_sec")
+                        if idx_ft is not None:
+                            vals[idx_ft] = float(max(0.0, (ts - trow["as_of_ts"]).total_seconds()))
+                            msk[idx_ft] = 0
+                    else:
+                        for k in TEXT_EMB_KEYS:
+                            idx = FEATURE_INDEX[k]
+                            vals[idx] = 0.0
+                            msk[idx] = 1
+                        for k in ("text_item_count", "text_unique_authors", "text_dup_ratio", "text_disagreement", "text_avg_lag_sec", "freshness_text_sec"):
+                            idx = FEATURE_INDEX.get(k)
+                            if idx is not None:
+                                vals[idx] = 0.0
+                                msk[idx] = 1
+                        cov_idx = FEATURE_INDEX.get("text_coverage")
+                        if cov_idx is not None:
+                            vals[cov_idx] = 0.0
+                            msk[cov_idx] = 0
                 else:
                     for k in TEXT_EMB_KEYS:
                         idx = FEATURE_INDEX[k]

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
+from cost.cost_profile import compute_cost_bps, load_cost_profile
 
 
 @dataclass(frozen=True)
@@ -138,8 +139,11 @@ def _max_drawdown(returns: np.ndarray) -> float:
 def evaluate_regression_oos(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    fee_bps: float = 5.0,
-    slippage_bps: float = 3.0,
+    horizon: str = "1h",
+    cost_profile_name: str = "standard",
+    liquidity_features: Dict[str, float] | None = None,
+    fee_bps: float | None = None,
+    slippage_bps: float | None = None,
 ) -> Dict[str, float]:
     if y_true.size == 0 or y_pred.size == 0:
         return {
@@ -148,6 +152,7 @@ def evaluate_regression_oos(
             "turnover": 0.0,
             "pnl_after_cost": 0.0,
             "max_drawdown": 0.0,
+            "cost_bps_used": 0.0,
         }
     yt = y_true.astype(np.float64)
     yp = y_pred.astype(np.float64)
@@ -162,7 +167,17 @@ def evaluate_regression_oos(
     signal_prev[0] = 0.0
     turnover = np.abs(signal - signal_prev)
     turnover_mean = float(np.mean(turnover))
-    cost = (fee_bps + slippage_bps) / 10000.0
+    if fee_bps is not None or slippage_bps is not None:
+        cost_bps = float(max(0.0, float(fee_bps or 0.0) + float(slippage_bps or 0.0)))
+    else:
+        cost_bps = compute_cost_bps(
+            horizon=str(horizon).strip().lower() or "1h",
+            profile=load_cost_profile(cost_profile_name),
+            market_state={"realized_vol": float(np.mean(np.abs(yt)))},
+            liquidity_features=dict(liquidity_features or {}),
+            turnover_estimate=turnover_mean,
+        )
+    cost = float(cost_bps) / 10000.0
     strategy_ret = signal * yt - turnover * cost
     pnl_after_cost = float(np.mean(strategy_ret))
     hit_rate = float(np.mean(np.sign(yt) == signal))
@@ -173,6 +188,7 @@ def evaluate_regression_oos(
         "turnover": turnover_mean,
         "pnl_after_cost": pnl_after_cost,
         "max_drawdown": max_dd,
+        "cost_bps_used": float(cost_bps),
     }
 
 

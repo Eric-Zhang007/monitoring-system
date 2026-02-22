@@ -13,13 +13,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query
-try:
-    import lightgbm as lgb  # type: ignore
-
-    HAS_LGB = True
-except Exception:
-    lgb = None  # type: ignore[assignment]
-    HAS_LGB = False
 
 from schemas_v2 import (
     AsyncTaskSubmitResponse,
@@ -75,7 +68,7 @@ from schemas_v2 import (
 from features.feature_contract import FEATURE_KEYS as CONTRACT_FEATURE_KEYS
 from features.feature_contract import SCHEMA_VERSION as CONTRACT_SCHEMA_VERSION
 from execution_engine import ExecutionEngine
-from execution_policy import build_execution_trace
+from execution_policy import build_execution_trace, resolve_order_execution_context
 from portfolio_allocator import AllocatorSignal, allocate_targets
 from liquid_model_registry import get_candidate_model as get_liquid_candidate_model
 from liquid_model_registry import load_registry as load_liquid_registry
@@ -90,26 +83,57 @@ from execution_api import (
     order_to_risk_weight as _executionapi_order_to_risk_weight,
 )
 from feature_signal import feature_signal_score
+from cost.cost_profile import compute_cost_map, load_cost_profile
 from liquid_model_service import LiquidModelService
 from vc_model_service import VCModelService
-from metrics import (
-    BACKTEST_FAILED_RUNS_TOTAL,
-    BITGET_UNCLASSIFIED_ERRORS_TOTAL,
-    DATA_FRESHNESS_SECONDS,
-    EXECUTION_LATENCY_SECONDS,
-    EXECUTION_ORDERS_TOTAL,
-    EXECUTION_REJECTS_TOTAL,
-    EXECUTION_REJECT_RATE,
-    METRIC_GATE_STATUS,
-    MODEL_COVERAGE_RATIO,
-    MODEL_DRIFT_EVENTS_TOTAL,
-    RISK_WEIGHT_CONVERSION_ERRORS_TOTAL,
-    RISK_HARD_BLOCKS_TOTAL,
-    SIGNAL_LATENCY_SECONDS,
-    SIGNAL_PREDICT_DIVERGENCE,
-    STRICT_ASOF_FAIL_COUNT,
-    INGEST_EVENTS_TOTAL,
-)
+try:
+    from backend.metrics import (
+        BACKTEST_FAILED_RUNS_TOTAL,
+        BITGET_UNCLASSIFIED_ERRORS_TOTAL,
+        DATA_FRESHNESS_SECONDS,
+        EXEC_CHILD_ORDERS_TOTAL,
+        EXEC_FILLS_TOTAL,
+        EXEC_IDEMPOTENCY_HITS_TOTAL,
+        EXEC_SLIPPAGE_BPS,
+        EXECUTION_LATENCY_SECONDS,
+        EXECUTION_ORDERS_TOTAL,
+        EXEC_RECON_DRIFT_EVENTS_TOTAL,
+        EXECUTION_REJECTS_TOTAL,
+        EXECUTION_REJECT_RATE,
+        METRIC_GATE_STATUS,
+        MODEL_COVERAGE_RATIO,
+        MODEL_DRIFT_EVENTS_TOTAL,
+        RISK_WEIGHT_CONVERSION_ERRORS_TOTAL,
+        RISK_HARD_BLOCKS_TOTAL,
+        SIGNAL_LATENCY_SECONDS,
+        SIGNAL_PREDICT_DIVERGENCE,
+        STRICT_ASOF_FAIL_COUNT,
+        INGEST_EVENTS_TOTAL,
+    )
+except Exception:
+    from metrics import (
+        BACKTEST_FAILED_RUNS_TOTAL,
+        BITGET_UNCLASSIFIED_ERRORS_TOTAL,
+        DATA_FRESHNESS_SECONDS,
+        EXEC_CHILD_ORDERS_TOTAL,
+        EXEC_FILLS_TOTAL,
+        EXEC_IDEMPOTENCY_HITS_TOTAL,
+        EXEC_SLIPPAGE_BPS,
+        EXECUTION_LATENCY_SECONDS,
+        EXECUTION_ORDERS_TOTAL,
+        EXEC_RECON_DRIFT_EVENTS_TOTAL,
+        EXECUTION_REJECTS_TOTAL,
+        EXECUTION_REJECT_RATE,
+        METRIC_GATE_STATUS,
+        MODEL_COVERAGE_RATIO,
+        MODEL_DRIFT_EVENTS_TOTAL,
+        RISK_WEIGHT_CONVERSION_ERRORS_TOTAL,
+        RISK_HARD_BLOCKS_TOTAL,
+        SIGNAL_LATENCY_SECONDS,
+        SIGNAL_PREDICT_DIVERGENCE,
+        STRICT_ASOF_FAIL_COUNT,
+        INGEST_EVENTS_TOTAL,
+    )
 from drift_ops import feature_drift_score as _driftops_feature_drift_score
 from drift_ops import ks_statistic as _driftops_ks_statistic
 from drift_ops import psi as _driftops_psi
@@ -152,7 +176,6 @@ def _init_repo() -> Any:
 repo = _init_repo()
 exec_engine = ExecutionEngine()
 DEFAULT_LIQUID_SYMBOLS = "BTC,ETH,SOL"
-_TABULAR_MODEL_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 LIQUID_FEATURE_KEYS: List[str] = list(CONTRACT_FEATURE_KEYS)
 _ROOT = Path(__file__).resolve().parents[1]
 _INFER_DIR = _ROOT / "inference"
@@ -161,17 +184,14 @@ if str(_INFER_DIR) not in sys.path:
 try:
     from liquid_feature_contract import LIQUID_FEATURE_KEYS as _CONTRACT_KEYS  # type: ignore
     from liquid_feature_contract import LIQUID_FEATURE_SCHEMA_VERSION as _CONTRACT_SCHEMA  # type: ignore
-    from model_router import ModelRouter  # type: ignore
 
     if isinstance(_CONTRACT_KEYS, list) and _CONTRACT_KEYS:
         LIQUID_FEATURE_KEYS = list(_CONTRACT_KEYS)
     FEATURE_PAYLOAD_SCHEMA_VERSION = str(_CONTRACT_SCHEMA or FEATURE_PAYLOAD_SCHEMA_VERSION)
     FEATURE_PAYLOAD_SCHEMA_COMPAT = {FEATURE_PAYLOAD_SCHEMA_VERSION, str(CONTRACT_SCHEMA_VERSION)}
 except Exception:
-    ModelRouter = None  # type: ignore[assignment]
     pass
 
-_MODEL_ROUTER: Optional[Any] = None
 _LIQUID_MODEL_SERVICE: Optional[LiquidModelService] = None
 _VC_MODEL_SERVICE: Optional[VCModelService] = None
 
@@ -188,36 +208,8 @@ def _utcnow_iso_z() -> str:
     return _utcnow().isoformat().replace("+00:00", "Z")
 
 
-def _default_model_dir() -> Path:
-    env_path = str(os.getenv("MODEL_DIR", "")).strip()
-    if env_path:
-        return Path(env_path)
-    local_models = Path(__file__).resolve().parent / "models"
-    if local_models.exists():
-        return local_models
-    return Path("/opt/monitoring-system/models")
-
-
-def _sigmoid(x: float) -> float:
-    if x < -30:
-        return 0.0
-    if x > 30:
-        return 1.0
-    return 1.0 / (1.0 + (2.718281828 ** (-x)))
-
-
 def _default_liquid_targets() -> List[str]:
     return [s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", DEFAULT_LIQUID_SYMBOLS).split(",") if s.strip()]
-
-
-def _get_model_router() -> Any:
-    global _MODEL_ROUTER
-    if _MODEL_ROUTER is not None:
-        return _MODEL_ROUTER
-    if ModelRouter is None:
-        raise RuntimeError("model_router_unavailable")
-    _MODEL_ROUTER = ModelRouter()
-    return _MODEL_ROUTER
 
 
 def _active_liquid_model() -> Tuple[str, str]:
@@ -1466,91 +1458,19 @@ def _align_feature_dim(x: np.ndarray, dim: int, pad_value: float = 0.0) -> np.nd
 
 
 def _load_tabular_model_artifact(target: str) -> Optional[Dict[str, Any]]:
-    target = str(target or "").strip().upper()
-    if not target:
-        return None
-    sym = target.split("_")[0].lower()
-    if sym in _TABULAR_MODEL_CACHE:
-        return _TABULAR_MODEL_CACHE[sym]
-    path = _default_model_dir() / f"liquid_{sym}_lgbm_baseline_v2.json"
-    if not path.exists():
-        _TABULAR_MODEL_CACHE[sym] = None
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        _TABULAR_MODEL_CACHE[sym] = None
-        return None
-    if not isinstance(data, dict):
-        _TABULAR_MODEL_CACHE[sym] = None
-        return None
-    if str(data.get("track") or "").strip().lower() not in {"", "liquid"}:
-        _TABULAR_MODEL_CACHE[sym] = None
-        return None
-    if str(data.get("feature_version") or "").strip() not in {"", FEATURE_VERSION}:
-        _TABULAR_MODEL_CACHE[sym] = None
-        return None
-    if str(data.get("data_version") or "").strip() not in {"", DATA_VERSION}:
-        _TABULAR_MODEL_CACHE[sym] = None
-        return None
-    schema_version = str(data.get("feature_payload_schema_version") or "").strip()
-    if schema_version and schema_version not in FEATURE_PAYLOAD_SCHEMA_COMPAT:
-        _TABULAR_MODEL_CACHE[sym] = None
-        return None
-
-    artifact: Dict[str, Any] = {
-        "feature_dim": int(data.get("feature_dim", len(LIQUID_FEATURE_KEYS)) or len(LIQUID_FEATURE_KEYS)),
-        "x_mean": np.array(data.get("x_mean", []), dtype=np.float64).reshape(-1),
-        "x_std": np.array(data.get("x_std", []), dtype=np.float64).reshape(-1),
-    }
-    if isinstance(data.get("weights"), list):
-        artifact["weights"] = np.array(data.get("weights", []), dtype=np.float64).reshape(-1)
-    if (
-        str(data.get("model") or "").strip().lower() == "lightgbm"
-        and HAS_LGB
-        and isinstance(data.get("booster_model"), str)
-        and str(data.get("booster_model")).strip()
-    ):
-        try:
-            artifact["booster"] = lgb.Booster(model_str=str(data["booster_model"]))
-        except Exception:
-            pass
-    if "weights" not in artifact and "booster" not in artifact:
-        _TABULAR_MODEL_CACHE[sym] = None
-        return None
-    _TABULAR_MODEL_CACHE[sym] = artifact
-    return artifact
+    _ = target
+    raise RuntimeError("legacy_tabular_baseline_disabled")
 
 
 def _load_tabular_model_weights(target: str) -> Optional[Dict[str, Any]]:
-    # backward-compatible alias used by existing tests/tooling
-    return _load_tabular_model_artifact(target)
+    _ = target
+    raise RuntimeError("legacy_tabular_baseline_disabled")
 
 
 def _predict_expected_return_tabular(target: str, payload: Dict[str, Any]) -> Optional[float]:
-    model = _load_tabular_model_weights(target)
-    if model is None:
-        return None
-    x = _feature_vector_from_payload(payload)
-    dim = int(model.get("feature_dim", x.shape[0]) or x.shape[0])
-    x = _align_feature_dim(x, dim, pad_value=0.0)
-    x_mean = model["x_mean"]
-    x_std = model["x_std"]
-    if x_mean.size > 0 and x_std.size > 0:
-        x_mean = _align_feature_dim(x_mean, dim, pad_value=0.0)
-        x_std = _align_feature_dim(x_std, dim, pad_value=1.0)
-        x = (x - x_mean) / np.clip(x_std, 1e-6, None)
-    booster = model.get("booster")
-    if booster is not None:
-        pred = booster.predict(x.reshape(1, -1))
-        arr = np.array(pred, dtype=np.float64).reshape(-1)
-        if arr.size > 0 and np.isfinite(arr[0]):
-            return float(arr[0])
-    w = model.get("weights")
-    if isinstance(w, np.ndarray) and w.size > 0:
-        ww = _align_feature_dim(w.reshape(-1), dim, pad_value=0.0)
-        return float(x @ ww)
-    return None
+    _ = target
+    _ = payload
+    raise RuntimeError("legacy_tabular_baseline_disabled")
 
 
 def _run_model_inference_backtest(
@@ -1670,8 +1590,8 @@ def _run_model_inference_backtest(
 
 def _default_model_by_track(track: str) -> Tuple[str, str]:
     if track == "liquid":
-        return "liquid_ttm_ensemble", "v2.1"
-    return "vc_survival_model", "v2.1"
+        return "liquid_main", "main"
+    return "vc_main", "main"
 
 
 def _parity_check(
@@ -1877,20 +1797,16 @@ def _parse_horizon_float_map(raw: str, defaults: Dict[str, float]) -> Dict[str, 
 
 
 def _liquid_cost_profile(cost_profile: str, stack: Dict[str, Any]) -> Dict[str, float]:
-    cfg = stack.get("cost_config") if isinstance(stack.get("cost_config"), dict) else {}
-    multipliers = cfg.get("horizon_multipliers") if isinstance(cfg.get("horizon_multipliers"), dict) else {}
-    fee_bps = float(cfg.get("fee_bps", 5.0) or 5.0)
-    slippage_bps = float(cfg.get("slippage_bps", 3.0) or 3.0)
-    impact_base_bps = float(cfg.get("impact_base_bps", 2.0) or 2.0)
-    base_cost = max(0.0, (fee_bps + slippage_bps + impact_base_bps) / 10000.0)
-    defaults = {
-        "1h": base_cost * float(multipliers.get("1h", 1.0) if multipliers else 1.0),
-        "4h": base_cost * float(multipliers.get("4h", 1.6) if multipliers else 1.6),
-        "1d": base_cost * float(multipliers.get("1d", 2.4) if multipliers else 2.4),
-        "7d": base_cost * float(multipliers.get("7d", 3.2) if multipliers else 3.2),
-    }
-    env_key = f"SIGNAL_COST_PROFILE_{str(cost_profile or 'standard').strip().upper()}"
-    return _parse_horizon_float_map(os.getenv(env_key, ""), defaults)
+    cov = stack.get("coverage_summary") if isinstance(stack.get("coverage_summary"), dict) else {}
+    profile = load_cost_profile(str(cost_profile or "standard"))
+    cost_bps = compute_cost_map(
+        horizons=("1h", "4h", "1d", "7d"),
+        profile=profile,
+        market_state={"realized_vol": float(cov.get("missing_ratio", 0.0) or 0.0)},
+        liquidity_features={"liquidity_score": float(cov.get("observed_ratio", 0.0) or 0.0)},
+        turnover_estimate=0.5,
+    )
+    return {h: float(v) / 10000.0 for h, v in cost_bps.items()}
 
 
 def _horizon_signal_thresholds() -> Dict[str, Dict[str, float]]:
@@ -2578,12 +2494,12 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
 
     if payload.track == "liquid":
         pred = _build_liquid_prediction(payload.target, payload.horizon)
-        model_name = str(pred.get("model_name") or "liquid_ttm_ensemble")
+        model_name = str(pred.get("model_name") or "liquid_main")
         model_version = str(pred.get("model_version") or "v2.1")
     else:
         pred = _build_vc_prediction(payload.target, 12)
-        model_name = "vc_survival_model"
-        model_version = "v2.1"
+        model_name = "vc_main"
+        model_version = "main"
 
     action = "hold"
     score = float(pred["score"])
@@ -3256,6 +3172,7 @@ async def submit_execution_orders(payload: SubmitExecutionOrdersRequest) -> Subm
         "position_mode": payload.position_mode,
         "margin_mode": payload.margin_mode,
     }
+    policy_preview: Dict[str, Any] = {}
     order_payloads = [
         {
             "target": o.target.upper(),
@@ -3268,10 +3185,43 @@ async def submit_execution_orders(payload: SubmitExecutionOrdersRequest) -> Subm
         }
         for o in payload.orders
     ]
+    if order_payloads:
+        policy_preview = resolve_order_execution_context(
+            order_payloads[0],
+            {
+                "time_in_force": payload.time_in_force,
+                "max_slippage_bps": payload.max_slippage_bps,
+                "venue": resolved_venue,
+                "market_type": payload.market_type,
+                "product_type": payload.product_type,
+                "leverage": payload.leverage,
+                "reduce_only": payload.reduce_only,
+                "position_mode": payload.position_mode,
+                "margin_mode": payload.margin_mode,
+            },
+        )
     for order in payload.orders:
         block_reason = _kill_switch_block_reason(order.track, order.strategy_id)
         if block_reason:
             raise HTTPException(status_code=423, detail=block_reason)
+    repo.create_execution_decision(
+        {
+            "decision_id": decision_id,
+            "adapter": payload.adapter,
+            "venue": resolved_venue,
+            "market_type": payload.market_type,
+            "product_type": payload.product_type,
+            "leverage": payload.leverage,
+            "reduce_only": payload.reduce_only,
+            "position_mode": payload.position_mode,
+            "margin_mode": payload.margin_mode,
+            "requested_by": "api",
+            "strategy_id": str(payload.orders[0].strategy_id if payload.orders else "default-liquid-v1"),
+            "policy_snapshot": policy_preview,
+            "risk_snapshot": {"pre_submit_kill_switch_checked": True},
+            "status": "created",
+        }
+    )
     order_ids = repo.create_execution_orders(
         decision_id=decision_id,
         adapter=payload.adapter,
@@ -3441,10 +3391,14 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
     )
     if not risk_resp.approved:
         raise HTTPException(status_code=423, detail=f"risk_blocked:{','.join(risk_resp.violations)}")
-    results = exec_engine.run(
-        payload.adapter,
-        scaled_orders,
-        context={
+    out = exec_engine.run_decision(
+        repo,
+        payload.decision_id,
+        adapter=payload.adapter,
+        venue=resolved_venue,
+        market_type=payload.market_type,
+        max_orders=payload.max_orders,
+        base_context={
             "time_in_force": payload.time_in_force,
             "max_slippage_bps": payload.max_slippage_bps,
             "venue": resolved_venue,
@@ -3458,48 +3412,61 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
             "max_retries": payload.max_retries,
             "fee_bps": payload.fee_bps,
         },
+        orders_override=scaled_orders,
     )
-    filled = 0
-    rejected = 0
+
+    filled = int(out.get("filled") or 0)
+    rejected = int(out.get("rejected") or 0)
     reject_breakdown: Dict[str, int] = {}
-    merged = []
-    for order, res in zip(scaled_orders, results):
-        normalized_res = _normalize_execution_payload(res)
-        exec_trace = build_execution_trace(order, normalized_res)
-        status = str(normalized_res.get("status") or "rejected")
+    merged: List[Dict[str, Any]] = []
+    for row in list(out.get("orders") or []):
+        if not isinstance(row, dict):
+            continue
+        execution = _normalize_execution_payload(row.get("execution") if isinstance(row.get("execution"), dict) else {})
+        status = str(execution.get("status") or "rejected")
+        execution_trace = row.get("execution_trace") if isinstance(row.get("execution_trace"), dict) else build_execution_trace(row, execution)
         EXECUTION_ORDERS_TOTAL.labels(adapter=payload.adapter, status=status).inc()
-        if status in {"filled", "partially_filled"}:
-            filled += 1
-        elif status == "rejected":
-            rejected += 1
-            reason_cat = str(normalized_res.get("reject_reason_category") or "other")
+        horizon_bucket = str(
+            ((row.get("metadata") or {}) if isinstance(row.get("metadata"), dict) else {}).get("horizon")
+            or ((row.get("metadata") or {}) if isinstance(row.get("metadata"), dict) else {}).get("selected_horizon")
+            or "unknown"
+        )
+        EXEC_SLIPPAGE_BPS.labels(venue=resolved_venue, adapter=payload.adapter, horizon_bucket=horizon_bucket).observe(
+            float(execution_trace.get("slippage_bps") or 0.0)
+        )
+        child_orders = list(row.get("child_orders") or [])
+        fills = list(row.get("fills") or [])
+        for child in child_orders:
+            if not isinstance(child, dict):
+                continue
+            c_status = str(child.get("status") or "unknown")
+            EXEC_CHILD_ORDERS_TOTAL.labels(venue=resolved_venue, adapter=payload.adapter, status=c_status).inc()
+            ack = child.get("ack") if isinstance(child.get("ack"), dict) else {}
+            if bool(ack.get("idempotency_hit")):
+                EXEC_IDEMPOTENCY_HITS_TOTAL.labels(venue=resolved_venue).inc()
+        if fills:
+            EXEC_FILLS_TOTAL.labels(venue=resolved_venue, adapter=payload.adapter).inc(len(fills))
+        if status == "rejected":
+            reason_cat = str(execution.get("reject_reason_category") or "other")
             reject_breakdown[reason_cat] = reject_breakdown.get(reason_cat, 0) + 1
             EXECUTION_REJECTS_TOTAL.labels(adapter=payload.adapter, reason=reason_cat).inc()
-            reason_raw = str(normalized_res.get("reject_reason") or "").lower()
+            reason_raw = str(execution.get("reject_reason") or "").lower()
             if reason_cat == "other" and "bitget" in reason_raw:
                 BITGET_UNCLASSIFIED_ERRORS_TOTAL.labels(adapter=payload.adapter).inc()
-        repo.update_order_execution(
-            order["id"],
-            status=status,
-            metadata={
-                "execution": normalized_res,
-                "execution_trace": exec_trace,
-                "execution_policy": str(normalized_res.get("execution_policy") or ""),
-            },
-        )
         merged.append(
             {
-                **order,
-                "execution": normalized_res,
-                "execution_trace": exec_trace,
-                "execution_policy": str(normalized_res.get("execution_policy") or ""),
+                **row,
+                "execution": execution,
+                "execution_trace": execution_trace,
+                "child_orders": child_orders,
+                "fills": fills,
             }
         )
 
     resp = ExecuteOrdersResponse(
         decision_id=payload.decision_id,
         adapter=payload.adapter,
-        total=len(orders),
+        total=int(out.get("total") or len(orders)),
         filled=filled,
         rejected=rejected,
         reject_breakdown=reject_breakdown,

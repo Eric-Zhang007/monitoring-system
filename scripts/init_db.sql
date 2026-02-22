@@ -271,6 +271,97 @@ CREATE TABLE IF NOT EXISTS orders_sim (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_orders_sim_decision_id ON orders_sim(decision_id);
+ALTER TABLE orders_sim ADD COLUMN IF NOT EXISTS filled_qty DOUBLE PRECISION DEFAULT 0;
+ALTER TABLE orders_sim ADD COLUMN IF NOT EXISTS avg_fill_price DOUBLE PRECISION;
+ALTER TABLE orders_sim ADD COLUMN IF NOT EXISTS fees_paid DOUBLE PRECISION DEFAULT 0;
+ALTER TABLE orders_sim ADD COLUMN IF NOT EXISTS last_venue_order_id TEXT;
+ALTER TABLE orders_sim ADD COLUMN IF NOT EXISTS reject_reason TEXT;
+ALTER TABLE orders_sim ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+CREATE TABLE IF NOT EXISTS execution_decisions (
+    decision_id VARCHAR(64) PRIMARY KEY,
+    adapter VARCHAR(32) NOT NULL,
+    venue VARCHAR(64) NOT NULL,
+    market_type VARCHAR(32) NOT NULL,
+    product_type VARCHAR(64),
+    leverage DOUBLE PRECISION,
+    reduce_only BOOLEAN DEFAULT FALSE,
+    position_mode VARCHAR(16),
+    margin_mode VARCHAR(16),
+    requested_by VARCHAR(64) DEFAULT 'api',
+    strategy_id VARCHAR(64) DEFAULT 'default-liquid-v1',
+    policy_snapshot JSONB DEFAULT '{}'::jsonb,
+    risk_snapshot JSONB DEFAULT '{}'::jsonb,
+    trace_summary JSONB DEFAULT '{}'::jsonb,
+    status VARCHAR(32) DEFAULT 'created',
+    error TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    ended_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_execution_decisions_status_time ON execution_decisions(status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS execution_child_orders (
+    id BIGSERIAL PRIMARY KEY,
+    decision_id VARCHAR(64) NOT NULL REFERENCES execution_decisions(decision_id) ON DELETE CASCADE,
+    parent_order_id BIGINT NOT NULL REFERENCES orders_sim(id) ON DELETE CASCADE,
+    client_order_id VARCHAR(128) NOT NULL UNIQUE,
+    venue_order_id VARCHAR(128),
+    symbol VARCHAR(32) NOT NULL,
+    side VARCHAR(8) NOT NULL,
+    qty DOUBLE PRECISION NOT NULL,
+    limit_price DOUBLE PRECISION,
+    tif VARCHAR(16) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'new',
+    slice_index INTEGER DEFAULT 0,
+    lifecycle JSONB DEFAULT '[]'::jsonb,
+    submitted_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_execution_child_orders_decision_parent ON execution_child_orders(decision_id, parent_order_id, id);
+CREATE INDEX IF NOT EXISTS idx_execution_child_orders_venue_order_id ON execution_child_orders(venue_order_id);
+
+CREATE TABLE IF NOT EXISTS execution_fills (
+    id BIGSERIAL PRIMARY KEY,
+    child_order_id BIGINT NOT NULL REFERENCES execution_child_orders(id) ON DELETE CASCADE,
+    fill_ts TIMESTAMPTZ NOT NULL,
+    qty DOUBLE PRECISION NOT NULL,
+    price DOUBLE PRECISION NOT NULL,
+    fee DOUBLE PRECISION DEFAULT 0,
+    fee_currency VARCHAR(16),
+    liquidity_flag VARCHAR(16),
+    raw JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_execution_fills_child_ts ON execution_fills(child_order_id, fill_ts);
+
+CREATE TABLE IF NOT EXISTS reconciliation_logs (
+    id BIGSERIAL PRIMARY KEY,
+    venue VARCHAR(64) NOT NULL,
+    adapter VARCHAR(32) NOT NULL,
+    decision_id VARCHAR(64),
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    open_orders_diff JSONB DEFAULT '{}'::jsonb,
+    positions_diff JSONB DEFAULT '{}'::jsonb,
+    actions_taken JSONB DEFAULT '[]'::jsonb,
+    status VARCHAR(32) DEFAULT 'ok',
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_logs_checked_at ON reconciliation_logs(checked_at DESC);
+
+CREATE TABLE IF NOT EXISTS positions_live (
+    id BIGSERIAL PRIMARY KEY,
+    venue VARCHAR(64) NOT NULL,
+    symbol VARCHAR(32) NOT NULL,
+    account_id VARCHAR(64) NOT NULL DEFAULT '',
+    position_qty DOUBLE PRECISION NOT NULL DEFAULT 0,
+    avg_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+    unrealized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    raw JSONB DEFAULT '{}'::jsonb,
+    UNIQUE (venue, symbol, account_id)
+);
+CREATE INDEX IF NOT EXISTS idx_positions_live_venue_symbol ON positions_live(venue, symbol, updated_at DESC);
 
 -- Phase1 crypto foundation
 CREATE TABLE IF NOT EXISTS market_bars (

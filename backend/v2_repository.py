@@ -13,7 +13,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from psycopg2.pool import ThreadedConnectionPool
 
-from repository_modules import backtest_store, execution_store
+from artifacts.validate import validate_manifest_dir
+from repository_modules import backtest_store, execution_oms_store, execution_store
 from schemas_v2 import Event
 
 
@@ -878,43 +879,8 @@ class V2Repository:
                 return [dict(r) for r in cur.fetchall()]
 
     def model_artifact_exists(self, model_name: str, track: str, model_version: str) -> bool:
-        def _has_required_fields(payload: Dict[str, Any], required: List[str]) -> bool:
-            for k in required:
-                v = payload.get(k)
-                if v is None:
-                    return False
-                if isinstance(v, str) and not v.strip():
-                    return False
-            return True
-
-        def _load_json_file(path: Path) -> Optional[Dict[str, Any]]:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                return None
-            return data if isinstance(data, dict) else None
-
-        def _find_checkpoint_manifest(path: Path) -> Optional[Path]:
-            candidates = [
-                path.with_suffix(".manifest.json"),
-                path.with_suffix(path.suffix + ".manifest.json"),
-                path.with_suffix(path.suffix + ".json"),
-            ]
-            for cand in candidates:
-                if cand.exists() and cand.is_file():
-                    return cand
-            return None
-
-        base_required = [
-            "model_name",
-            "model_version",
-            "track",
-            "type",
-            "created_at",
-            "feature_version",
-            "data_version",
-        ]
-
+        _ = track
+        _ = model_version
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -934,48 +900,14 @@ class V2Repository:
                 if not p:
                     return False
                 path = Path(p)
-                if not path.exists() or not path.is_file():
+                if not path.exists() or not path.is_dir():
                     return False
-                if path.suffix.lower() == ".json":
-                    payload = _load_json_file(path)
-                    if payload is None:
-                        return False
-                    if str(payload.get("type") or "").strip().lower() == "bootstrap_placeholder":
-                        return False
-                    if not _has_required_fields(payload, base_required):
-                        return False
-                    if str(payload.get("track") or "").strip().lower() != str(track).strip().lower():
-                        return False
-                    if str(payload.get("model_name") or "").strip() != str(model_name).strip():
-                        return False
-                    if str(payload.get("model_version") or "").strip() != str(model_version).strip():
-                        return False
-                    return True
-                if path.suffix.lower() in {".pt", ".pth"}:
-                    try:
-                        if path.stat().st_size <= 1024:
-                            return False
-                    except Exception:
-                        return False
-                    manifest_path = _find_checkpoint_manifest(path)
-                    if manifest_path is None:
-                        return False
-                    manifest = _load_json_file(manifest_path)
-                    if manifest is None:
-                        return False
-                    if not _has_required_fields(manifest, base_required):
-                        return False
-                    if str(manifest.get("track") or "").strip().lower() != str(track).strip().lower():
-                        return False
-                    if str(manifest.get("model_name") or "").strip() != str(model_name).strip():
-                        return False
-                    if str(manifest.get("model_version") or "").strip() != str(model_version).strip():
-                        return False
-                    # NN checkpoint must carry deterministic replay metadata via sidecar manifest.
-                    if not _has_required_fields(manifest, ["normalization", "train_report_hash", "feature_payload_schema_version"]):
-                        return False
-                    return True
-                return True
+                try:
+                    manifest = validate_manifest_dir(path)
+                except Exception:
+                    return False
+                model_id = str(manifest.get("model_id") or "").strip()
+                return model_id == str(model_name).strip()
 
     def load_price_history(
         self,
@@ -1175,6 +1107,252 @@ class V2Repository:
             orders=orders,
         )
 
+    def create_execution_decision(self, payload: Dict[str, Any]) -> str:
+        return execution_oms_store.create_decision(self._connect, payload)
+
+    def get_execution_decision(self, decision_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM execution_decisions
+                    WHERE decision_id = %s
+                    LIMIT 1
+                    """,
+                    (str(decision_id),),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def start_execution_decision(self, decision_id: str) -> None:
+        execution_oms_store.start_decision(self._connect, decision_id)
+
+    def finish_execution_decision(self, decision_id: str, status: str, summary: Dict[str, Any], error: Optional[str] = None) -> None:
+        execution_oms_store.finish_decision(self._connect, decision_id, status, summary, error)
+
+    def create_child_orders(self, parent_order_id: int, child_rows: List[Dict[str, Any]]) -> List[int]:
+        return execution_oms_store.create_child_orders(self._connect, parent_order_id, child_rows)
+
+    def update_child_order_status(
+        self,
+        child_id: int,
+        status: str,
+        venue_order_id: Optional[str] = None,
+        lifecycle_append: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        execution_oms_store.update_child_status(
+            self._connect,
+            child_id,
+            status,
+            venue_order_id=venue_order_id,
+            lifecycle_append=lifecycle_append,
+        )
+
+    def insert_execution_fills(self, child_id: int, fills: List[Dict[str, Any]]) -> List[int]:
+        return execution_oms_store.insert_fills(self._connect, child_id, fills)
+
+    def update_parent_from_fills(self, parent_order_id: int) -> Dict[str, Any]:
+        return execution_oms_store.update_parent_from_fills(self._connect, parent_order_id)
+
+    def list_child_orders(self, *, decision_id: Optional[str] = None, parent_order_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        cond: List[str] = []
+        params: List[Any] = []
+        if decision_id:
+            cond.append("decision_id = %s")
+            params.append(str(decision_id))
+        if parent_order_id is not None:
+            cond.append("parent_order_id = %s")
+            params.append(int(parent_order_id))
+        where = f"WHERE {' AND '.join(cond)}" if cond else ""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM execution_child_orders
+                    {where}
+                    ORDER BY parent_order_id ASC, slice_index ASC, id ASC
+                    """,
+                    tuple(params),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def list_fills_for_child(self, child_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM execution_fills
+                    WHERE child_order_id = %s
+                    ORDER BY fill_ts ASC, id ASC
+                    """,
+                    (int(child_id),),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def list_fills_for_decision(self, decision_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT f.*, c.parent_order_id, c.decision_id, c.symbol, c.side
+                    FROM execution_fills f
+                    JOIN execution_child_orders c ON c.id = f.child_order_id
+                    WHERE c.decision_id = %s
+                    ORDER BY f.fill_ts ASC, f.id ASC
+                    """,
+                    (str(decision_id),),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def append_reconciliation_log(
+        self,
+        *,
+        venue: str,
+        adapter: str,
+        decision_id: Optional[str],
+        open_orders_diff: Dict[str, Any],
+        positions_diff: Dict[str, Any],
+        actions_taken: List[Dict[str, Any]],
+        status: str,
+        error: Optional[str] = None,
+    ) -> int:
+        return execution_oms_store.append_reconciliation_log(
+            self._connect,
+            venue=venue,
+            adapter=adapter,
+            decision_id=decision_id,
+            open_orders_diff=open_orders_diff,
+            positions_diff=positions_diff,
+            actions_taken=actions_taken,
+            status=status,
+            error=error,
+        )
+
+    def latest_orderbook_l2(self, symbol: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT symbol, ts, bid_px, ask_px, bid_sz, ask_sz, spread_bps, imbalance
+                    FROM orderbook_l2
+                    WHERE symbol = UPPER(%s)
+                    ORDER BY ts DESC
+                    LIMIT 1
+                    """,
+                    (str(symbol),),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def get_position_live(self, venue: str, symbol: str, account_id: str = "") -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM positions_live
+                    WHERE venue = %s AND symbol = UPPER(%s) AND account_id = %s
+                    LIMIT 1
+                    """,
+                    (str(venue), str(symbol), str(account_id or "")),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def upsert_position_live(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        account_id: str = "",
+        position_qty: float,
+        avg_cost: float,
+        unrealized_pnl: float,
+        raw: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO positions_live (
+                        venue, symbol, account_id, position_qty, avg_cost, unrealized_pnl, updated_at, raw
+                    ) VALUES (%s, UPPER(%s), %s, %s, %s, %s, NOW(), %s::jsonb)
+                    ON CONFLICT (venue, symbol, account_id)
+                    DO UPDATE SET
+                        position_qty = EXCLUDED.position_qty,
+                        avg_cost = EXCLUDED.avg_cost,
+                        unrealized_pnl = EXCLUDED.unrealized_pnl,
+                        updated_at = NOW(),
+                        raw = EXCLUDED.raw
+                    """,
+                    (
+                        str(venue),
+                        str(symbol),
+                        str(account_id or ""),
+                        float(position_qty),
+                        float(avg_cost),
+                        float(unrealized_pnl),
+                        json.dumps(raw or {}),
+                    ),
+                )
+
+    def list_positions_live(self, venue: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if venue:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM positions_live
+                        WHERE venue = %s
+                        ORDER BY symbol ASC, account_id ASC
+                        """,
+                        (str(venue),),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM positions_live
+                        ORDER BY venue ASC, symbol ASC, account_id ASC
+                        """
+                    )
+                return [dict(r) for r in cur.fetchall()]
+
+    def list_open_child_orders_live(self, max_age_sec: Optional[int] = None) -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        age_clause = ""
+        if isinstance(max_age_sec, int) and max_age_sec > 0:
+            age_clause = "AND COALESCE(c.submitted_at, c.updated_at) < NOW() - make_interval(secs => %s)"
+            params.append(int(max_age_sec))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        c.*,
+                        d.adapter,
+                        d.venue,
+                        d.market_type,
+                        d.product_type,
+                        d.position_mode,
+                        d.margin_mode,
+                        d.reduce_only,
+                        d.leverage
+                    FROM execution_child_orders c
+                    JOIN execution_decisions d ON d.decision_id = c.decision_id
+                    WHERE c.status IN ('submitted', 'partially_filled')
+                      AND d.adapter IN ('coinbase_live', 'bitget_live')
+                      {age_clause}
+                    ORDER BY c.updated_at ASC, c.id ASC
+                    """,
+                    tuple(params),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
     def fetch_orders_for_decision(self, decision_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         return execution_store.fetch_orders_for_decision(self._connect, decision_id=decision_id, limit=limit)
 
@@ -1188,6 +1366,17 @@ class V2Repository:
     def get_trade_audit_chain(self, decision_id: str) -> Dict[str, Any]:
         with self._connect() as conn:
             with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM execution_decisions
+                    WHERE decision_id = %s
+                    LIMIT 1
+                    """,
+                    (decision_id,),
+                )
+                _drow = cur.fetchone()
+                decision = dict(_drow) if _drow else {}
                 cur.execute(
                     """
                     SELECT *
@@ -1218,7 +1407,35 @@ class V2Repository:
                     (decision_id,),
                 )
                 positions = [dict(r) for r in cur.fetchall()]
-        return {"signals": signals, "orders": orders, "positions": positions}
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM execution_child_orders
+                    WHERE decision_id = %s
+                    ORDER BY parent_order_id ASC, slice_index ASC, id ASC
+                    """,
+                    (decision_id,),
+                )
+                child_orders = [dict(r) for r in cur.fetchall()]
+                cur.execute(
+                    """
+                    SELECT f.*, c.parent_order_id, c.symbol, c.side
+                    FROM execution_fills f
+                    JOIN execution_child_orders c ON c.id = f.child_order_id
+                    WHERE c.decision_id = %s
+                    ORDER BY f.fill_ts ASC, f.id ASC
+                    """,
+                    (decision_id,),
+                )
+                fills = [dict(r) for r in cur.fetchall()]
+        return {
+            "decision": decision,
+            "signals": signals,
+            "orders": orders,
+            "positions": positions,
+            "child_orders": child_orders,
+            "fills": fills,
+        }
 
     def update_order_execution(self, order_id: int, status: str, metadata: Dict[str, Any]) -> None:
         execution_store.update_order_execution(self._connect, order_id=order_id, status=status, metadata=metadata)

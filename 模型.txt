@@ -1,0 +1,517 @@
+COMMIT 1 — 先把“模型主干契约”写死：Backbone 接口 + Head 接口 + 输出契约 + 单测门禁
+1.1 新增统一的模型输出结构（禁止推理端再造置信度/波动率）
+
+新增 models/outputs.py
+
+class MultiHorizonDistOutput：
+
+mu: Tensor[B,H]
+
+log_sigma: Tensor[B,H]（或 sigma）
+
+q: Optional[Tensor[B,H,Q]]（若用分位数）
+
+direction_logit: Optional[Tensor[B,H]]
+
+aux: dict（gate、attn解释、质量统计等）
+
+新增 tests/test_model_output_contract.py
+
+断言：LiquidModel.forward(x_values, x_mask) 必须返回 MultiHorizonDistOutput
+
+断言：输出包含能直接推导 vol_forecast/confidence 的字段（例如 sigma 或 direction_logit），禁止推理端启发式生成
+
+✅ Done：测试先过（可以先用 stub 输出）
+
+1.2 新增 Backbone 接口与注册表（可切换，不写死 PatchTST）
+
+新增 models/backbones/base.py
+
+class BackboneBase(nn.Module)：
+
+forward(x_values, x_mask) -> Tensor[B, L, d_model]（返回序列表征，别只取 last）
+
+out_dim: int
+
+新增 models/backbones/registry.py
+
+build_backbone(name: str, **cfg) -> BackboneBase
+
+支持的 name 列表先写死：patchtst, itransformer, tft
+
+新增 tests/test_backbone_registry.py
+
+name 不在白名单 -> 必须 raise（不要静默 fallback）
+
+✅ Done：训练入口可以选择 backbone 名称，但先不实现细节
+
+1.3 新增 Head 接口（统一输出分布/方向）
+
+新增 models/heads/dist_head.py
+
+class MultiHorizonDistHead(nn.Module)：
+
+输入：h_seq[B,L,D], x_values, x_mask, group_slices（可选）
+
+输出：MultiHorizonDistOutput
+
+新增 tests/test_dist_head_shapes.py
+
+H=4（1h/4h/1d/7d），Q=3（p10/p50/p90）固定
+
+shape 必须稳定
+
+✅ Done：head 可先用线性层占位，但必须符合输出契约
+
+COMMIT 2 — 真 PatchTST：patch-token 流程 + RevIN + mask 友好
+
+你当前 PatchTSTBackbone 是 concat values/mask 后 TransformerEncoder。
+这一步把它升级成真 PatchTST（patchify、channel-independent、可长 lookback）。
+
+2.1 替换 models/patchtst.py 为“真 PatchTST backbone”
+
+修改/重建 models/backbones/patchtst.py（不要继续用旧文件名也行，但 registry 里必须能 build）
+实现要点（强制）：
+
+RevIN：按 feature/channel 做可逆归一化（train 统计、inference 复用）
+
+Patchify：
+
+输入 [B,L,D] -> 每个 D 独立 patch -> tokens [B, D, N_patches, patch_len]
+
+Patch embedding：Linear(patch_len -> d_model)
+
+Positional embedding：对 patch index
+
+Encoder：标准 Transformer encoder over patch tokens（按 channel-independent 设计）
+
+Pooling：输出 h_seq（建议输出到 [B,L,d_model] 或 [B,N_patches,d_model]，再由 head 统一处理）
+
+mask 融合：
+
+mask patch 化后作为额外通道 或 attention bias（避免“零值=缺失”的混淆）
+
+新增 tests/test_patchtst_patchify.py
+
+L 必须能被 patch_len 整除，否则策略：pad 到最近整除（pad 的位置 mask=1）
+
+断言 patch 数正确、pad mask 正确
+
+✅ Done：PatchTST 不再是 concat-mask 的“伪 PatchTST”
+
+PatchTST patch 设计的参考：HF 文档与官方实现（你写 code 时可以对照）。
+
+COMMIT 3 — iTransformer backbone（进入 strict 主干，而不是 experiments 里 lite）
+3.1 新增 models/backbones/itransformer.py
+
+实现要点：
+
+维度反转：把 variate（特征维）当 token，时间维做 embedding
+
+输入 [B,L,D] -> variate tokens [B,D,embed(L)]
+
+注意 mask：缺失位置要在时间 embedding 时体现（例如 masked mean 或加 mask embedding）
+
+新增 tests/test_itransformer_shapes.py
+
+输出 h_seq 必须符合 BackboneBase 接口
+
+✅ Done：backbone_registry 现在能 build itransformer
+
+iTransformer 原理参考（倒置维度建模多变量相关性）。
+
+COMMIT 4 — TFT backbone（生产可用的“可解释多周期”分支）
+
+你实验里有 TFTLite，但不在 strict 工件链路。
+这一步做一个可训练、可推理、可打包的 TFT（可以简化，但结构要对）。
+
+4.1 新增 models/backbones/tft.py
+
+实现最小可用 TFT：
+
+Variable Selection Network（VSN）：对输入变量做 soft selection（可解释）
+
+LSTM encoder（局部时序）
+
+Multi-head attention（长依赖）
+
+Gating + residual（稳定训练）
+
+输出 h_seq[B,L,d_model]
+
+新增 tests/test_tft_minimal.py
+
+断言可 forward、梯度可回传（避免“训练不足返回零预测”那类问题）
+
+✅ Done：PatchTST / iTransformer / TFT 三路 backbone 都可 strict 训练
+
+TFT 多周期与可解释结构参考。
+
+COMMIT 5 — 多模态融合升级：从“last_step text + quality gate”变成“序列级双塔 + 受约束融合”
+
+你现在 head 的 text_vec/quality_vec 只取 最后一帧，且 gate 只看 quality。
+这会浪费大量文本时序信息，也让 gate 太脆。
+
+5.1 新增“文本塔”与“质量聚合器”
+
+新增 models/text_tower.py
+
+输入：x_values[:,:,text_emb_*] + x_mask[:,:,text_emb_*]
+
+输出：t_seq[B,L,d_text] 或 t_pool[B,d_text]
+
+建议：轻量 Transformer 或 GRU + attention pooling
+
+新增 models/quality_encoder.py
+
+输入：质量特征（coverage/disagreement/dup_ratio/avg_lag 等）做 时间衰减聚合
+
+输出：q_vec[B,d_q]
+
+5.2 替换 ResidualGateHead 为“受约束融合 Head”
+
+修改 models/heads/dist_head.py
+融合建议（稳定、可控、可解释）：
+
+numeric backbone 输出 h_seq
+
+text tower 输出 t_pool
+
+delta = MLP(t_pool)（多周期）
+
+gate = sigmoid(MLP(q_vec) + bias)，并做 gate 正则（防无脑开闸）
+
+mu = base_mu(h_seq_last) + gate * delta_mu
+
+sigma/quantiles/direction 同理（可选择只对 mu 做 residual）
+
+新增 tests/test_gate_behavior.py
+
+当 text_coverage=0 且 mask 全缺失时，gate 必须趋近 0（或小于阈值）
+
+当 text_coverage 高且 disagreement 低时，gate 可打开（不测收益，只测单调性）
+
+✅ Done：多模态不再是“最后一帧 text + 简单 gate”
+
+COMMIT 6 — 损失函数升级：MSE → 分布/分位数/方向/成本权重（训练目标更贴近决策）
+
+你现在 strict 是纯 MSE。
+这会导致：没有不确定性、方向不可校准、成本敏感不足。
+
+6.1 新增统一损失模块
+
+新增 training/losses/liquid_losses.py
+必须包含：
+
+gaussian_nll(mu, log_sigma, y)（每 horizon）
+
+quantile_loss(q, y, taus=[0.1,0.5,0.9])（可选）
+
+direction_bce(direction_logit, sign(y))（可选）
+
+gate_regularizer(gate, target_open_rate)（抑制过度依赖文本）
+
+cost_weighting(weight = f(cost_bps, liquidity, coverage))（成本越高样本权重越低/或反之，根据你策略）
+
+修改 training/train_liquid.py
+
+替换 nn.MSELoss() 为组合 loss
+
+日志里打印各项 loss 分量
+
+✅ Done：训练输出中包含每项 loss 的均值（便于诊断）
+
+COMMIT 7 — 数据切分升级：walk-forward + purged（默认强制），替换单次 80/20
+
+你现在是 split=int(n*0.8) 的一次顺序切分。
+
+7.1 新增 splits
+
+新增 training/splits/walkforward_purged.py
+
+配置：
+
+train_days / val_days / test_days
+
+purge_gap_hours
+
+step_days
+
+输出：多个 folds（fold_i 的 train/val/test index 列表）
+
+7.2 修改 training/train_liquid.py
+
+训练流程改为：
+
+对每个 fold：训练 -> 验证 -> 保存 best checkpoint
+
+最终模型：用所有 folds 最佳超参在全训练窗重新 fit（或 ensemble，二选一，但要写死规则）
+
+训练报告里必须记录每个 fold 的时间范围与指标
+
+新增 tests/test_walkforward_purged_split.py
+
+断言：purge_gap 生效（train_end < val_start - gap 等）
+
+✅ Done：strict 主训练不再允许单次 80/20
+
+COMMIT 8 — 评估体系升级：从“1h sharpe_proxy”变成多 horizon + 成本后 + 校准 + 稳健性
+
+你现在 OOS 是 1h 的 sign(pred)*y sharpe proxy。
+
+8.1 新增评估模块
+
+新增 training/metrics/liquid_metrics.py
+必须计算（每 horizon）：
+
+回归：MSE/MAE、Spearman IC、hit_rate
+
+策略代理（确定性、可回放）：
+
+position = clip(pred_mu/(pred_sigma+eps), -1, 1)（或用 direction prob）
+
+计算 pnl_net（必须扣统一成本，见下一 commit）
+
+sharpe、max_drawdown、turnover、avg_holding
+
+校准：
+
+direction 的 Brier/ECE
+
+分位数覆盖率（p10/p90 覆盖是否接近 80%）
+
+8.2 修改 training/train_liquid.py
+
+每 fold 输出完整指标
+
+training_report.json 写入指标结构（供 artifact 打包）
+
+✅ Done：报告里能看见“收益/风险/校准”三类指标，不再只看 MSE
+
+COMMIT 9 — 成本口径统一：labels / oos / action 共用一份成本配置（彻底消灭分叉）
+
+你现在存在：strict labels 固定 bps，而其它链路又动态成本；评估又缺 impact 分项（你总结 H）。
+这一步必须“一次性统一”。
+
+9.1 新增成本模块（单一真相源）
+
+新增 cost/cost_profile.py
+
+CostProfile（fee/slippage/impact/infra…）
+
+compute_cost_bps(horizon, market_state, liquidity_features, turnover_estimate, infra_usd=None)
+
+必须支持：按 horizon multiplier、按流动性/波动自适应
+
+9.2 修改 labels
+
+修改 training/labels/liquid_labels.py
+
+不再写死 1h=4,4h=6...
+
+直接调用 cost_profile.compute_cost_bps(...)
+
+label 产出必须同时写：
+
+ret_raw[h]
+
+cost_bps[h]
+
+ret_net[h] = ret_raw - cost_bps/1e4
+
+9.3 修改 action 层成本
+
+修改 backend/v2_router.py（你提到 cost profile 规则段）
+
+_liquid_cost_profile 改为调用同一 cost_profile.compute_cost_bps
+
+不允许 action 层再维护一套 multiplier/默认 bps
+
+9.4 修改 OOS 评估成本
+
+修改 training/validation.py 或你现在统一评估入口
+
+成本计算改为同一 cost_profile
+
+impact 不再漏掉
+
+新增 tests/test_cost_profile_parity.py
+
+给定同一输入（horizon/fee/slippage/impact/liquidity），labels/action/eval 三处算出的成本必须一致
+
+✅ Done：成本口径从根上统一
+
+COMMIT 10 — 推理输出升级：confidence/vol_forecast 来自模型头 + 校准器（移除 abs(pred) 启发式）
+
+你现在推理是 0.5 + abs(v)*5 这类映射，vol=abs(v)。
+
+10.1 修改 backend/liquid_model_service.py
+
+pred_map 保留（mu 的多 horizon）
+
+signal_confidence_horizons 改为：
+
+若有 direction_logit：p = sigmoid(logit)，再做温度缩放/Platt（可选）
+
+若只有 sigma：用 conf = f(mu/sigma) 但必须是固定可解释函数，并在训练时校准参数（写入 artifact）
+
+vol_forecast_horizons 改为：
+
+若有 sigma：vol = sigma
+
+若有 quantiles：vol ~= (q90 - q10)/2.56
+
+10.2 新增校准器
+
+新增 training/calibration/calibrate.py
+
+direction：temperature scaling / Platt
+
+sigma：可以做 scale 校准（让预测的覆盖率接近理论）
+
+artifact 打包：把 calibrator 参数写入 manifest extra_payload
+
+新增 tests/test_inference_no_heuristic_confidence.py
+
+grep 或行为测试：不允许出现 abs(pred) 直接生成 conf/vol 的分支
+
+✅ Done：推理端不再自造“假置信度/假波动率”
+
+COMMIT 11 — 文本/embedding 输入侧修复：禁止“伪 embedding”，失败即缺失（mask=1），由 gate 自动降权
+
+你现在 NIM 失败会返回 deterministic random embedding。
+这会把“不可用”伪装成“有信号”，最伤。
+
+11.1 修改 backend/nim_integration.py
+
+_call_nim_embedding 失败时：
+
+不再返回伪 embedding
+
+返回 None
+
+offline_extraction：
+
+如果 embedding None：写入 DB 时不要写 feature_vector，或写 null，并记录 news_count/last_news_time
+
+online get_cached_features：
+
+若 feature_vector 缺失/过期：返回 None
+
+11.2 修改文本构建脚本（你现在的 build_text_embeddings）
+
+如果上游 embedding None：
+
+text_emb_* 全缺失（mask=1）
+
+quality 的 text_coverage=0
+
+确保 merge 不再“补0当有效”
+
+新增 tests/test_nim_failure_results_in_missing.py
+
+模拟 NIM endpoint 失败：最终进入 feature_matrix 的 text embedding 必须是 missing（mask=1）
+
+✅ Done：文本不可用时会自动降权，而不是污染训练分布
+
+COMMIT 12 — 实验模型/旧链路清理：lite/零预测/legacy router 全部断路（避免“跑起来但其实没用”）
+
+你列的 C/D/E/F/I 里，本质问题是：实验/旧链路太多，且存在无 torch 直接返回零预测/字符串、兼容面过宽、推理置信度仍启发式。
+这一步要做“强制收敛”。
+
+12.1 backbone_experiments：要么并入主干、要么直接删除
+
+修改 training/backbone_experiments.py
+
+删除 payload.get(k,0.0) 这种构造（你总结 11）
+
+删除“无 torch 返回零预测/状态字符串”（你总结 12）
+
+改成：直接复用 LiquidSequenceDataset 与 strict artifact pack/validate（同一套）
+
+✅ Done：实验也必须可复现、可打包、可推理
+
+12.2 删除/冻结 legacy trainer & legacy router
+
+建议（激进一次性）
+
+training/liquid_model_trainer.py：标记 deprecated 并从入口移除（不再被任何脚本调用）
+
+inference/model_router.py：只保留 strict 路径（manifest dir + strict model），删除 multi-model meta / ridge / tsmixer 等兼容分支
+
+backend/v2_repository.py：移除旧 .json baseline 与旧 sidecar manifest 加载逻辑（只允许目录式 manifest）
+
+backend/models/*：删除旧 18维线性基线与旧 ensemble manifest（或至少不再被 registry 引用）
+
+修改 tests
+
+删除 backend/tests 中对 legacy/兼容面的覆盖（你列 43）
+
+新增 strict-only 的推理加载测试（manifest 校验、schema_hash 校验）
+
+✅ Done：仓库里不再存在“看似很多模型，实际主线没用”的路径
+
+COMMIT 13 — VC 链路一次性统一：训练/推理共用同一特征定义 + 输出概率可校准
+
+你总结 F 表明 VC 训练 5维和服务端 5维不一致、置信度启发式。
+这一步把 VC 做成“严格一致”的小模型。
+
+13.1 定义 VC feature contract（单一真相源）
+
+新增 schema/vc_feature_schema.yaml
+
+明确训练/推理同一套字段（要么从 event 表汇总，要么从 feature_matrix_main 取子集，但必须一致）
+
+13.2 重写 VC 训练与服务
+
+修改 training/train_vc.py
+
+使用 align_row/schema_hash（和 liquid 同风格）
+
+目标：多 horizon 概率（若需要），或至少输出 p_event_impact + sigma/置信度
+
+修改 backend/vc_model_service.py
+
+vol/confidence 来自模型输出 + 校准器，不再 0.55 + abs(p-0.5)
+
+新增 tests/test_vc_train_infer_parity.py
+
+同一条样本：训练特征与推理特征向量必须一致（强 parity）
+
+✅ Done：VC 不再是“两套 5 维 + 公式输出”的玩具链路
+
+COMMIT 14 — 总验收：端到端训练→打包→推理一致性 + 关键指标门禁
+14.1 必须新增的集成测试门禁
+
+新增
+
+tests/test_strict_train_artifact_can_infer.py
+流程：
+
+造一个小的 feature_matrix_main fixture（包含缺失、包含部分文本缺失）
+
+跑 training/train_liquid.py 训练 1-2 epoch（小模型参数）
+
+校验 artifacts 目录：manifest/weights/schema_snapshot/training_report 都存在（validate 通过）
+
+用 LiquidModelService 加载并对固定 end_ts 推理
+
+断言：
+
+输出包含 mu/sigma(or quantiles)/direction(prob)
+
+confidence/vol 来自模型字段（不是启发式 abs 映射）
+
+schema_hash/feature_dim/lookback 全匹配
+
+14.2 指标门禁（训练脚本内直接 hard fail）
+
+在 training/train_liquid.py 的最后加硬门禁（不满足就 exit 1）：
+
+每个 horizon 的 IC/Sharpe_proxy 不得为 NaN
+
+direction 校准 ECE 不得爆炸（给个上限）
+
+gate_mean 不得贴近 1（防文本过拟合），也不得永远 0（说明文本塔坏了）
+
+✅ Done：这套门禁能防止 Codex 写出“能跑但没学到”的模型

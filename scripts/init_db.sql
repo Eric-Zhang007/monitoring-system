@@ -465,6 +465,18 @@ CREATE TABLE IF NOT EXISTS risk_control_state (
 );
 CREATE INDEX IF NOT EXISTS idx_risk_control_state_track_state ON risk_control_state(track, state, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS risk_events (
+    id BIGSERIAL PRIMARY KEY,
+    decision_id VARCHAR(64) NOT NULL,
+    severity VARCHAR(16) NOT NULL,
+    code VARCHAR(64) NOT NULL,
+    message TEXT NOT NULL,
+    payload JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_risk_events_decision_time ON risk_events(decision_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_risk_events_severity_time ON risk_events(severity, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS model_rollout_state (
     id BIGSERIAL PRIMARY KEY,
     track VARCHAR(16) NOT NULL UNIQUE,

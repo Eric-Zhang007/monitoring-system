@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Tuple
 
 import torch
@@ -88,6 +89,16 @@ class PatchTSTBackbone(BackboneBase):
         xm = x_mask.transpose(1, 2).contiguous().view(bsz, feat_dim, n_patch, self.patch_len)
         return xv, xm, pad_len
 
+    def _sinusoidal_pos_embed(self, n_patch: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        pos = torch.arange(n_patch, device=device, dtype=dtype).unsqueeze(1)
+        half = (self.d_model + 1) // 2
+        div = torch.exp(torch.arange(0, half, device=device, dtype=dtype) * (-(math.log(10000.0) / max(1, self.d_model))))
+        angle = pos * div.unsqueeze(0)
+        pe = torch.zeros((1, n_patch, self.d_model), device=device, dtype=dtype)
+        pe[:, :, 0::2] = torch.sin(angle[:, : pe[:, :, 0::2].shape[-1]])
+        pe[:, :, 1::2] = torch.cos(angle[:, : pe[:, :, 1::2].shape[-1]])
+        return pe
+
     def forward(self, x_values: torch.Tensor, x_mask: torch.Tensor) -> torch.Tensor:
         if x_values.dim() != 3 or x_mask.dim() != 3:
             raise RuntimeError("patchtst_input_rank_invalid")
@@ -107,8 +118,10 @@ class PatchTSTBackbone(BackboneBase):
         tokens = tokens.view(bsz * feat_dim, n_patch, self.d_model)
 
         if n_patch > self.pos_embed.shape[1]:
-            raise RuntimeError(f"patchtst_positional_capacity_exceeded:{n_patch}:{self.pos_embed.shape[1]}")
-        pos = self.pos_embed[:, :n_patch, :]
+            # Keep checkpoint compatibility for learned table while allowing very long lookback windows.
+            pos = self._sinusoidal_pos_embed(n_patch, device=tokens.device, dtype=tokens.dtype)
+        else:
+            pos = self.pos_embed[:, :n_patch, :].to(dtype=tokens.dtype)
         mask_tok = self.mask_embed(patch_obs.view(bsz * feat_dim, n_patch, 1))
         src_key_padding_mask = (patch_obs.view(bsz * feat_dim, n_patch) <= 1e-6)
 

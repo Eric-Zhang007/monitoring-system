@@ -6,6 +6,7 @@ import json
 import os
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -51,6 +52,17 @@ def _latest_before(ts_list: List[datetime], rows: List[Dict[str, Any]], ts: date
     return rows[idx]
 
 
+def _row_dim_mismatch(row: Dict[str, Any]) -> bool:
+    vals = row.get("feature_values")
+    msk = row.get("feature_mask")
+    return (not isinstance(vals, list)) or (not isinstance(msk, list)) or (len(vals) != FEATURE_DIM) or (len(msk) != FEATURE_DIM)
+
+
+def _write_audit(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Merge strict numeric snapshots + semantic text embeddings")
     ap.add_argument("--database-url", default=os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor"))
@@ -58,11 +70,16 @@ def main() -> int:
     ap.add_argument("--end", default="")
     ap.add_argument("--truncate", action="store_true")
     ap.add_argument("--max-rows", type=int, default=0)
+    ap.add_argument("--dim-mismatch-max-ratio", type=float, default=float(os.getenv("MERGE_DIM_MISMATCH_MAX_RATIO", "0.02")))
+    ap.add_argument("--audit-path", default=os.getenv("MERGE_AUDIT_PATH", "artifacts/audit/merge_feature_views_audit.json"))
     args = ap.parse_args()
 
     start_dt = _parse_dt(args.start)
     end_dt = _parse_dt(args.end) if str(args.end).strip() else datetime.now(timezone.utc)
     inserted = 0
+    mismatch_count = 0
+    mismatch_ratio = 0.0
+    audit_path = Path(str(args.audit_path))
 
     with psycopg2.connect(args.database_url, cursor_factory=RealDictCursor) as conn:
         with conn.cursor() as cur:
@@ -103,6 +120,34 @@ def main() -> int:
             if not base_rows:
                 print(json.dumps({"status": "ok", "rows_inserted": 0, "table": "feature_matrix_main"}, ensure_ascii=False))
                 return 0
+
+            mismatch_rows = [r for r in base_rows if _row_dim_mismatch(r)]
+            mismatch_count = len(mismatch_rows)
+            mismatch_ratio = float(mismatch_count) / float(len(base_rows))
+            mismatch_examples = [
+                {
+                    "symbol": str(r.get("symbol") or ""),
+                    "as_of_ts": (r.get("as_of_ts").isoformat() if isinstance(r.get("as_of_ts"), datetime) else None),
+                    "feature_values_len": (len(r.get("feature_values")) if isinstance(r.get("feature_values"), list) else None),
+                    "feature_mask_len": (len(r.get("feature_mask")) if isinstance(r.get("feature_mask"), list) else None),
+                }
+                for r in mismatch_rows[:20]
+            ]
+            audit_payload = {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "table": "feature_snapshots_main",
+                "rows_total": len(base_rows),
+                "dim_mismatch_count": mismatch_count,
+                "dim_mismatch_ratio": mismatch_ratio,
+                "dim_mismatch_max_ratio": float(args.dim_mismatch_max_ratio),
+                "examples": mismatch_examples,
+            }
+            if mismatch_count > 0:
+                _write_audit(audit_path, audit_payload)
+            if mismatch_ratio > float(args.dim_mismatch_max_ratio):
+                raise RuntimeError(
+                    f"feature_dim_mismatch_ratio_exceeded:{mismatch_count}/{len(base_rows)}:{mismatch_ratio:.6f}:{float(args.dim_mismatch_max_ratio):.6f}"
+                )
 
             symbols = sorted({str(r.get("symbol") or "").upper() for r in base_rows if str(r.get("symbol") or "").strip()})
             cur.execute(
@@ -256,6 +301,10 @@ def main() -> int:
                 "status": "ok",
                 "table": "feature_matrix_main",
                 "rows_inserted": int(inserted),
+                "dim_mismatch_count": int(mismatch_count),
+                "dim_mismatch_ratio": float(mismatch_ratio),
+                "dim_mismatch_max_ratio": float(args.dim_mismatch_max_ratio),
+                "audit_path": str(audit_path),
                 "feature_dim": int(FEATURE_DIM),
                 "schema_hash": str(SCHEMA_HASH),
                 "feature_version": str(SCHEMA_VERSION),

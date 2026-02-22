@@ -1,0 +1,633 @@
+0) 一次性改对的“强制规则”（Codex 先照抄到 docs/ 里）
+
+Rule-1：唯一特征真相源
+全仓库只允许一个特征 Schema 文件：schema/liquid_feature_schema.yaml。任何 key list 不允许手写分叉。
+
+Rule-2：禁止 pad/truncate
+训练与推理都不允许对特征向量做“少了补 0、多了截断”。缺失必须通过 mask 显式表达；schema 不匹配要直接报错并停止服务/训练。
+
+Rule-3：真时序输入
+主模型输入必须是连续时间桶序列 X_values[L,D] + X_mask[L,D]，严禁把扁平向量 reshape 成“伪序列”。
+
+Rule-4：工件强一致
+工件必须包含 manifest + 权重 + schema snapshot + 训练报告；推理启动必须校验“文件存在 + schema_hash 一致”，否则直接失败退出（不允许静默降级）。
+
+Rule-5：线上吃全量特征
+推理只从数据库的 feature_matrix_main 读取完整 D 维序列；不允许线上临时拼 61 维 online features 再喂模型。
+
+Rule-6：禁合成回填入主训练集
+orderbook/onchain/social 的 synthetic/backfill 只能进入 *_synthetic 表或带强标记字段；默认训练数据过滤掉 synthetic。
+
+Rule-7：VC 必须闭环
+VC 线上不允许规则分作为最终输出；必须调用训练得到的 VC 模型服务链路（同样受工件契约约束）。
+
+1) Codex 一把梭执行顺序（必须按这个顺序写，保证不写歪）
+
+下面按“提交顺序”写（你可以让 Codex 每次生成一个 commit，但最终合成一个大 PR；关键是先写门禁再写实现）。
+
+COMMIT 1 — 建立“不可写歪”的四大契约（Schema / 对齐 / 输入 / 工件）+ 测试门禁
+1.1 新增特征 Schema（唯一真相源）
+
+新增文件
+
+schema/liquid_feature_schema.yaml
+
+Schema 字段（必须有）
+
+name（字符串，唯一）
+
+dtype（float32/int32/bool/string）
+
+group（price/orderbook/derivatives/onchain/event/text/quality/…）
+
+source（表或视图名）
+
+asof（as-of 规则：例如 “<= bucket_end_ts”）
+
+impute（缺失填充：zero/median/ffill/…）
+
+required（true/false）
+
+is_synthetic_allowed（true/false）
+
+comment
+
+Done Criteria
+
+YAML 能被解析；每个字段 name 唯一；required 字段不为空
+
+1.2 Schema hash 与 codegen（杜绝手写 key list）
+
+新增文件
+
+schema/schema_hash.py（canonicalize YAML → sha256）
+
+schema/codegen_feature_contract.py
+
+codegen 生成文件（禁止手改）
+
+features/feature_contract.py
+
+FEATURE_KEYS: list[str]
+
+FEATURE_INDEX: dict[str,int]
+
+DTYPE_MAP: dict[str,str]
+
+REQUIRED_KEYS: set[str]
+
+SCHEMA_HASH: str
+
+Done Criteria
+
+修改 YAML 后重新 codegen，hash 会变化且输出稳定（与顺序无关）
+
+1.3 对齐器（禁止 pad/truncate）
+
+新增文件
+
+features/align.py
+
+features/feature_row.py
+
+实现要求
+
+align_row(row_dict: dict) -> (values: np.ndarray[D], mask: np.ndarray[D])
+
+缺失：按 schema.impute 填值，mask=1
+
+多余字段：直接报错（告诉你多了哪些 keys）
+
+required 缺失：直接报错
+
+Done Criteria
+
+单测覆盖：缺失/多余/required 缺失均按预期失败或成功
+
+1.4 输入契约（真时序）
+
+新增文件
+
+features/sequence.py
+
+build_sequence(symbol, end_ts, lookback) -> X_values[L,D], X_mask[L,D], meta
+
+meta 必含
+
+schema_hash
+
+symbol
+
+start_ts/end_ts
+
+bucket_interval
+
+coverage_summary（缺失比例、text 覆盖等）
+
+Done Criteria
+
+不允许返回扁平向量；必须返回 [L,D]
+
+1.5 工件契约（manifest 强校验、无降级）
+
+新增文件
+
+artifacts/manifest.py
+
+artifacts/pack.py
+
+artifacts/validate.py
+
+manifest 必含
+
+model_id
+
+created_at
+
+schema_hash
+
+lookback
+
+feature_dim
+
+data_version（训练数据快照标识）
+
+metrics_summary
+
+files（weights、schema_snapshot、training_report）
+
+validate 行为
+
+files 不存在 → raise + 退出
+
+schema_hash 不一致 → raise + 退出
+
+Done Criteria
+
+推理启动时必须调用 validate；任何缺失直接失败（不能 fallback）
+
+1.6 门禁测试（必须先写）
+
+新增测试
+
+tests/test_schema_hash_stable.py
+
+tests/test_codegen_contract_matches_schema.py
+
+tests/test_align_row_behavior.py
+
+tests/test_build_sequence_shape.py
+
+tests/test_manifest_validation.py
+
+Done Criteria
+
+以上测试全部通过；此时业务逻辑还没改也没关系
+
+COMMIT 2 — 彻底移除/禁止所有“玩具对齐 & 61在线投影”逻辑（写死成错误）
+2.1 删除或硬禁 pad/truncate
+
+修改文件（必须动到这些点）
+
+training/feature_pipeline.py：删除 _align_feature_vector(补零/截断)；改为调用 features/align.align_row 并输出 mask
+
+inference/model_router.py：删除/禁止 pad/truncate；如果 shape 不对直接 raise
+
+任何 _to_sequence reshape 伪序列逻辑：直接删
+
+Done Criteria
+
+全仓库 grep：pad, truncate, _align_feature_vector 不再用于特征维度对齐
+
+训练/推理只接受 schema 对齐后的固定 D + mask
+
+2.2 禁止线上只吃 61 维
+
+修改文件
+
+inference/main.py：移除 vector_from_payload_online/ONLINE keys 投影路径
+
+backend/v2_router.py（如有）：不再走“在线拼 61 维”喂液体模型
+
+Done Criteria
+
+推理入口必须从 feature_matrix_main 读取完整 D（序列 L×D）
+
+如果 DB 里没对应行 → 直接报错（不要兜底在线拼 61）
+
+COMMIT 3 — Feature Store 重写：消灭硬置0、消灭 manual_stat 合成、补齐质量字段
+
+目标：feature_matrix_main 里每一维都“有来源、有 as-of、有缺失 mask、有 freshness/quality”，不是工程占位。
+
+3.1 数据表/视图约定（不搞 v 几）
+
+要求
+
+训练/推理统一读：feature_matrix_main
+
+数值源快照（可选）：feature_snapshots_main
+
+文本 embedding：social_text_embeddings（或统一 text_embeddings）
+
+质量表：feature_quality_daily
+
+（如果你要迁移表结构，用 alembic 直接改现有表或新增必要列，但名字不引入版本号）
+
+3.2 重写 scripts/build_feature_store.py
+
+必须改掉的玩具点
+
+禁止大量字段硬置 0
+
+禁止 manual_stat 用 sin/tanh 合成
+
+禁止把 missing 当 0 伪装
+
+实现方式（Codex 按这个写）
+新增模块：
+
+features/recipes/base_signals.py：定义“原子信号”列表（price, vol, spread, depth, funding, basis, onchain flows, event counts, …）
+
+features/recipes/rolling.py：统一 rolling 统计生成器
+
+windows：[6, 12, 24, 72, 288, 2016]（5m 桶：0.5h/1h/2h/6h/1d/7d 示例，可配置）
+
+stats：mean/std/min/max/last/zscore/ewm_mean/ewm_std/autocorr1/quantile_10/quantile_90
+
+features/recipes/microstructure.py：orderbook 专用统计
+
+features/recipes/derivatives.py：资金费率/basis/持仓等
+
+features/recipes/onchain.py：拆分 inflow/outflow/active 等（有就算，没有就缺失 + mask）
+
+输出要求：
+
+每个 feature 同时产出：
+
+value
+
+missing_flag（可合并进 mask）
+
+freshness_lag（从源数据 ts 到 bucket_end_ts 的滞后）
+
+每条 row 写入 schema_hash
+
+Done Criteria
+
+feature_matrix_main 任意字段缺失都能在 mask/flag 中看见
+
+不存在“默认 0 占位导致看似完整”的情况
+
+3.3 禁 synthetic/backfill 污染主训练分布
+
+必须处理你列出来的三条回填脚本
+
+scripts/backfill_orderbook_from_market_bars.py
+
+scripts/ingest_binance_aux_signals.py
+
+scripts/backfill_social_history.py
+
+要求
+
+所有回填写入必须带 is_synthetic=1 或进入专用表
+
+build_feature_store 默认过滤 synthetic（除非显式参数允许）
+
+readiness/audit 必须统计 synthetic 占比，超过阈值直接 fail
+
+Done Criteria
+
+主训练集（默认）synthetic 占比为 0
+
+报告里能看到 synthetic 占比
+
+COMMIT 4 — 文本：hash trick 全面替换为语义 embedding（无兜底）
+4.1 替换 scripts/build_text_latent_embeddings.py
+
+硬要求
+
+不允许 hash trick 桶向量做最终 text embedding
+
+必须使用语义 embedding（sentence-transformers / 你自选 encoder），并可配置本地模型路径
+
+模型文件缺失：脚本直接失败（不要 fallback 到 hash）
+
+新增文件
+
+text/embedder.py
+
+load_model(model_path)
+
+encode_texts(texts) -> np.ndarray[n, d]
+
+scripts/build_text_embeddings.py
+
+按 5m bucket 聚合 posts/comments/news/event text
+
+pooling：engagement-weighted mean + 去重
+
+输出 text_quality：num_items/unique_authors/dup_ratio/disagreement/avg_lag
+
+Done Criteria
+
+text embedding 维度固定（例如 384/768，再线性投影到 128）
+
+任意 bucket 没文本：embedding 缺失 + mask=1（不是生成零向量伪装）
+
+4.2 merge：数值 + 文本 + 质量 → feature_matrix_main
+
+修改/新增脚本
+
+scripts/merge_feature_views.py（改成真正“最终唯一矩阵”构建）
+
+join 数值特征行 + text embedding 行
+
+输出同一行包含：values + mask + schema_hash（mask 可拆列存或序列化存 blob，按你 DB 习惯）
+
+Done Criteria
+
+feature_matrix_main 是训练/推理唯一入口
+
+任意时间点能从 DB 拉出完整 row 并对齐到 schema
+
+COMMIT 5 — 训练：真时序 dataset + 更强 backbone + 多模态 gate（一次性上主力）
+5.1 Dataset：从 feature_matrix_main 拉连续 L 行
+
+新增文件
+
+training/datasets/liquid_sequence_dataset.py
+
+输入：symbol、end_ts、lookback L
+
+输出：X_values[L,D], X_mask[L,D], labels（multi-horizon）
+
+缺桶策略：
+
+缺桶直接插入全缺失帧（mask=1），values 用 impute
+
+Done Criteria
+
+shape 恒定；缺桶不崩；mask 正确
+
+5.2 标签：成本后多目标
+
+新增/改造
+
+training/labels/liquid_labels.py
+
+horizons：[1h, 4h, 1d, 7d]（可配置）
+
+目标：
+
+return_net（成本后）
+
+direction（符号）
+
+risk_proxy（未来波动/回撤分位，可选）
+
+Done Criteria
+
+输出训练报告里包含成本后指标（不是只算 raw return）
+
+5.3 模型：PatchTST 或 iTransformer + Residual Gate
+
+新增文件
+
+models/patchtst.py（或 models/itransformer.py，你选一个做主力）
+
+models/multimodal_gate.py
+
+y = y_num + gate * delta_text
+
+gate 输入：text_quality（覆盖、分歧、活跃度、lag）+ market regime（可选）
+
+mask 用法（必须落地一种）：
+
+方案 A：将 mask 作为额外通道拼到输入（D→2D）
+
+方案 B：用 mask 生成 attention bias / embedding
+
+Done Criteria
+
+训练脚本能跑通并产出可加载权重
+
+报告中输出 gate 分布（均值/分位数），便于上线监控
+
+5.4 HPO：不再只调回测参数，直接调表示学习
+
+新增/改造
+
+scripts/optuna_model_hpo.py
+
+搜索空间：lookback、patch_len、d_model、n_layers、dropout、lr、weight_decay、gate_strength
+
+目标：OOS 成本后指标（例如 IC / Sharpe proxy / hit rate + 回撤惩罚）
+
+固定 split（walk-forward + purged）
+
+Done Criteria
+
+HPO 输出最佳 trial 的模型工件（见下一 commit 工件打包）
+
+COMMIT 6 — 工件：ensemble/缺失 .pt/静默降级 全部消灭（启动即强校验）
+6.1 统一工件目录与发布格式（不允许“引用不存在文件”）
+
+新增
+
+artifacts/models/<model_id>/manifest.json
+
+artifacts/models/<model_id>/weights.pt
+
+artifacts/models/<model_id>/schema_snapshot.yaml
+
+artifacts/models/<model_id>/training_report.json
+
+训练脚本必须做
+
+打包 schema_snapshot（复制当前 schema 文件）
+
+写 manifest（包含 schema_hash、lookback、D、metrics_summary、files 列表）
+
+打包完后立刻 validate（自己验证自己）
+
+Done Criteria
+
+不可能出现“manifest 引用了不存在的 .pt”
+
+validate 失败则训练脚本直接失败退出
+
+6.2 推理服务：删除 fallback，缺失即退出
+
+必须修改
+
+backend/liquid_model_service.py
+
+移除 “neural 缺失→tabular fallback” 的默认允许逻辑
+
+启动时强制 artifacts.validate(manifest)，失败直接退出
+
+Done Criteria
+
+删掉所有 silent fallback 分支
+
+模型加载失败是显式错误（log + exit），不是继续服务
+
+6.3 ensemble（如仍需要）：必须强一致、文件齐全
+
+如果你仍保留 ensemble：
+
+ensemble manifest 必须列出每个子模型目录
+
+validate 必须逐个校验子模型文件存在 + schema_hash 一致
+
+ensemble 只允许组合“相同 D、相同 lookback、相同 schema_hash”的模型
+
+Done Criteria
+
+ensemble 配错就启动失败（别让它跑在错误配置上）
+
+COMMIT 7 — 推理：只读 feature_matrix_main，构造 [L,D]，一次性与训练完全一致
+7.1 新增 DB reader（序列读取）
+
+新增
+
+inference/feature_reader.py
+
+fetch_sequence(symbol, end_ts, lookback) -> X_values[L,D], X_mask[L,D], meta
+
+要求
+
+查询必须按时间排序，严格对齐 5m bucket
+
+缺桶插入缺失帧（与训练一致）
+
+meta 输出 coverage_summary（用于监控）
+
+Done Criteria
+
+推理与训练对同一 (symbol,end_ts) 拉到的序列 values/mask 完全一致（见下一条 parity test）
+
+7.2 parity 集成测试（最关键，保证“一次性写对”）
+
+新增测试
+
+tests/test_train_infer_parity.py
+
+流程：
+
+用小型 fixture DB 写入 50 个 bucket 的 feature_matrix_main（含部分缺失、含部分 text 缺失）
+
+训练 dataset 拉一个样本
+
+推理 reader 拉同一个样本
+
+断言 values、mask、schema_hash 完全一致
+
+Done Criteria
+
+该测试必过，否则禁止合并（这是“一次性写对”的根）
+
+COMMIT 8 — VC：线上规则分删除，训练模型闭环接入（同样吃序列/或吃小特征也行）
+8.1 线上 VC 输出必须来自模型
+
+修改
+
+backend/v2_router.py：移除规则打分路径作为最终输出
+
+新增 backend/vc_model_service.py（同 liquid 服务的工件契约）
+
+8.2 训练 VC：要么用同一 feature_matrix，要么明确独立 schema
+
+两种可选（但要“一次性写对”，建议统一）：
+
+统一：VC 也从 feature_matrix_main 拉序列，训练一个小模型 head
+
+独立：为 VC 单独写 schema/vc_feature_schema.yaml（但你说不要出现 v 几，不代表不能有 schema 文件；只是别搞版本名）
+
+Done Criteria
+
+VC 推理不再跑规则；没有模型工件就启动失败
+
+VC 训练产物同样包含 manifest+validate
+
+COMMIT 9 — readiness/audit：gate 变严格，社媒覆盖低直接 fail（别再“门槛定义下可过”）
+9.1 重写 gates：不许“默认可放松”
+
+修改
+
+artifacts/audit/required_data_readiness_latest.json 的生成逻辑对应脚本（按你仓库实际脚本名改）
+
+training/register_candidate_model.py（如仍存在）默认严格，不允许 relax 参数绕过
+
+硬指标（建议直接写死到 config）
+
+history_window_complete 必须为 true 才能训练主力模型（否则直接 fail）
+
+社媒原始覆盖率（num_buckets_with_text / num_total_buckets）低于阈值直接 fail
+
+feature 缺失率（每维 missing_ratio）超过阈值直接 fail
+
+synthetic 占比 > 0 直接 fail（默认）
+
+Done Criteria
+
+gate 失败就训练/注册失败，不生成“可用模型”
+
+COMMIT 10 — 清理：删掉所有“玩具/偷懒实现”残留入口（让错误尽早暴露）
+
+必须清理/断路
+
+任何“在线 61 维组装”入口
+
+任何 pad/truncate/补零截断
+
+文本 hash trick 生成最终 embedding 的入口
+
+market_latent 手工拼 latent 的入口（如果你决定不用预计算 latent）
+
+baseline “tabular_linear JSON 假装 LGBM” 的默认激活路径
+
+“工件缺失静默降级”的所有分支
+
+VC 规则分最终输出路径
+
+synthetic 回填默认进入主训练集路径
+
+Done Criteria
+
+grep/搜索能证明上述入口不存在或不可达
+
+服务启动/训练如果缺数据缺工件会“立刻失败”，而不是带病运行
+
+2) 一条命令的端到端验收（Codex 必须提供并跑通）
+
+Codex 在最终输出里必须附上“从 0 到 1 的验收脚本”，至少包含以下 4 条命令（你可以按仓库实际入口调整名字）：
+
+建表/迁移
+
+alembic upgrade head 或 python scripts/init_db.py
+
+构建 feature_matrix_main
+
+python scripts/build_feature_store.py --start ... --end ...
+
+python scripts/build_text_embeddings.py --start ... --end ...
+
+python scripts/merge_feature_views.py --start ... --end ...
+
+训练并打包工件
+
+python training/train_liquid.py --config ...
+
+输出目录里必须有：manifest.json / weights.pt / schema_snapshot.yaml / training_report.json
+
+启动推理并跑一个样例
+
+python inference/main.py --symbol BTC --end_ts ...
+
+必须打印：schema_hash / model_id / coverage_summary
+
+不允许出现 fallback 字样
+
+并且：CI 必须跑 pytest -q，其中 test_train_infer_parity.py 必须通过。

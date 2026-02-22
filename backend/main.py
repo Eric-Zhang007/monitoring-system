@@ -454,6 +454,18 @@ async def lifespan(app: FastAPI):
         logger.warning(f"⚠️ Database connection failed (Will retry): {e}")
 
     # 启动后台任务
+    # Strict model artifact validation on startup: fail fast if contract is broken.
+    try:
+        from v2_router import _get_liquid_model_service, _get_vc_model_service  # type: ignore
+
+        _get_liquid_model_service()
+        _get_vc_model_service()
+        logger.info("✅ Model artifacts validated at startup")
+    except Exception as e:
+        logger.error(f"❌ model artifact validation failed: {e}")
+        raise RuntimeError(f"startup_model_validation_failed:{e}") from e
+
+    # 启动后台任务
     asyncio.create_task(consume_redis_messages())
     asyncio.create_task(broadcast_predictions())
 

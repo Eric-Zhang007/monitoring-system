@@ -174,10 +174,10 @@ def main() -> int:
     ap.add_argument("--include-noncompleted", action="store_true")
     ap.add_argument("--limit", type=int, default=400)
     ap.add_argument("--candidate-registry", default=os.getenv("CANDIDATE_REGISTRY_FILE", "artifacts/models/candidate_registry.jsonl"))
-    ap.add_argument("--require-candidate-gate-passed", default=os.getenv("VALIDATE_REQUIRE_CANDIDATE_GATE_PASSED", "0"))
+    ap.add_argument("--require-candidate-gate-passed", default=os.getenv("VALIDATE_REQUIRE_CANDIDATE_GATE_PASSED", "1"))
     ap.add_argument("--candidate-max-age-hours", type=float, default=float(os.getenv("VALIDATE_CANDIDATE_MAX_AGE_HOURS", "0")))
     ap.add_argument("--multimodal-gate-snapshot", default=os.getenv("MULTIMODAL_GATE_SNAPSHOT", "artifacts/ops/multimodal_gate_state.json"))
-    ap.add_argument("--require-multimodal-gate-passed", default=os.getenv("VALIDATE_REQUIRE_MULTIMODAL_GATE_PASSED", "0"))
+    ap.add_argument("--require-multimodal-gate-passed", default=os.getenv("VALIDATE_REQUIRE_MULTIMODAL_GATE_PASSED", "1"))
     ap.add_argument(
         "--multimodal-gate-max-age-hours",
         type=float,

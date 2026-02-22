@@ -548,18 +548,9 @@ class LiquidModelTrainer:
 
     @staticmethod
     def _to_sequence(xn: np.ndarray, n_channels: int = 5) -> np.ndarray:
-        if xn.ndim != 2:
-            raise ValueError("expected 2D feature matrix")
-        n, d = xn.shape
-        ch = max(1, int(n_channels))
-        tok = int(max(1, int(np.ceil(float(d) / float(ch)))))
-        target_dim = tok * ch
-        if target_dim > d:
-            pad = np.zeros((n, target_dim - d), dtype=np.float32)
-            xpad = np.concatenate([xn.astype(np.float32), pad], axis=1)
-        else:
-            xpad = xn[:, :target_dim].astype(np.float32)
-        return xpad.reshape(n, tok, ch)
+        _ = xn
+        _ = n_channels
+        raise RuntimeError("pseudo_sequence_reshape_forbidden")
 
     def _fit_lightgbm(self, x_train: np.ndarray, y_train: np.ndarray, x_pred: np.ndarray) -> tuple[np.ndarray, str, Dict]:
         ridge_w = self._ridge_weights(x_train, y_train)

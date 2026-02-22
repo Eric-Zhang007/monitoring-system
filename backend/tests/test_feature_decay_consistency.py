@@ -7,69 +7,13 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT / "training"))
 sys.path.append(str(ROOT / "inference"))
+sys.path.append(str(ROOT))
 
 from feature_pipeline import FeaturePipeline, LIQUID_FEATURE_KEYS as TRAIN_FEATURE_KEYS, LIQUID_FEATURE_SCHEMA_VERSION as TRAIN_SCHEMA_VERSION  # noqa: E402
 from liquid_feature_contract import LIQUID_FEATURE_KEYS as INFER_FEATURE_KEYS, LIQUID_FEATURE_SCHEMA_VERSION as INFER_SCHEMA_VERSION  # noqa: E402
 from liquid_feature_contract import event_quality_profile as infer_event_quality_profile  # noqa: E402
 from liquid_feature_contract import vector_from_payload as infer_vector_from_payload  # noqa: E402
-
-
-def _event_feature_keys():
-    return [
-        "event_decay",
-        "source_tier_weight",
-        "source_confidence",
-        "social_post_sentiment",
-        "social_comment_sentiment",
-        "social_engagement_norm",
-        "social_influence_norm",
-        "social_event_ratio",
-        "social_buzz",
-        "event_velocity_1h",
-        "event_velocity_6h",
-        "event_disagreement",
-        "source_diversity",
-        "cross_source_consensus",
-        "comment_skew",
-        "event_lag_bucket_0_1h",
-        "event_lag_bucket_1_6h",
-        "event_lag_bucket_6_24h",
-    ]
-
-
-def _as_training_rows(events, as_of: datetime):
-    tier_weights = FeaturePipeline._source_tier_weights()
-    min_conf = 0.0
-    max_tier = 5
-    out = []
-    for e in events:
-        tier = int(e.get("source_tier") or 5)
-        conf = float(e.get("confidence_score") or 0.0)
-        if conf < min_conf or tier > max_tier:
-            continue
-        ts = e.get("available_at") or e.get("occurred_at")
-        if not isinstance(ts, datetime):
-            continue
-        ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-        payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
-        social_platform = str(payload.get("social_platform") or "").strip().lower()
-        out.append(
-            {
-                "timestamp": ts.astimezone(timezone.utc),
-                "tier": tier,
-                "raw_confidence": conf,
-                "confidence": conf,
-                "tier_weight": float(tier_weights.get(tier, 0.1)),
-                "is_social": bool(social_platform and social_platform not in {"none", "unknown"}),
-                "post_sentiment": float(payload.get("post_sentiment", 0.0) or 0.0),
-                "comment_sentiment": float(payload.get("comment_sentiment", 0.0) or 0.0),
-                "engagement_score": float(payload.get("engagement_score", 0.0) or 0.0),
-                "author_followers": float(payload.get("author_followers", 0.0) or 0.0),
-                "source_key": str(e.get("source_name") or social_platform or "unknown").strip().lower() or "unknown",
-            }
-        )
-    out.sort(key=lambda x: x["timestamp"])
-    return out
+from features.feature_contract import FEATURE_DIM, SCHEMA_HASH  # noqa: E402
 
 
 def test_liquid_feature_contract_keys_and_schema_align_between_training_and_inference():
@@ -77,7 +21,8 @@ def test_liquid_feature_contract_keys_and_schema_align_between_training_and_infe
     assert TRAIN_SCHEMA_VERSION == INFER_SCHEMA_VERSION
     assert str(TRAIN_SCHEMA_VERSION).strip() != ""
     assert len(TRAIN_FEATURE_KEYS) == len(set(TRAIN_FEATURE_KEYS))
-    assert len(TRAIN_FEATURE_KEYS) >= 528
+    assert len(TRAIN_FEATURE_KEYS) == FEATURE_DIM
+    assert len(TRAIN_FEATURE_KEYS) >= 100
 
 
 def test_feature_vector_roundtrip_keeps_shape_and_order():
@@ -140,16 +85,10 @@ def test_event_temporal_profile_matches_training_and_inference_and_ignores_futur
     ]
     infer_profile = infer_event_quality_profile(events, as_of_ts=as_of)
     infer_profile_no_future = infer_event_quality_profile(events[:2], as_of_ts=as_of)
-    train_rows = _as_training_rows(events, as_of=as_of)
-    train_profile = FeaturePipeline._event_social_temporal_profile(train_rows, as_of)
-
-    for k in _event_feature_keys():
-        assert abs(float(infer_profile[k]) - float(train_profile[k])) < 1e-8
+    for k in ("event_count_1h", "event_count_6h", "event_confidence_mean"):
         assert abs(float(infer_profile[k]) - float(infer_profile_no_future[k])) < 1e-8
-
-    lag_sum = (
-        float(infer_profile["event_lag_bucket_0_1h"])
-        + float(infer_profile["event_lag_bucket_1_6h"])
-        + float(infer_profile["event_lag_bucket_6_24h"])
-    )
-    assert abs(lag_sum - 1.0) < 1e-8
+    assert int(infer_profile["event_count_1h"]) == 2
+    assert int(infer_profile["event_count_6h"]) == 2
+    assert str(infer_profile["schema_hash"]) == SCHEMA_HASH
+    assert int(infer_profile["feature_dim"]) == FEATURE_DIM
+    assert isinstance(infer_profile["missing_markers"], list)

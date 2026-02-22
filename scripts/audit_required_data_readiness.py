@@ -206,6 +206,13 @@ def main() -> int:
     ap.add_argument("--min-linked-events-per-symbol", type=int, default=20)
     ap.add_argument("--min-social-posts", type=int, default=200)
     ap.add_argument("--min-comment-post-ratio", type=float, default=2.0)
+    ap.add_argument("--min-text-bucket-coverage", type=float, default=float(os.getenv("MIN_TEXT_BUCKET_COVERAGE", "0.2")))
+    ap.add_argument("--max-feature-missing-ratio", type=float, default=float(os.getenv("MAX_FEATURE_MISSING_RATIO", "0.35")))
+    ap.add_argument("--max-synthetic-ratio", type=float, default=float(os.getenv("MAX_SYNTHETIC_RATIO", "0.0")))
+    ap.add_argument(
+        "--history-audit-json",
+        default=os.getenv("HISTORY_AUDIT_JSON", "artifacts/audit/full_history_latest.json"),
+    )
     ap.add_argument("--out-json", default="artifacts/audit/required_data_readiness_latest.json")
     args = ap.parse_args()
 
@@ -261,6 +268,7 @@ def main() -> int:
             "avg": {},
         },
         "events_social": {},
+        "feature_matrix_quality": {},
         "derivatives_metrics": {},
         "thresholds": {
             "min_primary_coverage": float(args.min_primary_coverage),
@@ -272,6 +280,9 @@ def main() -> int:
             "min_linked_events_per_symbol": int(args.min_linked_events_per_symbol),
             "min_social_posts": int(args.min_social_posts),
             "min_comment_post_ratio": float(args.min_comment_post_ratio),
+            "min_text_bucket_coverage": float(args.min_text_bucket_coverage),
+            "max_feature_missing_ratio": float(args.max_feature_missing_ratio),
+            "max_synthetic_ratio": float(args.max_synthetic_ratio),
         },
         "gates": {},
         "missing_data_kinds": [],
@@ -575,6 +586,71 @@ def main() -> int:
                     }
             out["derivatives_metrics"] = deriv_summary
 
+            text_cov_avg = 0.0
+            if _table_exists(cur, "social_text_embeddings"):
+                sum_text_cov = 0.0
+                for sym in symbols:
+                    cur.execute(
+                        """
+                        SELECT COUNT(DISTINCT FLOOR(EXTRACT(EPOCH FROM as_of_ts) / %s)::bigint) AS c
+                        FROM social_text_embeddings
+                        WHERE symbol = %s
+                          AND as_of_ts >= %s
+                          AND as_of_ts <= %s
+                        """,
+                        (primary_bucket_sec, sym, lookback_start, end_dt),
+                    )
+                    c = int((cur.fetchone() or {}).get("c") or 0)
+                    sum_text_cov += _coverage(c, expected_primary)
+                text_cov_avg = float(sum_text_cov / max(1, len(symbols)))
+
+            synthetic_ratio = 1.0
+            if _table_exists(cur, "feature_snapshots_main"):
+                cur.execute(
+                    """
+                    SELECT COALESCE(AVG(synthetic_ratio), 0.0) AS r
+                    FROM feature_snapshots_main
+                    WHERE as_of_ts >= %s AND as_of_ts <= %s
+                    """,
+                    (lookback_start, end_dt),
+                )
+                synthetic_ratio = float((cur.fetchone() or {}).get("r") or 0.0)
+
+            feature_missing_ratio = 1.0
+            if _table_exists(cur, "feature_matrix_main"):
+                cur.execute(
+                    """
+                    SELECT COALESCE(
+                        AVG((
+                            SELECT AVG((m)::double precision)
+                            FROM jsonb_array_elements_text(mask) AS mm(m)
+                        )),
+                        1.0
+                    ) AS r
+                    FROM feature_matrix_main
+                    WHERE as_of_ts >= %s AND as_of_ts <= %s
+                    """,
+                    (lookback_start, end_dt),
+                )
+                feature_missing_ratio = float((cur.fetchone() or {}).get("r") or 1.0)
+
+            history_window_complete = False
+            history_path = Path(str(args.history_audit_json))
+            if history_path.exists():
+                try:
+                    obj = json.loads(history_path.read_text(encoding="utf-8"))
+                    summary = obj.get("summary") if isinstance(obj, dict) else {}
+                    history_window_complete = bool((summary or {}).get("history_window_complete", False))
+                except Exception:
+                    history_window_complete = False
+
+            out["feature_matrix_quality"] = {
+                "history_window_complete": bool(history_window_complete),
+                "text_bucket_coverage": round(float(text_cov_avg), 8),
+                "feature_missing_ratio": round(float(feature_missing_ratio), 8),
+                "synthetic_ratio": round(float(synthetic_ratio), 8),
+            }
+
     avg_cov = out["coverage"]["avg"]
     gates = {
         "market_primary": bool(_safe_float(avg_cov.get("market_primary")) >= float(args.min_primary_coverage)),
@@ -591,6 +667,16 @@ def main() -> int:
             _safe_float(out["events_social"].get("comment_post_ratio")) >= float(args.min_comment_post_ratio)
         ),
         "derivatives_metrics": True,
+        "history_window_complete": bool(out["feature_matrix_quality"].get("history_window_complete", False)),
+        "text_bucket_coverage": bool(
+            _safe_float(out["feature_matrix_quality"].get("text_bucket_coverage")) >= float(args.min_text_bucket_coverage)
+        ),
+        "feature_missing_ratio": bool(
+            _safe_float(out["feature_matrix_quality"].get("feature_missing_ratio")) <= float(args.max_feature_missing_ratio)
+        ),
+        "synthetic_ratio": bool(
+            _safe_float(out["feature_matrix_quality"].get("synthetic_ratio")) <= float(args.max_synthetic_ratio)
+        ),
     }
     for metric_name in req_deriv_metrics:
         block = out["derivatives_metrics"].get(metric_name) if isinstance(out["derivatives_metrics"], dict) else None
@@ -624,6 +710,14 @@ def main() -> int:
         missing.append("social_comments_ratio")
     if not gates["derivatives_metrics"]:
         missing.append("derivatives_metrics")
+    if not gates["history_window_complete"]:
+        missing.append("history_window_incomplete")
+    if not gates["text_bucket_coverage"]:
+        missing.append("text_bucket_coverage")
+    if not gates["feature_missing_ratio"]:
+        missing.append("feature_missing_ratio")
+    if not gates["synthetic_ratio"]:
+        missing.append("synthetic_ratio")
     out["missing_data_kinds"] = missing
 
     recommended: List[str] = []
@@ -645,6 +739,14 @@ def main() -> int:
     if "derivatives_metrics" in missing:
         recommended.append(
             "python3 scripts/ingest_binance_derivatives_signals.py --symbols BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,AVAX,LINK --start 2018-01-01T00:00:00Z --period 5m"
+        )
+    if "text_bucket_coverage" in missing:
+        recommended.append(
+            "python3 scripts/build_text_embeddings.py --start 2018-01-01T00:00:00Z"
+        )
+    if "feature_missing_ratio" in missing or "synthetic_ratio" in missing:
+        recommended.append(
+            "python3 scripts/build_feature_store.py --start 2018-01-01T00:00:00Z && python3 scripts/merge_feature_views.py --start 2018-01-01T00:00:00Z"
         )
     out["recommended_commands"] = recommended
 

@@ -96,6 +96,7 @@ def main() -> int:
                 raise RuntimeError("missing_table:market_bars")
             if not _table_exists(cur, "orderbook_l2"):
                 raise RuntimeError("missing_table:orderbook_l2")
+            cur.execute("ALTER TABLE orderbook_l2 ADD COLUMN IF NOT EXISTS is_synthetic BOOLEAN NOT NULL DEFAULT FALSE")
 
             cur.execute(
                 """
@@ -152,7 +153,7 @@ def main() -> int:
             cur.execute(
                 """
                 INSERT INTO orderbook_l2 (
-                    symbol, ts, bid_px, ask_px, bid_sz, ask_sz, spread_bps, imbalance, source, created_at
+                    symbol, ts, bid_px, ask_px, bid_sz, ask_sz, spread_bps, imbalance, source, is_synthetic, created_at
                 )
                 WITH src AS (
                     SELECT
@@ -204,6 +205,7 @@ def main() -> int:
                     f.spread_bps,
                     f.imbalance,
                     %s,
+                    TRUE,
                     NOW()
                 FROM f
                 WHERE NOT EXISTS (

@@ -2,22 +2,21 @@
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_right, bisect_left
 import json
-import math
 import os
+from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
+import numpy as np
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 
-from inference.liquid_feature_contract import (
-    LIQUID_FEATURE_SCHEMA_VERSION,
-    LIQUID_FULL_FEATURE_KEYS,
-    LIQUID_LATENT_FEATURE_KEYS,
-    LIQUID_MANUAL_FEATURE_KEYS,
-)
+from features.align import validate_schema_hash
+from features.feature_contract import FEATURE_DIM, FEATURE_INDEX, FEATURE_KEYS, GROUP_MAP, SCHEMA_HASH, SCHEMA_VERSION
+
+
+TEXT_EMB_KEYS = [k for k in FEATURE_KEYS if k.startswith("text_emb_")]
 
 
 def _parse_dt(raw: str) -> datetime:
@@ -30,87 +29,11 @@ def _parse_dt(raw: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def _to_list(raw: Any) -> List[float]:
-    if isinstance(raw, list):
-        vals = raw
-    else:
-        vals = []
-    out: List[float] = []
-    for x in vals:
-        try:
-            out.append(float(x))
-        except Exception:
-            out.append(0.0)
+def _to_feature_payload(values: np.ndarray, mask: np.ndarray) -> Dict[str, Dict[str, float | int]]:
+    out: Dict[str, Dict[str, float | int]] = {}
+    for i, k in enumerate(FEATURE_KEYS):
+        out[k] = {"value": float(values[i]), "missing": int(mask[i])}
     return out
-
-
-def _to_dict(raw: Any) -> Dict[str, Any]:
-    return raw if isinstance(raw, dict) else {}
-
-
-def _avg_vectors(vectors: List[List[float]], dim: int) -> List[float]:
-    if not vectors:
-        return [0.0] * dim
-    out = [0.0] * dim
-    for v in vectors:
-        for i in range(min(dim, len(v))):
-            out[i] += float(v[i])
-    n = float(len(vectors))
-    return [x / n for x in out]
-
-
-def _latest_before(ts_list: List[datetime], vec_list: List[List[float]], as_of_ts: datetime) -> List[float]:
-    if not ts_list or not vec_list:
-        return []
-    idx = bisect_right(ts_list, as_of_ts) - 1
-    if idx < 0:
-        return []
-    return vec_list[idx]
-
-
-def _window_vectors(
-    ts_list: List[datetime],
-    vec_list: List[List[float]],
-    start_ts: datetime,
-    end_ts: datetime,
-    max_count: int = 256,
-) -> List[List[float]]:
-    if not ts_list or not vec_list:
-        return []
-    left = bisect_left(ts_list, start_ts)
-    right = bisect_right(ts_list, end_ts)
-    if right <= left:
-        return []
-    sliced = vec_list[left:right]
-    if len(sliced) > max_count:
-        sliced = sliced[-max_count:]
-    return sliced
-
-
-def _window_items(
-    ts_list: List[datetime],
-    val_list: List[Dict[str, Any]],
-    start_ts: datetime,
-    end_ts: datetime,
-    max_count: int = 256,
-) -> List[Dict[str, Any]]:
-    if not ts_list or not val_list:
-        return []
-    left = bisect_left(ts_list, start_ts)
-    right = bisect_right(ts_list, end_ts)
-    if right <= left:
-        return []
-    sliced = val_list[left:right]
-    if len(sliced) > max_count:
-        sliced = sliced[-max_count:]
-    return sliced
-
-
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return float(default)
 
 
 def _table_exists(cur, table_name: str) -> bool:
@@ -119,96 +42,26 @@ def _table_exists(cur, table_name: str) -> bool:
     return bool(row.get("reg"))
 
 
-def _social_manual_from_agg(rows: List[Dict[str, Any]], as_of_ts: datetime) -> Dict[str, float]:
-    if not rows:
-        return {}
-    total_items = 0.0
-    total_posts = 0.0
-    total_comments = 0.0
-    total_engagement = 0.0
-    post_sent_num = 0.0
-    comment_sent_num = 0.0
-    count_1h = 0.0
-    count_6h = 0.0
-
-    lookback_1h = as_of_ts - timedelta(hours=1)
-    lookback_6h = as_of_ts - timedelta(hours=6)
-    for row in rows:
-        ts = row.get("_as_of_ts")
-        item_count = max(0.0, _safe_float(row.get("item_count"), 0.0))
-        post_count = max(0.0, _safe_float(row.get("post_count"), 0.0))
-        comment_count = max(0.0, _safe_float(row.get("comment_count"), 0.0))
-        engagement_sum = max(0.0, _safe_float(row.get("engagement_sum"), 0.0))
-        post_sent = max(-1.0, min(1.0, _safe_float(row.get("post_sentiment_weighted"), 0.0)))
-        comment_sent = max(-1.0, min(1.0, _safe_float(row.get("comment_sentiment_weighted"), 0.0)))
-
-        w = max(1.0, item_count)
-        total_items += item_count
-        total_posts += post_count
-        total_comments += comment_count
-        total_engagement += engagement_sum
-        post_sent_num += w * post_sent
-        comment_sent_num += w * comment_sent
-        if isinstance(ts, datetime):
-            if ts >= lookback_6h:
-                count_6h += item_count
-            if ts >= lookback_1h:
-                count_1h += item_count
-
-    den = max(1.0, total_items)
-    post_sent_mean = post_sent_num / den
-    comment_sent_mean = comment_sent_num / den
-    social_comment_rate = total_comments / max(1.0, total_posts)
-    social_event_ratio = min(1.0, total_items / 72.0)  # 6h window with 5m bins -> 72 buckets
-    engagement_norm = math.tanh((math.log1p(total_engagement / den)) / 3.0)
-    buzz_norm = math.tanh(math.log1p(total_items) / 4.0)
-    event_density = min(1.0, total_items / 72.0)
-    return {
-        "social_post_sentiment": float(post_sent_mean),
-        "social_comment_sentiment": float(comment_sent_mean),
-        "social_engagement_norm": float(engagement_norm),
-        "social_event_ratio": float(social_event_ratio),
-        "social_buzz": float(buzz_norm),
-        "social_comment_rate": float(social_comment_rate),
-        "sentiment_abs": float(abs(0.5 * (post_sent_mean + comment_sent_mean))),
-        "comment_skew": float(comment_sent_mean - post_sent_mean),
-        "event_density": float(event_density),
-        "event_velocity_1h": float(math.tanh(count_1h / 12.0)),
-        "event_velocity_6h": float(math.tanh(count_6h / 72.0)),
-    }
-
-
-def _blend_manual_features(
-    final: Dict[str, float],
-    derived: Dict[str, float],
-    *,
-    alpha: float,
-) -> None:
-    w = max(0.0, min(1.0, float(alpha)))
-    for key, dv in derived.items():
-        if key not in final:
-            continue
-        base = _safe_float(final.get(key), 0.0)
-        derived_v = _safe_float(dv, 0.0)
-        if abs(base) <= 1e-12:
-            final[key] = float(derived_v)
-        else:
-            final[key] = float((1.0 - w) * base + w * derived_v)
+def _latest_before(ts_list: List[datetime], rows: List[Dict[str, Any]], ts: datetime) -> Dict[str, Any] | None:
+    if not ts_list:
+        return None
+    idx = bisect_right(ts_list, ts) - 1
+    if idx < 0:
+        return None
+    return rows[idx]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Merge feature views into final training matrix")
-    parser.add_argument("--database-url", default=os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor"))
-    parser.add_argument("--start", default="2018-01-01T00:00:00Z")
-    parser.add_argument("--end", default="")
-    parser.add_argument("--truncate", action="store_true")
-    parser.add_argument("--max-rows", type=int, default=int(os.getenv("FEATURE_MATRIX_MAIN_MAX_ROWS", "0")))
-    parser.add_argument("--social-agg-blend-alpha", type=float, default=float(os.getenv("SOCIAL_AGG_BLEND_ALPHA", "0.35")))
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Merge strict numeric snapshots + semantic text embeddings")
+    ap.add_argument("--database-url", default=os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor"))
+    ap.add_argument("--start", default="2018-01-01T00:00:00Z")
+    ap.add_argument("--end", default="")
+    ap.add_argument("--truncate", action="store_true")
+    ap.add_argument("--max-rows", type=int, default=0)
+    args = ap.parse_args()
 
     start_dt = _parse_dt(args.start)
     end_dt = _parse_dt(args.end) if str(args.end).strip() else datetime.now(timezone.utc)
-
     inserted = 0
 
     with psycopg2.connect(args.database_url, cursor_factory=RealDictCursor) as conn:
@@ -219,9 +72,13 @@ def main() -> int:
                     id BIGSERIAL PRIMARY KEY,
                     symbol TEXT NOT NULL,
                     as_of_ts TIMESTAMPTZ NOT NULL,
+                    values JSONB NOT NULL,
+                    mask JSONB NOT NULL,
                     features JSONB NOT NULL,
                     feature_dim INTEGER NOT NULL,
+                    schema_hash TEXT NOT NULL,
                     feature_version TEXT NOT NULL,
+                    synthetic_ratio DOUBLE PRECISION NOT NULL DEFAULT 0.0,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
                 """
@@ -231,147 +88,149 @@ def main() -> int:
                 cur.execute("TRUNCATE TABLE feature_matrix_main")
 
             sql = """
-                SELECT symbol, as_of_ts, feature_payload
+                SELECT symbol, as_of_ts, feature_values, feature_mask, feature_payload, schema_hash, synthetic_ratio
                 FROM feature_snapshots_main
                 WHERE as_of_ts >= %s AND as_of_ts <= %s
-                ORDER BY as_of_ts ASC
+                ORDER BY symbol ASC, as_of_ts ASC
             """
-            params: List[object] = [start_dt, end_dt]
+            params: List[Any] = [start_dt, end_dt]
             if int(args.max_rows) > 0:
                 sql += " LIMIT %s"
                 params.append(int(args.max_rows))
             cur.execute(sql, tuple(params))
             base_rows = [dict(r) for r in cur.fetchall()]
 
+            if not base_rows:
+                print(json.dumps({"status": "ok", "rows_inserted": 0, "table": "feature_matrix_main"}, ensure_ascii=False))
+                return 0
+
             symbols = sorted({str(r.get("symbol") or "").upper() for r in base_rows if str(r.get("symbol") or "").strip()})
-            if symbols:
-                # Idempotency: rebuild same window/version without duplicate accumulation.
+            cur.execute(
+                """
+                DELETE FROM feature_matrix_main
+                WHERE symbol = ANY(%s)
+                  AND as_of_ts >= %s
+                  AND as_of_ts <= %s
+                  AND feature_version = %s
+                """,
+                (symbols, start_dt, end_dt, str(SCHEMA_VERSION)),
+            )
+
+            text_map: Dict[str, Tuple[List[datetime], List[Dict[str, Any]]]] = {}
+            if _table_exists(cur, "social_text_embeddings"):
                 cur.execute(
                     """
-                    DELETE FROM feature_matrix_main
+                    SELECT symbol, as_of_ts, embedding, embedding_dim, text_quality, schema_hash
+                    FROM social_text_embeddings
                     WHERE symbol = ANY(%s)
-                      AND as_of_ts >= %s
+                      AND as_of_ts >= %s - INTERVAL '6 hour'
                       AND as_of_ts <= %s
-                      AND feature_version = %s
+                    ORDER BY symbol ASC, as_of_ts ASC
                     """,
-                    (symbols, start_dt, end_dt, str(LIQUID_FEATURE_SCHEMA_VERSION)),
+                    (symbols, start_dt, end_dt),
                 )
-            market_ts_map: Dict[str, List[datetime]] = {}
-            market_vec_map: Dict[str, List[List[float]]] = {}
-            social_ts_map: Dict[str, List[datetime]] = {}
-            social_vec_map: Dict[str, List[List[float]]] = {}
-            social_feat_map: Dict[str, List[Dict[str, Any]]] = {}
+                for r in cur.fetchall() or []:
+                    row = dict(r)
+                    sym = str(row.get("symbol") or "").upper()
+                    ts = row.get("as_of_ts")
+                    if not sym or not isinstance(ts, datetime):
+                        continue
+                    validate_schema_hash(str(row.get("schema_hash") or ""))
+                    bucket = text_map.setdefault(sym, ([], []))
+                    bucket[0].append(ts)
+                    bucket[1].append(row)
 
-            if symbols:
-                if _table_exists(cur, "market_latent"):
-                    cur.execute(
-                        """
-                        SELECT symbol, as_of_ts, latent
-                        FROM market_latent
-                        WHERE symbol = ANY(%s)
-                          AND as_of_ts >= %s
-                          AND as_of_ts <= %s
-                        ORDER BY symbol ASC, as_of_ts ASC
-                        """,
-                        (symbols, start_dt - timedelta(days=7), end_dt),
-                    )
-                    for row in cur.fetchall() or []:
-                        sym = str(row.get("symbol") or "").upper()
-                        ts = row.get("as_of_ts")
-                        if not sym or not isinstance(ts, datetime):
-                            continue
-                        market_ts_map.setdefault(sym, []).append(ts)
-                        market_vec_map.setdefault(sym, []).append(_to_list(row.get("latent")))
-
-                if _table_exists(cur, "social_text_latent"):
-                    cur.execute(
-                        """
-                        SELECT as_of_ts, symbols, latent, agg_features
-                        FROM social_text_latent
-                        WHERE as_of_ts >= %s
-                          AND as_of_ts <= %s
-                        ORDER BY as_of_ts ASC
-                        """,
-                        (start_dt - timedelta(hours=6), end_dt),
-                    )
-                    for row in cur.fetchall() or []:
-                        ts = row.get("as_of_ts")
-                        syms = row.get("symbols")
-                        if not isinstance(ts, datetime) or not isinstance(syms, list):
-                            continue
-                        vec = _to_list(row.get("latent"))
-                        feat = _to_dict(row.get("agg_features"))
-                        for s in syms:
-                            sym = str(s or "").upper()
-                            if sym in symbols:
-                                social_ts_map.setdefault(sym, []).append(ts)
-                                social_vec_map.setdefault(sym, []).append(vec)
-                                social_feat_map.setdefault(sym, []).append({**feat, "_as_of_ts": ts})
-
-            insert_rows = []
-            for r in base_rows:
-                symbol = str(r.get("symbol") or "").upper()
-                as_of_ts = r.get("as_of_ts")
-                if not isinstance(as_of_ts, datetime):
+            inserts = []
+            for br in base_rows:
+                sym = str(br.get("symbol") or "").upper()
+                ts = br.get("as_of_ts")
+                if not sym or (not isinstance(ts, datetime)):
                     continue
-                manual_payload = r.get("feature_payload") if isinstance(r.get("feature_payload"), dict) else {}
 
-                market_latent = _latest_before(
-                    market_ts_map.get(symbol, []),
-                    market_vec_map.get(symbol, []),
-                    as_of_ts,
-                )
-                social_vectors = _window_vectors(
-                    social_ts_map.get(symbol, []),
-                    social_vec_map.get(symbol, []),
-                    start_ts=as_of_ts - timedelta(hours=6),
-                    end_ts=as_of_ts,
-                    max_count=256,
-                )
-                social_feature_rows = _window_items(
-                    social_ts_map.get(symbol, []),
-                    social_feat_map.get(symbol, []),
-                    start_ts=as_of_ts - timedelta(hours=6),
-                    end_ts=as_of_ts,
-                    max_count=256,
-                )
-                social_latent_target_dim = len(LIQUID_LATENT_FEATURE_KEYS) // 2
-                social_latent = _avg_vectors(social_vectors, social_latent_target_dim)
+                validate_schema_hash(str(br.get("schema_hash") or ""))
+                vals = np.array(br.get("feature_values") or [], dtype=np.float32).reshape(-1)
+                msk = np.array(br.get("feature_mask") or [], dtype=np.uint8).reshape(-1)
+                if vals.size != FEATURE_DIM or msk.size != FEATURE_DIM:
+                    payload = br.get("feature_payload") if isinstance(br.get("feature_payload"), dict) else {}
+                    vals = np.zeros((FEATURE_DIM,), dtype=np.float32)
+                    msk = np.ones((FEATURE_DIM,), dtype=np.uint8)
+                    for i, k in enumerate(FEATURE_KEYS):
+                        item = payload.get(k) if isinstance(payload.get(k), dict) else {}
+                        vals[i] = float((item or {}).get("value", 0.0) or 0.0)
+                        msk[i] = int((item or {}).get("missing", 1) or 0)
 
-                final = {k: 0.0 for k in LIQUID_FULL_FEATURE_KEYS}
-                for k in LIQUID_MANUAL_FEATURE_KEYS:
-                    final[k] = float(manual_payload.get(k, 0.0) or 0.0)
+                t_meta = text_map.get(sym)
+                if t_meta:
+                    trow = _latest_before(t_meta[0], t_meta[1], ts)
+                else:
+                    trow = None
 
-                half = len(LIQUID_LATENT_FEATURE_KEYS) // 2
-                for i in range(half):
-                    final[LIQUID_LATENT_FEATURE_KEYS[i]] = float(market_latent[i] if i < len(market_latent) else 0.0)
-                for i in range(half, len(LIQUID_LATENT_FEATURE_KEYS)):
-                    j = i - half
-                    final[LIQUID_LATENT_FEATURE_KEYS[i]] = float(social_latent[j] if j < len(social_latent) else 0.0)
-                derived_social = _social_manual_from_agg(social_feature_rows, as_of_ts=as_of_ts)
-                _blend_manual_features(final, derived_social, alpha=float(args.social_agg_blend_alpha))
+                if isinstance(trow, dict):
+                    emb = trow.get("embedding") if isinstance(trow.get("embedding"), list) else []
+                    quality = trow.get("text_quality") if isinstance(trow.get("text_quality"), dict) else {}
+                    for i, k in enumerate(TEXT_EMB_KEYS):
+                        j = FEATURE_INDEX[k]
+                        if i < len(emb):
+                            vals[j] = float(emb[i])
+                            msk[j] = 0
+                        else:
+                            vals[j] = 0.0
+                            msk[j] = 1
+                    mapping = {
+                        "text_item_count": float(quality.get("num_items", 0.0) or 0.0),
+                        "text_unique_authors": float(quality.get("unique_authors", 0.0) or 0.0),
+                        "text_dup_ratio": float(quality.get("dup_ratio", 0.0) or 0.0),
+                        "text_disagreement": float(quality.get("disagreement", 0.0) or 0.0),
+                        "text_avg_lag_sec": float(quality.get("avg_lag_sec", 0.0) or 0.0),
+                        "text_coverage": float(quality.get("coverage", 0.0) or 0.0),
+                    }
+                    for k, v in mapping.items():
+                        idx = FEATURE_INDEX[k]
+                        vals[idx] = float(v)
+                        msk[idx] = 0
+                    idx_ft = FEATURE_INDEX.get("freshness_text_sec")
+                    if idx_ft is not None:
+                        vals[idx_ft] = float(max(0.0, (ts - trow["as_of_ts"]).total_seconds()))
+                        msk[idx_ft] = 0
+                else:
+                    for k in TEXT_EMB_KEYS:
+                        idx = FEATURE_INDEX[k]
+                        vals[idx] = 0.0
+                        msk[idx] = 1
+                    for k in ("text_item_count", "text_unique_authors", "text_dup_ratio", "text_disagreement", "text_avg_lag_sec", "text_coverage", "freshness_text_sec"):
+                        idx = FEATURE_INDEX.get(k)
+                        if idx is not None:
+                            vals[idx] = 0.0
+                            msk[idx] = 1
 
-                insert_rows.append(
+                payload = _to_feature_payload(vals, msk)
+                inserts.append(
                     (
-                        symbol,
-                        as_of_ts,
-                        json.dumps(final),
-                        len(LIQUID_FULL_FEATURE_KEYS),
-                        str(LIQUID_FEATURE_SCHEMA_VERSION),
+                        sym,
+                        ts,
+                        json.dumps([float(x) for x in vals.tolist()]),
+                        json.dumps([int(x) for x in msk.tolist()]),
+                        json.dumps(payload),
+                        int(FEATURE_DIM),
+                        str(SCHEMA_HASH),
+                        str(SCHEMA_VERSION),
+                        float(br.get("synthetic_ratio") or 0.0),
                     )
                 )
 
-            if insert_rows:
+            if inserts:
                 execute_values(
                     cur,
                     """
-                    INSERT INTO feature_matrix_main(symbol, as_of_ts, features, feature_dim, feature_version)
-                    VALUES %s
+                    INSERT INTO feature_matrix_main(
+                        symbol, as_of_ts, values, mask, features,
+                        feature_dim, schema_hash, feature_version, synthetic_ratio
+                    ) VALUES %s
                     """,
-                    insert_rows,
-                    template="(%s, %s, %s::jsonb, %s, %s)",
+                    inserts,
+                    template="(%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s)",
                 )
-                inserted += len(insert_rows)
+                inserted = len(inserts)
 
         conn.commit()
 
@@ -381,11 +240,9 @@ def main() -> int:
                 "status": "ok",
                 "table": "feature_matrix_main",
                 "rows_inserted": int(inserted),
-                "manual_dim": len(LIQUID_MANUAL_FEATURE_KEYS),
-                "latent_dim": len(LIQUID_LATENT_FEATURE_KEYS),
-                "total_dim": len(LIQUID_FULL_FEATURE_KEYS),
-                "feature_version": str(LIQUID_FEATURE_SCHEMA_VERSION),
-                "social_agg_blend_alpha": float(args.social_agg_blend_alpha),
+                "feature_dim": int(FEATURE_DIM),
+                "schema_hash": str(SCHEMA_HASH),
+                "feature_version": str(SCHEMA_VERSION),
             },
             ensure_ascii=False,
         )

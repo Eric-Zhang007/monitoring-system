@@ -126,10 +126,10 @@ def main() -> int:
     parser.add_argument("--eval", default="artifacts/models/multimodal_eval.json")
     parser.add_argument("--backbone-report", default="artifacts/experiments/backbone_suite_latest.json")
     parser.add_argument("--registry", default="artifacts/models/candidate_registry.jsonl")
-    parser.add_argument("--enforce-gates", default=os.getenv("CANDIDATE_ENFORCE_GATES", "0"))
+    parser.add_argument("--enforce-gates", default=os.getenv("CANDIDATE_ENFORCE_GATES", "1"))
     parser.add_argument("--min-oos-hit-rate", type=float, default=float(os.getenv("CANDIDATE_MIN_OOS_HIT_RATE", "0.5")))
     parser.add_argument("--max-oos-mse", type=float, default=float(os.getenv("CANDIDATE_MAX_OOS_MSE", "1.0")))
-    parser.add_argument("--min-backbone-ready", type=int, default=int(os.getenv("CANDIDATE_MIN_BACKBONE_READY", "0")))
+    parser.add_argument("--min-backbone-ready", type=int, default=int(os.getenv("CANDIDATE_MIN_BACKBONE_READY", "1")))
     parser.add_argument("--required-backbones", default=os.getenv("CANDIDATE_REQUIRED_BACKBONES", ""))
     parser.add_argument(
         "--max-delta-mse-no-text-vs-full",

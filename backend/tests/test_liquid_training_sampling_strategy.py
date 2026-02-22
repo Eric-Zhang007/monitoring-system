@@ -136,9 +136,9 @@ def test_research_mode_guardrails_filter_missing_and_downsample():
     d = len(LIQUID_FEATURE_KEYS)
     X = np.zeros((n, d), dtype=np.float32)
     missing_idx = [i for i, key in enumerate(LIQUID_FEATURE_KEYS) if str(key).endswith("_missing_flag")]
-    assert len(missing_idx) > 0
-    # First row has all modal features missing and should be filtered out in research mode.
-    X[0, missing_idx] = 1.0
+    if missing_idx:
+        # First row has all modal features missing and should be filtered out in research mode.
+        X[0, missing_idx] = 1.0
     y = np.arange(n, dtype=np.float32)
     batch = SampleBatch(
         X=X,
@@ -150,5 +150,6 @@ def test_research_mode_guardrails_filter_missing_and_downsample():
     out_batch, guard = trainer._apply_research_mode_guardrails(batch)
     assert bool(guard.get("enabled")) is True
     assert int(guard.get("rows_before") or 0) == n
+    assert int(guard.get("missing_flag_count") or 0) == len(missing_idx)
     assert int(out_batch.X.shape[0]) <= 3
     assert int(out_batch.X.shape[0]) == int(out_batch.y.shape[0])

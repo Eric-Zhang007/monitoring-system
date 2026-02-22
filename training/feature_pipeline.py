@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
+from features.feature_contract import FEATURE_KEYS as CONTRACT_FEATURE_KEYS
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor")
 _ROOT = Path(__file__).resolve().parents[1]
@@ -38,69 +39,7 @@ DERIVATIVE_METRIC_KEY_MAP: Dict[str, str] = {
 DERIVATIVE_METRIC_NAMES: List[str] = list(DERIVATIVE_METRIC_KEY_MAP.keys())
 DERIVATIVE_FEATURE_KEYS: List[str] = list(DERIVATIVE_METRIC_KEY_MAP.values())
 DERIVATIVE_MISSING_FLAG_KEYS: List[str] = [f"{k}_missing_flag" for k in DERIVATIVE_FEATURE_KEYS]
-LIQUID_FEATURE_KEYS: List[str] = [
-    "ret_1",
-    "ret_3",
-    "ret_12",
-    "ret_48",
-    "ret_96",
-    "ret_288",
-    "vol_3",
-    "vol_12",
-    "vol_48",
-    "vol_96",
-    "vol_288",
-    "ret_accel_1_3",
-    "ret_accel_3_12",
-    "ret_accel_12_48",
-    "vol_term_3_12",
-    "vol_term_12_48",
-    "vol_term_48_288",
-    "log_volume",
-    "vol_z",
-    "volume_impact",
-    "orderbook_imbalance",
-    "funding_rate",
-    "onchain_norm",
-    "deriv_long_short_ratio_global_accounts",
-    "deriv_long_short_ratio_top_accounts",
-    "deriv_long_short_ratio_top_positions",
-    "deriv_taker_buy_sell_ratio",
-    "deriv_basis_rate",
-    "deriv_annualized_basis_rate",
-    "event_decay",
-    "orderbook_missing_flag",
-    "funding_missing_flag",
-    "onchain_missing_flag",
-    "deriv_long_short_ratio_global_accounts_missing_flag",
-    "deriv_long_short_ratio_top_accounts_missing_flag",
-    "deriv_long_short_ratio_top_positions_missing_flag",
-    "deriv_taker_buy_sell_ratio_missing_flag",
-    "deriv_basis_rate_missing_flag",
-    "deriv_annualized_basis_rate_missing_flag",
-    "source_tier_weight",
-    "source_confidence",
-    "social_post_sentiment",
-    "social_comment_sentiment",
-    "social_engagement_norm",
-    "social_influence_norm",
-    "social_event_ratio",
-    "social_buzz",
-    "event_velocity_1h",
-    "event_velocity_6h",
-    "event_disagreement",
-    "source_diversity",
-    "cross_source_consensus",
-    "comment_skew",
-    "event_lag_bucket_0_1h",
-    "event_lag_bucket_1_6h",
-    "event_lag_bucket_6_24h",
-    "event_density",
-    "sentiment_abs",
-    "social_comment_rate",
-    "event_importance_mean",
-    "novelty_confidence_blend",
-]
+LIQUID_FEATURE_KEYS: List[str] = list(CONTRACT_FEATURE_KEYS)
 ONLINE_FEATURE_KEYS: List[str] = list(LIQUID_FEATURE_KEYS)
 try:
     from liquid_feature_contract import LIQUID_FEATURE_KEYS as _CONTRACT_KEYS  # type: ignore
@@ -213,11 +152,9 @@ class FeaturePipeline:
     def _align_feature_vector(values: List[float]) -> List[float]:
         target_dim = len(LIQUID_FEATURE_KEYS)
         row = [float(x) for x in values]
-        if len(row) == target_dim:
-            return row
-        if len(row) > target_dim:
-            return row[:target_dim]
-        return row + [0.0] * (target_dim - len(row))
+        if len(row) != target_dim:
+            raise RuntimeError(f"feature_dim_mismatch:actual={len(row)}:expected={target_dim}")
+        return row
 
     @staticmethod
     def _parse_optional_utc(raw: object) -> Optional[datetime]:

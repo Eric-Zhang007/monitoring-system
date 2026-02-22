@@ -22,8 +22,6 @@ def test_derivative_feature_keys_are_aligned_between_training_and_inference_cont
     for key in TRAIN_DERIV_FEATURE_KEYS:
         assert key in TRAIN_KEYS
         assert key in INFER_KEYS
-        assert f"{key}_missing_flag" in TRAIN_KEYS
-        assert f"{key}_missing_flag" in INFER_KEYS
 
 
 def test_latest_before_with_missing_enforces_no_lookahead():

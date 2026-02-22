@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT / "inference"))
@@ -11,20 +12,14 @@ sys.path.append(str(ROOT / "inference"))
 from model_router import ModelRouter  # noqa: E402
 
 
-def test_align_features_pad_and_trim():
+def test_align_features_strict_dim_match():
     x = np.array([1.0, 2.0], dtype=np.float32)
-    padded = ModelRouter._align_features(x, 4)
-    assert padded.shape[0] == 4
-    assert float(padded[0]) == 1.0
-    assert float(padded[1]) == 2.0
-    assert float(padded[2]) == 0.0
-    assert float(padded[3]) == 0.0
-
-    y = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    trimmed = ModelRouter._align_features(y, 2)
-    assert trimmed.shape[0] == 2
-    assert float(trimmed[0]) == 1.0
-    assert float(trimmed[1]) == 2.0
+    with pytest.raises(ValueError, match="feature_dim_mismatch"):
+        ModelRouter._align_features(x, 4)
+    exact = ModelRouter._align_features(x, 2)
+    assert exact.shape[0] == 2
+    assert float(exact[0]) == 1.0
+    assert float(exact[1]) == 2.0
 
 
 def test_normalize_features_uses_stats():

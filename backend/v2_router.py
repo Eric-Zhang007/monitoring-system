@@ -72,6 +72,8 @@ from schemas_v2 import (
     TradeAuditResponse,
     VCPredictRequest,
 )
+from features.feature_contract import FEATURE_KEYS as CONTRACT_FEATURE_KEYS
+from features.feature_contract import SCHEMA_VERSION as CONTRACT_SCHEMA_VERSION
 from execution_engine import ExecutionEngine
 from execution_policy import build_execution_trace
 from portfolio_allocator import AllocatorSignal, allocate_targets
@@ -89,6 +91,7 @@ from execution_api import (
 )
 from feature_signal import feature_signal_score
 from liquid_model_service import LiquidModelService
+from vc_model_service import VCModelService
 from metrics import (
     BACKTEST_FAILED_RUNS_TOTAL,
     BITGET_UNCLASSIFIED_ERRORS_TOTAL,
@@ -150,81 +153,27 @@ repo = _init_repo()
 exec_engine = ExecutionEngine()
 DEFAULT_LIQUID_SYMBOLS = "BTC,ETH,SOL"
 _TABULAR_MODEL_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
-LIQUID_FEATURE_KEYS: List[str] = [
-    "ret_1",
-    "ret_3",
-    "ret_12",
-    "ret_48",
-    "ret_96",
-    "ret_288",
-    "vol_3",
-    "vol_12",
-    "vol_48",
-    "vol_96",
-    "vol_288",
-    "ret_accel_1_3",
-    "ret_accel_3_12",
-    "ret_accel_12_48",
-    "vol_term_3_12",
-    "vol_term_12_48",
-    "vol_term_48_288",
-    "log_volume",
-    "vol_z",
-    "volume_impact",
-    "orderbook_imbalance",
-    "funding_rate",
-    "onchain_norm",
-    "event_decay",
-    "orderbook_missing_flag",
-    "funding_missing_flag",
-    "onchain_missing_flag",
-    "source_tier_weight",
-    "source_confidence",
-    "social_post_sentiment",
-    "social_comment_sentiment",
-    "social_engagement_norm",
-    "social_influence_norm",
-    "social_event_ratio",
-    "social_buzz",
-    "event_velocity_1h",
-    "event_velocity_6h",
-    "event_disagreement",
-    "source_diversity",
-    "cross_source_consensus",
-    "comment_skew",
-    "event_lag_bucket_0_1h",
-    "event_lag_bucket_1_6h",
-    "event_lag_bucket_6_24h",
-    "event_density",
-    "sentiment_abs",
-    "social_comment_rate",
-    "event_importance_mean",
-    "novelty_confidence_blend",
-]
+LIQUID_FEATURE_KEYS: List[str] = list(CONTRACT_FEATURE_KEYS)
 _ROOT = Path(__file__).resolve().parents[1]
 _INFER_DIR = _ROOT / "inference"
 if str(_INFER_DIR) not in sys.path:
     sys.path.append(str(_INFER_DIR))
 try:
-    from liquid_feature_contract import ONLINE_LIQUID_FEATURE_KEYS as _CONTRACT_KEYS  # type: ignore
+    from liquid_feature_contract import LIQUID_FEATURE_KEYS as _CONTRACT_KEYS  # type: ignore
     from liquid_feature_contract import LIQUID_FEATURE_SCHEMA_VERSION as _CONTRACT_SCHEMA  # type: ignore
     from model_router import ModelRouter  # type: ignore
 
     if isinstance(_CONTRACT_KEYS, list) and _CONTRACT_KEYS:
         LIQUID_FEATURE_KEYS = list(_CONTRACT_KEYS)
     FEATURE_PAYLOAD_SCHEMA_VERSION = str(_CONTRACT_SCHEMA or FEATURE_PAYLOAD_SCHEMA_VERSION)
-    FEATURE_PAYLOAD_SCHEMA_COMPAT = {
-        FEATURE_PAYLOAD_SCHEMA_VERSION,
-        "main",
-        "v2.3",
-        "v2.2",
-    }
+    FEATURE_PAYLOAD_SCHEMA_COMPAT = {FEATURE_PAYLOAD_SCHEMA_VERSION, str(CONTRACT_SCHEMA_VERSION)}
 except Exception:
     ModelRouter = None  # type: ignore[assignment]
     pass
 
 _MODEL_ROUTER: Optional[Any] = None
 _LIQUID_MODEL_SERVICE: Optional[LiquidModelService] = None
+_VC_MODEL_SERVICE: Optional[VCModelService] = None
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -289,6 +238,14 @@ def _get_liquid_model_service() -> LiquidModelService:
         default_model_version=default_version,
     )
     return _LIQUID_MODEL_SERVICE
+
+
+def _get_vc_model_service() -> VCModelService:
+    global _VC_MODEL_SERVICE
+    if _VC_MODEL_SERVICE is not None and _VC_MODEL_SERVICE.repo is repo:
+        return _VC_MODEL_SERVICE
+    _VC_MODEL_SERVICE = VCModelService(repo=repo)
+    return _VC_MODEL_SERVICE
 
 
 def _latest_liquid_feature_payload(symbol: str, *, max_lookback_days: int = 30) -> Dict[str, float]:
@@ -866,60 +823,10 @@ def _evaluate_risk(
 
 
 def _build_vc_prediction(company_name: str, horizon_months: int) -> Dict[str, object]:
-    context = repo.recent_event_context(company_name, limit=8)
-
-    funding_hits = sum(1 for e in context if e["event_type"] == "funding")
-    product_hits = sum(1 for e in context if e["event_type"] == "product")
-    regulatory_hits = sum(1 for e in context if e["event_type"] == "regulatory")
-    score_raw = funding_hits * 0.9 + product_hits * 0.4 - regulatory_hits * 0.6
-
-    horizon_adj = {6: 0.1, 12: 0.0, 24: -0.05}[horizon_months]
-    p_next_round = max(0.01, min(0.99, _sigmoid(score_raw * 0.7 + horizon_adj)))
-    p_exit = max(0.01, min(0.95, _sigmoid(score_raw * 0.3 - 0.4)))
-    expected_moic = {
-        "p10": round(0.6 + p_next_round * 0.8, 2),
-        "p50": round(1.0 + p_next_round * 1.6, 2),
-        "p90": round(1.2 + p_next_round * 3.5 + p_exit * 2.0, 2),
-    }
-
-    explanation = {
-        "top_event_contributors": [
-            {
-                "event_id": e["id"],
-                "event_type": e["event_type"],
-                "title": e["title"],
-                "weight": round(0.2 + e.get("confidence_score", 0.5) * 0.6, 3),
-            }
-            for e in context[:5]
-        ],
-        "top_feature_contributors": [
-            {"feature": "recent_funding_event_count", "value": funding_hits, "contribution": round(funding_hits * 0.9, 3)},
-            {"feature": "recent_product_event_count", "value": product_hits, "contribution": round(product_hits * 0.4, 3)},
-            {"feature": "recent_regulatory_event_count", "value": regulatory_hits, "contribution": round(-regulatory_hits * 0.6, 3)},
-        ],
-        "evidence_links": [e["source_url"] for e in context if e.get("source_url")][:5],
-        "model_version": "vc-survival-baseline-v2",
-        "feature_version": FEATURE_VERSION,
-    }
-
-    outputs = {
-        "p_next_round": {
-            "6m": round(max(0.01, min(0.99, p_next_round + 0.05)), 4),
-            "12m": round(p_next_round, 4),
-            "24m": round(max(0.01, min(0.99, p_next_round - 0.08)), 4),
-        },
-        "p_exit_24m": round(p_exit, 4),
-        "expected_moic_distribution": expected_moic,
-        "as_of": _utcnow().isoformat(),
-    }
-
-    return {
-        "target": company_name,
-        "score": float(round(p_next_round, 4)),
-        "confidence": float(round(min(0.95, 0.55 + len(context) * 0.04), 4)),
-        "outputs": outputs,
-        "explanation": explanation,
-    }
+    return _get_vc_model_service().predict_with_context(
+        company_name=str(company_name),
+        horizon_months=int(horizon_months),
+    )
 
 
 def _build_liquid_prediction(symbol: str, horizon: str) -> Dict[str, object]:
@@ -1545,14 +1452,16 @@ def _run_model_replay_backtest(
 
 
 def _feature_vector_from_payload(payload: Dict[str, Any]) -> np.ndarray:
-    return np.array([float(payload.get(k, 0.0) or 0.0) for k in LIQUID_FEATURE_KEYS], dtype=np.float64)
+    missing = [k for k in LIQUID_FEATURE_KEYS if k not in payload]
+    if missing:
+        raise RuntimeError(f"feature_payload_missing_keys:{missing[:16]}")
+    return np.array([float(payload[k]) for k in LIQUID_FEATURE_KEYS], dtype=np.float64)
 
 
 def _align_feature_dim(x: np.ndarray, dim: int, pad_value: float = 0.0) -> np.ndarray:
-    if x.shape[0] < dim:
-        return np.concatenate([x, np.full((dim - x.shape[0],), float(pad_value), dtype=np.float64)], axis=0)
-    if x.shape[0] > dim:
-        return x[:dim]
+    _ = pad_value
+    if x.shape[0] != int(dim):
+        raise RuntimeError(f"feature_dim_mismatch:actual={x.shape[0]}:expected={int(dim)}")
     return x
 
 

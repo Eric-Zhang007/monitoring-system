@@ -1,24 +1,50 @@
 from __future__ import annotations
 
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import HTTPException
-from liquid_model_registry import get_active_model as get_registry_active_model
 
-_ROOT = Path(__file__).resolve().parents[1]
-_INFER_DIR = _ROOT / "inference"
-if str(_INFER_DIR) not in sys.path:
-    sys.path.append(str(_INFER_DIR))
+from artifacts.validate import validate_manifest_dir
+from features.feature_contract import FEATURE_DIM, SCHEMA_HASH
+from inference.feature_reader import fetch_sequence
+from liquid_model_registry import get_active_model as get_registry_active_model
+from models.multimodal_gate import ResidualGateHead
+from models.patchtst import PatchTSTBackbone
 
 try:
-    from model_router import ModelRouter  # type: ignore
-except Exception:
-    ModelRouter = None  # type: ignore[assignment]
+    import torch
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+
+
+if torch is not None:
+    class _LiquidSequenceModel(torch.nn.Module):
+        def __init__(self, *, lookback: int, feature_dim: int, d_model: int, n_layers: int, dropout: float, text_indices, quality_indices):
+            super().__init__()
+            self.backbone = PatchTSTBackbone(
+                feature_dim=feature_dim,
+                lookback=lookback,
+                d_model=d_model,
+                n_layers=n_layers,
+                dropout=dropout,
+            )
+            self.text_indices = list(text_indices)
+            self.quality_indices = list(quality_indices)
+            self.head = ResidualGateHead(hidden_dim=d_model, text_dim=len(self.text_indices), quality_dim=len(self.quality_indices), out_dim=4)
+
+        def forward(self, x_values: torch.Tensor, x_mask: torch.Tensor):
+            h = self.backbone(x_values, x_mask)
+            last_values = x_values[:, -1, :]
+            text_vec = last_values[:, self.text_indices]
+            quality_vec = last_values[:, self.quality_indices]
+            return self.head(h, text_vec, quality_vec)
+else:  # pragma: no cover
+    class _LiquidSequenceModel:  # type: ignore[no-redef]
+        pass
 
 
 class LiquidModelService:
@@ -29,8 +55,8 @@ class LiquidModelService:
         feature_keys: List[str],
         feature_version: str,
         data_version: str,
-        default_model_name: str = "liquid_ttm_ensemble",
-        default_model_version: str = "v2.1",
+        default_model_name: str = "liquid_main",
+        default_model_version: str = "main",
     ):
         self.repo = repo
         self.feature_keys = list(feature_keys)
@@ -38,101 +64,131 @@ class LiquidModelService:
         self.data_version = str(data_version)
         self.default_model_name = str(default_model_name)
         self.default_model_version = str(default_model_version)
-        self._model_router: Optional[Any] = None
-        self.require_neural_artifact = str(os.getenv("LIQUID_REQUIRE_NN_ARTIFACT", "0")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "y",
-        }
+        self.model_dir = Path(str(os.getenv("LIQUID_MODEL_DIR", "artifacts/models/liquid_main")))
 
-    @staticmethod
-    def _default_model_dir() -> Path:
-        env_path = str(os.getenv("MODEL_DIR", "")).strip()
-        if env_path:
-            return Path(env_path)
-        local_models = Path(__file__).resolve().parent / "models"
-        if local_models.exists():
-            return local_models
-        return Path("/opt/monitoring-system/models")
+        self.model, self.manifest, self.lookback = self._load_model_or_fail()
 
     @staticmethod
     def _utcnow() -> datetime:
         return datetime.now(timezone.utc)
 
-    def _get_model_router(self) -> Any:
-        if self._model_router is not None:
-            return self._model_router
-        if ModelRouter is None:
-            raise RuntimeError("model_router_unavailable")
-        self._model_router = ModelRouter()
-        return self._model_router
+    def _load_model_or_fail(self):
+        if torch is None:
+            raise RuntimeError("torch_required_for_liquid_inference")
+        manifest = validate_manifest_dir(self.model_dir, expected_schema_hash=SCHEMA_HASH)
+        weights = self.model_dir / manifest["files"]["weights"]
+        ckpt = torch.load(weights, map_location="cpu")
+        if str(ckpt.get("schema_hash") or "") != SCHEMA_HASH:
+            raise RuntimeError("schema_hash_mismatch_weights")
+        lookback = int(ckpt.get("lookback") or 0)
+        if lookback <= 0:
+            raise RuntimeError("invalid_lookback")
+        fdim = int(ckpt.get("feature_dim") or 0)
+        if fdim != FEATURE_DIM:
+            raise RuntimeError(f"feature_dim_mismatch_weights:{fdim}:{FEATURE_DIM}")
+
+        model = _LiquidSequenceModel(
+            lookback=lookback,
+            feature_dim=fdim,
+            d_model=int(ckpt.get("d_model") or 128),
+            n_layers=int(ckpt.get("n_layers") or 2),
+            dropout=float(ckpt.get("dropout") or 0.1),
+            text_indices=list(ckpt.get("text_indices") or []),
+            quality_indices=list(ckpt.get("quality_indices") or []),
+        )
+        model.load_state_dict(ckpt["state_dict"])
+        model.eval()
+        return model, manifest, lookback
 
     def _active_liquid_model(self, *, symbol: str = "", horizon: str = "1h") -> Tuple[str, str]:
         reg_hit = get_registry_active_model(symbol=symbol, horizon=horizon)
         if reg_hit:
             return reg_hit
-        try:
-            row = self.repo.get_active_model_state("liquid")
-        except Exception:
-            row = None
-        if isinstance(row, dict):
-            name = str(row.get("active_model_name") or "").strip()
-            ver = str(row.get("active_model_version") or "").strip()
-            if name and ver:
-                return name, ver
         return self.default_model_name, self.default_model_version
 
     def latest_feature_payload(self, symbol: str, *, max_lookback_days: int = 30) -> Dict[str, float]:
         target = str(symbol or "").strip().upper()
         if not target:
             return {}
-        rows = self.repo.load_feature_history(
-            target=target,
-            track="liquid",
-            lookback_days=max(1, int(max_lookback_days)),
-            data_version=self.data_version,
-            limit=20000,
-        )
-        if not rows:
-            rows = self.repo.load_feature_history(
-                target=target,
-                track="liquid",
-                lookback_days=max(1, int(max_lookback_days)),
-                data_version=None,
-                limit=20000,
-            )
-        for row in reversed(rows):
-            payload = row.get("feature_payload") if isinstance(row, dict) else None
-            if isinstance(payload, dict) and payload:
-                return {k: float(payload.get(k, 0.0) or 0.0) for k in self.feature_keys}
-        return {}
-
-    def _feature_vector_from_payload(self, payload: Dict[str, Any]) -> np.ndarray:
-        return np.array([float(payload.get(k, 0.0) or 0.0) for k in self.feature_keys], dtype=np.float32)
-
-    def _has_neural_artifact(self, *, target: str, model_router: Optional[Any] = None) -> bool:
-        sym = str(target or "").strip().upper()
-        if not sym:
-            return False
-        router = model_router or self._get_model_router()
-        nn_path = os.path.join(str(self._default_model_dir()), f"liquid_{sym.lower()}_tsmixer_v2.pt")
-        nn = router._load_torch_model(nn_path, "liquid", len(self.feature_keys))  # type: ignore[attr-defined]
-        return nn is not None
+        with self.repo._connect() as conn:  # type: ignore[attr-defined]
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT values, mask, schema_hash
+                    FROM feature_matrix_main
+                    WHERE symbol = %s
+                      AND as_of_ts >= NOW() - make_interval(days => %s)
+                    ORDER BY as_of_ts DESC
+                    LIMIT 1
+                    """,
+                    (target, max(1, int(max_lookback_days))),
+                )
+                row = cur.fetchone()
+        if not row:
+            return {}
+        payload = dict(row)
+        if str(payload.get("schema_hash") or "") != SCHEMA_HASH:
+            raise RuntimeError("schema_hash_mismatch_feature_matrix")
+        vals = payload.get("values") if isinstance(payload.get("values"), list) else []
+        if len(vals) != FEATURE_DIM:
+            raise RuntimeError("feature_dim_mismatch_feature_matrix")
+        return {k: float(vals[i]) for i, k in enumerate(self.feature_keys)}
 
     def has_required_artifacts(self, *, target: str, model_name: str) -> bool:
-        sym = str(target or "").strip().upper()
-        if not sym:
+        _ = target
+        _ = model_name
+        try:
+            validate_manifest_dir(self.model_dir, expected_schema_hash=SCHEMA_HASH)
+            return True
+        except Exception:
             return False
-        model_router = self._get_model_router()
-        tab = model_router._load_liquid_tabular_model(sym)  # type: ignore[attr-defined]
-        if tab is None:
-            return False
-        if model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
-            if self._has_neural_artifact(target=sym, model_router=model_router):
-                return True
-            return not bool(self.require_neural_artifact)
-        return True
+
+    def _predict_sequence(self, *, symbol: str, horizon: str, as_of: datetime) -> Dict[str, Any]:
+        seq = fetch_sequence(
+            db_url=str(self.repo.db_url),
+            symbol=symbol,
+            end_ts=as_of,
+            lookback=self.lookback,
+        )
+        if str(seq["schema_hash"]) != SCHEMA_HASH:
+            raise RuntimeError("schema_hash_mismatch_sequence")
+        values = np.array(seq["values"], dtype=np.float32)
+        mask = np.array(seq["mask"], dtype=np.float32)
+        xv = torch.tensor(values, dtype=torch.float32).unsqueeze(0)
+        xm = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            pred, gate = self.model(xv, xm)
+        p = pred.squeeze(0).cpu().numpy().tolist()
+        g = float(gate.squeeze(0).item())
+        pred_map = {
+            "1h": float(p[0]),
+            "4h": float(p[1]),
+            "1d": float(p[2]),
+            "7d": float(p[3]),
+        }
+        conf_map = {k: float(max(0.01, min(0.99, 0.5 + abs(v) * 5.0))) for k, v in pred_map.items()}
+        vol_map = {k: float(max(1e-6, abs(v))) for k, v in pred_map.items()}
+        h = str(horizon or "1h").strip().lower()
+        if h not in pred_map:
+            h = "1h"
+        return {
+            "expected_return": float(pred_map[h]),
+            "signal_confidence": float(conf_map[h]),
+            "vol_forecast": float(vol_map[h]),
+            "expected_return_horizons": pred_map,
+            "signal_confidence_horizons": conf_map,
+            "vol_forecast_horizons": vol_map,
+            "stack": {
+                "model_id": str(self.manifest.get("model_id") or "liquid_main"),
+                "gate": float(g),
+                "coverage_summary": dict(seq.get("coverage_summary") or {}),
+                "schema_hash": SCHEMA_HASH,
+            },
+            "model_name": str(self.manifest.get("model_id") or self.default_model_name),
+            "model_version": str(self.default_model_version),
+            "degraded": False,
+            "degraded_reasons": [],
+        }
 
     def predict_from_feature_payload(
         self,
@@ -144,67 +200,12 @@ class LiquidModelService:
         model_version: Optional[str] = None,
         require_artifact: bool = True,
     ) -> Dict[str, Any]:
-        sym = str(target or "").strip().upper()
-        if not sym:
-            raise RuntimeError("target_required")
-        if not isinstance(payload, dict) or not payload:
-            raise RuntimeError(f"feature_payload_unavailable:{sym}")
-        use_model_name = str(model_name or "").strip()
-        use_model_version = str(model_version or "").strip()
-        if not use_model_name or not use_model_version:
-            use_model_name, use_model_version = self._active_liquid_model(symbol=sym, horizon=horizon)
-        if require_artifact and not self.has_required_artifacts(target=sym, model_name=use_model_name):
-            if use_model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
-                if not self.has_required_artifacts(target=sym, model_name="liquid_baseline"):
-                    raise RuntimeError(f"model_artifact_missing:tabular:{sym}")
-                raise RuntimeError(f"model_artifact_missing:neural:{sym}")
-            raise RuntimeError(f"model_artifact_missing:tabular:{sym}")
-        model_router = self._get_model_router()
-        vec = self._feature_vector_from_payload(payload)
-        out = model_router.predict_liquid(sym, vec, model_name=use_model_name)
-        horizon_key = str(horizon).strip().lower() or "1h"
-        expected_map = out.get("expected_return_horizons") if isinstance(out.get("expected_return_horizons"), dict) else {}
-        conf_map = out.get("signal_confidence_horizons") if isinstance(out.get("signal_confidence_horizons"), dict) else {}
-        vol_map = out.get("vol_forecast_horizons") if isinstance(out.get("vol_forecast_horizons"), dict) else {}
-        if not expected_map:
-            expected_map = {"1h": float(out.get("expected_return") or 0.0)}
-        if not conf_map:
-            conf_map = {"1h": float(out.get("signal_confidence") or 0.0)}
-        if not vol_map:
-            vol_map = {"1h": float(out.get("vol_forecast") or 0.0)}
-        if horizon_key not in expected_map:
-            horizon_key = "1h" if "1h" in expected_map else sorted(expected_map.keys())[0]
-        expected_return = float(expected_map.get(horizon_key, 0.0) or 0.0)
-        signal_confidence = float(conf_map.get(horizon_key, 0.0) or 0.0)
-        vol_forecast = float(vol_map.get(horizon_key, 0.0) or 0.0)
-        stack = out.get("stack") if isinstance(out.get("stack"), dict) else {}
-        stack = {
-            **stack,
-            "expected_return_horizons": {str(k): float(v) for k, v in expected_map.items()},
-            "signal_confidence_horizons": {str(k): float(v) for k, v in conf_map.items()},
-            "vol_forecast_horizons": {str(k): float(v) for k, v in vol_map.items()},
-            "selected_horizon": horizon_key,
-        }
-        degraded_reasons: List[str] = []
-        if use_model_name in {"liquid_ttm_ensemble", "liquid_ttm"}:
-            neural_present = self._has_neural_artifact(target=sym, model_router=model_router)
-            stack = {**stack, "neural_artifact_present": bool(neural_present)}
-            if (not neural_present) and (not self.require_neural_artifact):
-                degraded_reasons.append("neural_artifact_missing_tabular_fallback")
-        degraded = bool(degraded_reasons)
-        return {
-            "expected_return": float(expected_return),
-            "signal_confidence": float(signal_confidence),
-            "vol_forecast": float(vol_forecast),
-            "expected_return_horizons": {str(k): float(v) for k, v in expected_map.items()},
-            "signal_confidence_horizons": {str(k): float(v) for k, v in conf_map.items()},
-            "vol_forecast_horizons": {str(k): float(v) for k, v in vol_map.items()},
-            "stack": stack,
-            "model_name": use_model_name,
-            "model_version": use_model_version,
-            "degraded": degraded,
-            "degraded_reasons": degraded_reasons,
-        }
+        # Strict mode: online inference must come from feature_matrix_main sequence.
+        _ = payload
+        _ = model_name
+        _ = model_version
+        _ = require_artifact
+        return self._predict_sequence(symbol=str(target or "").upper(), horizon=horizon, as_of=self._utcnow())
 
     def predict_with_context(self, *, symbol: str, horizon: str) -> Dict[str, Any]:
         target = str(symbol or "").strip().upper()
@@ -213,16 +214,13 @@ class LiquidModelService:
         price_row = self.repo.latest_price_snapshot(target)
         if not price_row:
             raise HTTPException(status_code=404, detail=f"no price snapshot for {target}")
-        payload = self.latest_feature_payload(target, max_lookback_days=30)
-        if not payload:
-            raise HTTPException(status_code=424, detail=f"feature_payload_unavailable:{target}")
+
         try:
-            pred = self.predict_from_feature_payload(target=target, payload=payload, horizon=horizon, require_artifact=True)
+            pred = self._predict_sequence(symbol=target, horizon=horizon, as_of=self._utcnow())
         except RuntimeError as exc:
-            detail = str(exc)
-            if detail.startswith("model_artifact_missing:"):
-                raise HTTPException(status_code=503, detail=detail) from exc
-            raise HTTPException(status_code=500, detail=detail) from exc
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        payload = self.latest_feature_payload(target, max_lookback_days=30)
         context = self.repo.recent_event_context(target, limit=8)
         explanation = {
             "top_event_contributors": [
@@ -237,11 +235,7 @@ class LiquidModelService:
             "top_feature_contributors": [
                 {"feature": "ret_12", "value": round(float(payload.get("ret_12", 0.0)), 6), "contribution": round(float(payload.get("ret_12", 0.0)), 6)},
                 {"feature": "vol_12", "value": round(float(payload.get("vol_12", 0.0)), 6), "contribution": round(-abs(float(payload.get("vol_12", 0.0))), 6)},
-                {
-                    "feature": "orderbook_imbalance",
-                    "value": round(float(payload.get("orderbook_imbalance", 0.0)), 6),
-                    "contribution": round(float(payload.get("orderbook_imbalance", 0.0)) * 0.5, 6),
-                },
+                {"feature": "orderbook_imbalance", "value": round(float(payload.get("orderbook_imbalance", 0.0)), 6), "contribution": round(float(payload.get("orderbook_imbalance", 0.0)) * 0.5, 6)},
             ],
             "evidence_links": [str(e.get("source_url") or "") for e in context if str(e.get("source_url") or "").strip()][:5],
             "model_version": f"{pred['model_name']}:{pred['model_version']}",
@@ -261,8 +255,8 @@ class LiquidModelService:
             "model_version": pred["model_version"],
             "score_source": "model",
             "stack": pred["stack"],
-            "degraded": bool(pred.get("degraded", False)),
-            "degraded_reasons": list(pred.get("degraded_reasons") or []),
+            "degraded": False,
+            "degraded_reasons": [],
         }
         return {
             "target": target,

@@ -349,16 +349,17 @@ def _upsert_funding_rows(
                 cur,
                 """
                 INSERT INTO funding_rates (
-                    symbol, ts, funding_rate, next_funding_ts, source, created_at
+                    symbol, ts, funding_rate, next_funding_ts, source, is_synthetic, created_at
                 ) VALUES %s
                 ON CONFLICT (symbol, ts)
                 DO UPDATE SET
                     funding_rate = EXCLUDED.funding_rate,
                     next_funding_ts = EXCLUDED.next_funding_ts,
-                    source = EXCLUDED.source
+                    source = EXCLUDED.source,
+                    is_synthetic = EXCLUDED.is_synthetic
                 """,
                 values,
-                template="(%s,%s,%s,%s,%s,NOW())",
+                template="(%s,%s,%s,%s,%s,FALSE,NOW())",
                 page_size=max(200, int(batch_size)),
             )
             inserted += len(values)
@@ -395,11 +396,11 @@ def _insert_onchain_rows(
                 cur,
                 """
                 INSERT INTO onchain_signals (
-                    asset_symbol, chain, ts, metric_name, metric_value, source, created_at
+                    asset_symbol, chain, ts, metric_name, metric_value, source, is_synthetic, created_at
                 ) VALUES %s
                 """,
                 values,
-                template="(%s,%s,%s,%s,%s,%s,NOW())",
+                template="(%s,%s,%s,%s,%s,%s,FALSE,NOW())",
                 page_size=max(200, int(batch_size)),
             )
             inserted += len(values)
@@ -421,7 +422,7 @@ def _fill_missing_onchain_from_market_bars(
         cur.execute(
             """
             INSERT INTO onchain_signals (
-                asset_symbol, chain, ts, metric_name, metric_value, source, created_at
+                asset_symbol, chain, ts, metric_name, metric_value, source, is_synthetic, created_at
             )
             SELECT
                 mb.symbol AS asset_symbol,
@@ -430,6 +431,7 @@ def _fill_missing_onchain_from_market_bars(
                 %s AS metric_name,
                 ((mb.close - mb.open) * GREATEST(0.0, mb.volume))::double precision AS metric_value,
                 %s AS source,
+                TRUE AS is_synthetic,
                 NOW()
             FROM market_bars mb
             LEFT JOIN onchain_signals os
@@ -555,6 +557,9 @@ def main() -> int:
 
     with psycopg2.connect(args.database_url) as conn:
         conn.autocommit = False
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE funding_rates ADD COLUMN IF NOT EXISTS is_synthetic BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("ALTER TABLE onchain_signals ADD COLUMN IF NOT EXISTS is_synthetic BOOLEAN NOT NULL DEFAULT FALSE")
         for sym in symbols:
             pair = symbol_map.get(sym, f"{sym}USDT")
             sym_summary: Dict[str, Any] = {"pair": pair, "warnings": []}

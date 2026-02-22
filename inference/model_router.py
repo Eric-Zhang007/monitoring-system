@@ -130,12 +130,9 @@ class ModelRouter:
     @staticmethod
     def _align_features(features: np.ndarray, in_dim: int) -> np.ndarray:
         x = np.array(features, dtype=np.float32).reshape(-1)
-        if x.shape[0] == in_dim:
-            return x
-        if x.shape[0] > in_dim:
-            return x[:in_dim]
-        pad = np.zeros((in_dim - x.shape[0],), dtype=np.float32)
-        return np.concatenate([x, pad], axis=0)
+        if x.shape[0] != int(in_dim):
+            raise ValueError(f"feature_dim_mismatch:actual={x.shape[0]}:expected={int(in_dim)}")
+        return x
 
     @staticmethod
     def _normalize_features(features: np.ndarray, normalization: object) -> np.ndarray:
@@ -151,20 +148,7 @@ class ModelRouter:
 
     @staticmethod
     def _to_sequence(features: np.ndarray, n_tokens: int | None = None, n_channels: int | None = None) -> np.ndarray:
-        x = np.array(features, dtype=np.float32).reshape(-1)
-        if n_tokens is not None and n_channels is not None:
-            tok = max(1, int(n_tokens))
-            ch = max(1, int(n_channels))
-        else:
-            ch = max(1, int(os.getenv("LIQUID_SEQUENCE_CHANNELS", "5")))
-            tok = int(max(1, int(np.ceil(float(x.shape[0]) / float(ch)))))
-        target_dim = tok * ch
-        if x.shape[0] < target_dim:
-            pad = np.zeros((target_dim - x.shape[0],), dtype=np.float32)
-            x = np.concatenate([x, pad], axis=0)
-        elif x.shape[0] > target_dim:
-            x = x[:target_dim]
-        return x.reshape(1, tok, ch).astype(np.float32)
+        raise RuntimeError("pseudo_sequence_reshape_forbidden")
 
     @staticmethod
     def _sigmoid_scalar(x: float) -> float:

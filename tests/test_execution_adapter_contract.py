@@ -3,7 +3,16 @@ from __future__ import annotations
 from execution_engine import ExecutionEngine
 
 
-REQUIRED_METHODS = ("prepare", "submit_order", "poll_order", "cancel_order", "fetch_fills", "fetch_positions")
+REQUIRED_METHODS = (
+    "prepare",
+    "submit_order",
+    "poll_order",
+    "cancel_order",
+    "fetch_fills",
+    "fetch_balances",
+    "fetch_positions",
+    "fetch_open_orders",
+)
 
 
 def test_all_adapters_implement_contract_methods():

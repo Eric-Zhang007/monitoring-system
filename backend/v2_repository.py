@@ -9,12 +9,13 @@ from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from psycopg2.pool import ThreadedConnectionPool
 
 from artifacts.validate import validate_manifest_dir
-from repository_modules import backtest_store, execution_oms_store, execution_store
+from repository_modules import account_state_store, backtest_store, execution_oms_store, execution_store
 from schemas_v2 import Event
 
 
@@ -1321,6 +1322,169 @@ class V2Repository:
                         """
                     )
                 return [dict(r) for r in cur.fetchall()]
+
+    def upsert_balance_state(
+        self,
+        *,
+        ts: datetime,
+        venue: str,
+        cash: float,
+        equity: float,
+        free_margin: float,
+        used_margin: float,
+        margin_ratio: float,
+        account_currency: str = "USD",
+        raw: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        account_state_store.upsert_balances(
+            self._connect,
+            ts=ts,
+            venue=venue,
+            cash=cash,
+            equity=equity,
+            free_margin=free_margin,
+            used_margin=used_margin,
+            margin_ratio=margin_ratio,
+            account_currency=account_currency,
+            raw=raw,
+        )
+
+    def upsert_position_state(
+        self,
+        *,
+        ts: datetime,
+        venue: str,
+        symbol: str,
+        qty: float,
+        avg_cost: float,
+        liq_price: Optional[float] = None,
+        unrealized_pnl: float = 0.0,
+        realized_pnl: float = 0.0,
+        leverage: float = 1.0,
+        margin_mode: str = "cross",
+        position_mode: str = "one_way",
+        raw: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        account_state_store.upsert_positions(
+            self._connect,
+            ts=ts,
+            venue=venue,
+            symbol=symbol,
+            qty=qty,
+            avg_cost=avg_cost,
+            liq_price=liq_price,
+            unrealized_pnl=unrealized_pnl,
+            realized_pnl=realized_pnl,
+            leverage=leverage,
+            margin_mode=margin_mode,
+            position_mode=position_mode,
+            raw=raw,
+        )
+
+    def insert_account_state_snapshot(
+        self,
+        *,
+        ts: datetime,
+        venue: str,
+        adapter: str,
+        equity: float,
+        free_margin: float,
+        margin_ratio: float,
+        raw_state: Dict[str, Any],
+    ) -> int:
+        return account_state_store.insert_snapshot(
+            self._connect,
+            ts=ts,
+            venue=venue,
+            adapter=adapter,
+            equity=equity,
+            free_margin=free_margin,
+            margin_ratio=margin_ratio,
+            raw_state=raw_state,
+        )
+
+    def insert_decision_trace(self, trace: Dict[str, Any]) -> int:
+        return account_state_store.insert_decision_trace(self._connect, trace)
+
+    def latest_balance_state(self, venue: str) -> Dict[str, Any]:
+        return account_state_store.latest_balance(self._connect, venue=venue)
+
+    def latest_positions_state(self, venue: str) -> List[Dict[str, Any]]:
+        return account_state_store.latest_positions(self._connect, venue=venue)
+
+    def recent_decision_traces(self, symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
+        return account_state_store.recent_decision_traces(self._connect, symbol=symbol, limit=limit)
+
+    def list_open_orders_live(self, venue: str, adapter: str, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT c.*
+                    FROM execution_child_orders c
+                    JOIN execution_decisions d ON d.decision_id = c.decision_id
+                    WHERE d.venue = %s
+                      AND d.adapter = %s
+                      AND c.status IN ('submitted', 'partially_filled')
+                    ORDER BY c.updated_at DESC, c.id DESC
+                    LIMIT %s
+                    """,
+                    (str(venue), str(adapter), int(limit)),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def recent_execution_stats(self, venue: str, lookback_minutes: int = 5) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        c.status,
+                        c.submitted_at,
+                        f.fill_ts,
+                        f.price,
+                        o.est_price
+                    FROM execution_child_orders c
+                    JOIN execution_decisions d ON d.decision_id = c.decision_id
+                    LEFT JOIN execution_fills f ON f.child_order_id = c.id
+                    LEFT JOIN orders_sim o ON o.id = c.parent_order_id
+                    WHERE d.venue = %s
+                      AND c.updated_at >= NOW() - make_interval(mins => %s)
+                    ORDER BY c.id ASC, f.fill_ts ASC
+                    """,
+                    (str(venue), max(1, int(lookback_minutes))),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+
+        slips: List[float] = []
+        latencies: List[float] = []
+        total_orders = 0
+        rejected = 0
+        seen = set()
+        for r in rows:
+            key = (r.get("submitted_at"), r.get("status"), r.get("est_price"))
+            if key not in seen:
+                seen.add(key)
+                total_orders += 1
+                if str(r.get("status") or "").lower() == "rejected":
+                    rejected += 1
+            est = float(r.get("est_price") or 0.0)
+            px = float(r.get("price") or 0.0)
+            if est > 0 and px > 0:
+                slips.append(abs((px - est) / est) * 10000.0)
+            submitted = r.get("submitted_at")
+            fill_ts = r.get("fill_ts")
+            if isinstance(submitted, datetime) and isinstance(fill_ts, datetime):
+                latencies.append(max(0.0, (fill_ts - submitted).total_seconds()))
+        slips_np = np.array(slips, dtype=np.float64) if slips else np.array([], dtype=np.float64)
+        lats_np = np.array(latencies, dtype=np.float64) if latencies else np.array([], dtype=np.float64)
+        return {
+            "slippage_bps_p50": float(np.quantile(slips_np, 0.5)) if slips else 0.0,
+            "slippage_bps_p90": float(np.quantile(slips_np, 0.9)) if slips else 0.0,
+            "reject_rate_5m": float(rejected / max(1, total_orders)),
+            "fill_latency_p50": float(np.quantile(lats_np, 0.5)) if latencies else 0.0,
+            "last_fill_ts": max((r.get("fill_ts") for r in rows if isinstance(r.get("fill_ts"), datetime)), default=None),
+        }
 
     def list_open_child_orders_live(self, max_age_sec: Optional[int] = None) -> List[Dict[str, Any]]:
         params: List[Any] = []

@@ -28,5 +28,13 @@ class ExecutionAdapterBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def fetch_balances(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def fetch_open_orders(self) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
     def fetch_positions(self) -> List[Dict[str, Any]]:
         raise NotImplementedError

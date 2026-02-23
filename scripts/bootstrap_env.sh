@@ -6,10 +6,27 @@ cd "$ROOT_DIR"
 
 PROFILE="${PROFILE:-all}" # runtime|train|dev|all
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+ALLOW_NON_312="${ALLOW_NON_312:-0}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  echo "[FAIL] python executable not found: $PYTHON_BIN"
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  else
+    echo "[FAIL] python executable not found: $PYTHON_BIN"
+    exit 2
+  fi
+fi
+
+PY_VER="$("$PYTHON_BIN" - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+
+if [[ "$PY_VER" != "3.12" && "$ALLOW_NON_312" != "1" ]]; then
+  echo "[FAIL] python version must be 3.12.x for reproducible runtime. got: $PY_VER"
+  echo "set PYTHON_BIN=python3.12 or set ALLOW_NON_312=1 to bypass"
   exit 2
 fi
 

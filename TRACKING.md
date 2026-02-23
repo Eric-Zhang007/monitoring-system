@@ -1,22 +1,27 @@
 # Tracking
 
-## 当前文档状态（2026-02-22）
+## 当前状态（2026-02-22）
 
-1. 文档已按代码现实合并精简，主入口为：
-   - `README.md`
-   - `TRAINING_PIPELINES_SUMMARY_ZH.md`
-2. 以下文档已并入上述两份并移除：
-   - `PRODUCTION_READINESS_CHECKLIST.md`
-   - `MULTIMODAL_UPGRADE_PLAN_ZH.md`
-   - `SERVER_PREP_PLAN_ZH.md`
-   - `REPOSITORY_ARCHITECTURE_GUIDE_ZH.md`
-   - `SYSTEM_REMEDIATION_BLUEPRINT.md`
-   - `SYSTEM_REMEDIATION_BLUEPRINT_ZH.md`
-3. 历史冻结记录保留在：
-   - `baseline_snapshots/BASELINE_FREEZE_2026-02-19_ZH.md`
+1. 主链路为 strict-only：无灰度、无 silent fallback。
+2. 端到端关键链路（执行 + 训练工件 + 推理 parity）本地可跑通。
+3. 服务器建议按 `docs/DEPLOYMENT_QUICKSTART_ZH.md` 执行最小配置上线。
 
-## 当前工程判断
+## 文档入口
 
-1. 主链路已切到 strict 契约（单一 schema、无 pad/truncate、无 fallback、序列 parity）。
-2. 当前测试状态：`pytest -q` => `211 passed, 2 skipped`（2026-02-22）。
-3. 运行时仍需准备 `torch` 与文本 embedding 模型文件，缺失时会按规则 fail-fast。
+1. 总览：`README.md`
+2. 规则：`docs/PRODUCTION_REFACTOR_RULES.md`
+3. Pipeline：`docs/STRICT_PIPELINE_ZH.md`
+4. 部署：`docs/DEPLOYMENT_QUICKSTART_ZH.md`
+
+<!-- AUTO_STATUS_SNAPSHOT:BEGIN -->
+### Auto Snapshot
+- track: `liquid`
+- score_source: `model`
+- sharpe: `n/a`
+- max_drawdown: `n/a`
+- execution_reject_rate: `n/a`
+- hard_passed: `false`
+- parity_status: `unknown`
+- parity_matched_targets: `0`
+- parity_paper_filled_orders: `0`
+<!-- AUTO_STATUS_SNAPSHOT:END -->

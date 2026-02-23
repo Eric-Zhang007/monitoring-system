@@ -4,13 +4,23 @@ from __future__ import annotations
 import argparse
 import os
 import time
+import sys
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+ROOT = Path(__file__).resolve().parents[1]
+for p in (ROOT, ROOT / "backend"):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
 from execution_engine import ExecutionEngine
 from v2_repository import V2Repository
-from metrics import EXEC_RECON_DRIFT_EVENTS_TOTAL
+try:
+    from backend.metrics import EXEC_RECON_DRIFT_EVENTS_TOTAL
+except Exception:
+    from metrics import EXEC_RECON_DRIFT_EVENTS_TOTAL
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -56,7 +66,14 @@ def _position_diff_usd(repo: V2Repository, venue: str, remote: List[Dict[str, An
     return float(diff_total), {"venue": venue, "by_symbol_usd": by_symbol, "checked_at": _now_iso()}
 
 
-def run_once(repo: V2Repository, engine: ExecutionEngine, max_age_sec: int, pos_diff_usd_max: float, fail_triggers_kill: bool) -> Dict[str, Any]:
+def run_once(
+    repo: V2Repository,
+    engine: ExecutionEngine,
+    max_age_sec: int,
+    pos_diff_usd_max: float,
+    fail_triggers_kill: bool,
+    fails_to_red: int = 2,
+) -> Dict[str, Any]:
     pending = repo.list_open_child_orders_live(max_age_sec=max_age_sec)
     by_adapter: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for row in pending:
@@ -64,6 +81,7 @@ def run_once(repo: V2Repository, engine: ExecutionEngine, max_age_sec: int, pos_
 
     actions: List[Dict[str, Any]] = []
     fail_count = 0
+    by_adapter_failures: Dict[str, int] = defaultdict(int)
     for adapter_name, rows in by_adapter.items():
         adapter = engine.adapters.get(adapter_name)
         if adapter is None:
@@ -97,6 +115,7 @@ def run_once(repo: V2Repository, engine: ExecutionEngine, max_age_sec: int, pos_
                 )
             except Exception as exc:
                 fail_count += 1
+                by_adapter_failures[adapter_name] += 1
                 actions.append(
                     {
                         "action": "poll_failed",
@@ -126,6 +145,16 @@ def run_once(repo: V2Repository, engine: ExecutionEngine, max_age_sec: int, pos_
             status = "drift_exceeded"
             drift_events += 1
             EXEC_RECON_DRIFT_EVENTS_TOTAL.labels(venue=venue).inc()
+            try:
+                repo.save_risk_event(
+                    decision_id=f"recon-{venue}-{_now_iso()}",
+                    severity="critical",
+                    code="reconciliation_positions_drift_exceeded",
+                    message=f"positions diff exceeded threshold for {venue}",
+                    payload={"venue": venue, "diff_usd": diff_usd, "threshold": pos_diff_usd_max},
+                )
+            except Exception:
+                pass
             if fail_triggers_kill:
                 repo.upsert_kill_switch_state(
                     track="liquid",
@@ -146,7 +175,18 @@ def run_once(repo: V2Repository, engine: ExecutionEngine, max_age_sec: int, pos_
             error=None,
         )
 
-    if fail_count > 0 and fail_triggers_kill:
+    if fail_count > 0:
+        try:
+            repo.save_risk_event(
+                decision_id=f"recon-global-{_now_iso()}",
+                severity="warning",
+                code="reconciliation_poll_failures",
+                message="poll failures during reconciliation",
+                payload={"failures": fail_count, "by_adapter": dict(by_adapter_failures)},
+            )
+        except Exception:
+            pass
+    if fail_count >= max(1, int(fails_to_red)) and fail_triggers_kill:
         repo.upsert_kill_switch_state(
             track="liquid",
             strategy_id="global",
@@ -162,6 +202,7 @@ def run_once(repo: V2Repository, engine: ExecutionEngine, max_age_sec: int, pos_
         "actions": len(actions),
         "poll_failures": fail_count,
         "drift_events": drift_events,
+        "fails_to_red": int(fails_to_red),
     }
 
 
@@ -177,14 +218,29 @@ def main() -> int:
     max_age_sec = int(float(os.getenv("RECON_OPEN_ORDERS_MAX_AGE_SEC", "300") or 300))
     pos_diff_usd_max = float(os.getenv("RECON_POS_DIFF_USD_MAX", "100.0") or 100.0)
     fail_triggers_kill = _env_flag("RECON_FAILS_TRIGGER_KILL_SWITCH", "1")
+    fails_to_red = int(float(os.getenv("RECON_FAILS_TO_RED", "2") or 2))
 
     if args.loop:
         while True:
-            out = run_once(repo, engine, max_age_sec=max_age_sec, pos_diff_usd_max=pos_diff_usd_max, fail_triggers_kill=fail_triggers_kill)
+            out = run_once(
+                repo,
+                engine,
+                max_age_sec=max_age_sec,
+                pos_diff_usd_max=pos_diff_usd_max,
+                fail_triggers_kill=fail_triggers_kill,
+                fails_to_red=fails_to_red,
+            )
             print(out, flush=True)
             time.sleep(max(1.0, float(args.interval_sec)))
     else:
-        out = run_once(repo, engine, max_age_sec=max_age_sec, pos_diff_usd_max=pos_diff_usd_max, fail_triggers_kill=fail_triggers_kill)
+        out = run_once(
+            repo,
+            engine,
+            max_age_sec=max_age_sec,
+            pos_diff_usd_max=pos_diff_usd_max,
+            fail_triggers_kill=fail_triggers_kill,
+            fails_to_red=fails_to_red,
+        )
         print(out, flush=True)
     return 0
 

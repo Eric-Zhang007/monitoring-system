@@ -4,7 +4,7 @@
 
 1. 本文件是历史快照，作用是追溯当时冻结状态。
 2. 快照中的维度与工件情况不代表当前代码真实状态。
-3. 当前真实状态请看：`TRAINING_PIPELINES_SUMMARY_ZH.md`。
+3. 当前真实状态请看：`docs/STRICT_PIPELINE_ZH.md`。
 
 ## 冻结命令
 

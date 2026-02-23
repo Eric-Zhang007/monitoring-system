@@ -477,6 +477,77 @@ CREATE TABLE IF NOT EXISTS risk_events (
 CREATE INDEX IF NOT EXISTS idx_risk_events_decision_time ON risk_events(decision_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_risk_events_severity_time ON risk_events(severity, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS account_state_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL,
+    venue VARCHAR(64) NOT NULL,
+    adapter VARCHAR(32) NOT NULL,
+    equity DOUBLE PRECISION NOT NULL DEFAULT 0,
+    free_margin DOUBLE PRECISION NOT NULL DEFAULT 0,
+    margin_ratio DOUBLE PRECISION NOT NULL DEFAULT 0,
+    raw JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_account_state_snapshots_venue_ts ON account_state_snapshots(venue, ts DESC);
+
+CREATE TABLE IF NOT EXISTS balances_state (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL,
+    venue VARCHAR(64) NOT NULL,
+    cash DOUBLE PRECISION NOT NULL DEFAULT 0,
+    equity DOUBLE PRECISION NOT NULL DEFAULT 0,
+    free_margin DOUBLE PRECISION NOT NULL DEFAULT 0,
+    used_margin DOUBLE PRECISION NOT NULL DEFAULT 0,
+    margin_ratio DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_currency VARCHAR(16) NOT NULL DEFAULT 'USD',
+    raw JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (venue, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_balances_state_venue_ts ON balances_state(venue, ts DESC);
+
+CREATE TABLE IF NOT EXISTS positions_state (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL,
+    venue VARCHAR(64) NOT NULL,
+    symbol VARCHAR(32) NOT NULL,
+    qty DOUBLE PRECISION NOT NULL DEFAULT 0,
+    avg_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+    liq_price DOUBLE PRECISION,
+    unrealized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+    realized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+    leverage DOUBLE PRECISION NOT NULL DEFAULT 1,
+    margin_mode VARCHAR(16) NOT NULL DEFAULT 'cross',
+    position_mode VARCHAR(16) NOT NULL DEFAULT 'one_way',
+    raw JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (venue, symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_positions_state_venue_symbol_ts ON positions_state(venue, symbol, ts DESC);
+
+CREATE TABLE IF NOT EXISTS decision_traces (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    decision_id VARCHAR(64) NOT NULL,
+    symbol VARCHAR(32) NOT NULL,
+    action VARCHAR(16) NOT NULL,
+    target_pos DOUBLE PRECISION NOT NULL DEFAULT 0,
+    delta_pos DOUBLE PRECISION NOT NULL DEFAULT 0,
+    exec_style VARCHAR(32) NOT NULL DEFAULT 'marketable_limit',
+    deadline_s INTEGER NOT NULL DEFAULT 0,
+    slices INTEGER NOT NULL DEFAULT 1,
+    mu JSONB DEFAULT '{}'::jsonb,
+    sigma JSONB DEFAULT '{}'::jsonb,
+    direction_prob JSONB DEFAULT '{}'::jsonb,
+    cost JSONB DEFAULT '{}'::jsonb,
+    risk JSONB DEFAULT '{}'::jsonb,
+    account JSONB DEFAULT '{}'::jsonb,
+    reason_codes JSONB DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_decision_traces_symbol_ts ON decision_traces(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_traces_decision_id ON decision_traces(decision_id, ts DESC);
+
 CREATE TABLE IF NOT EXISTS model_rollout_state (
     id BIGSERIAL PRIMARY KEY,
     track VARCHAR(16) NOT NULL UNIQUE,

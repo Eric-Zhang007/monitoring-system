@@ -33,6 +33,7 @@ pnpm-debug.log*
 
 # TypeScript
 *.tsbuildinfo
+frontend/vite.config.d.ts
 
 # IDE
 .vscode/

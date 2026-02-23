@@ -90,6 +90,8 @@ class PaperExecutionAdapter(ExecutionAdapterBase):
             snap = {
                 "client_order_id": client_order_id,
                 "venue_order_id": None,
+                "symbol": symbol,
+                "side": side,
                 "status": "rejected",
                 "requested_qty": qty,
                 "filled_qty": 0.0,
@@ -106,6 +108,8 @@ class PaperExecutionAdapter(ExecutionAdapterBase):
             snap = {
                 "client_order_id": client_order_id,
                 "venue_order_id": None,
+                "symbol": symbol,
+                "side": side,
                 "status": "rejected",
                 "requested_qty": qty,
                 "filled_qty": 0.0,
@@ -149,6 +153,8 @@ class PaperExecutionAdapter(ExecutionAdapterBase):
             snap = {
                 "client_order_id": client_order_id,
                 "venue_order_id": venue_order_id,
+                "symbol": symbol,
+                "side": side,
                 "status": "rejected",
                 "requested_qty": qty,
                 "filled_qty": 0.0,
@@ -186,6 +192,8 @@ class PaperExecutionAdapter(ExecutionAdapterBase):
         snap = {
             "client_order_id": client_order_id,
             "venue_order_id": venue_order_id,
+            "symbol": symbol,
+            "side": side,
             "status": status,
             "requested_qty": qty,
             "filled_qty": fill_qty,
@@ -231,6 +239,49 @@ class PaperExecutionAdapter(ExecutionAdapterBase):
 
     def fetch_fills(self, venue_order_id: str) -> List[Dict[str, Any]]:
         return list(self._fills_by_order.get(str(venue_order_id), []))
+
+    def fetch_balances(self) -> Dict[str, Any]:
+        cash = float(os.getenv("PAPER_CASH_USD", "100000") or 100000.0)
+        used_margin = 0.0
+        unrealized = 0.0
+        for row in self._positions.values():
+            qty = float(row.get("position_qty") or 0.0)
+            avg = float(row.get("avg_cost") or 0.0)
+            notional = abs(qty * avg)
+            used_margin += notional * float(os.getenv("PAPER_MARGIN_RATE", "0.1") or 0.1)
+        equity = cash + unrealized
+        free_margin = max(0.0, equity - used_margin)
+        margin_ratio = (equity / used_margin) if used_margin > 1e-9 else 999.0
+        return {
+            "cash": float(cash),
+            "equity": float(equity),
+            "free_margin": float(free_margin),
+            "used_margin": float(used_margin),
+            "margin_ratio": float(margin_ratio),
+            "account_currency": str(os.getenv("PAPER_ACCOUNT_CCY", "USD")).upper(),
+            "raw": {"adapter": "paper"},
+        }
+
+    def fetch_open_orders(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in self._orders.values():
+            st = str(row.get("status") or "").lower()
+            if st not in {"submitted", "partially_filled"}:
+                continue
+            out.append(
+                {
+                    "client_order_id": str(row.get("client_order_id") or ""),
+                    "venue_order_id": str(row.get("venue_order_id") or ""),
+                    "symbol": str(row.get("symbol") or ""),
+                    "side": str(row.get("side") or "buy"),
+                    "qty": float(row.get("requested_qty") or 0.0),
+                    "filled_qty": float(row.get("filled_qty") or 0.0),
+                    "status": st,
+                    "created_at": row.get("submitted_at"),
+                    "updated_at": row.get("submitted_at"),
+                }
+            )
+        return out
 
     def fetch_positions(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -578,6 +629,66 @@ class CoinbaseLiveAdapter(ExecutionAdapterBase):
                     "fee_currency": r.get("fee_currency"),
                     "liquidity_flag": r.get("liquidity_indicator"),
                     "raw": r,
+                }
+            )
+        return out
+
+    def fetch_balances(self) -> Dict[str, Any]:
+        code, body = self._request("GET", "/api/v3/brokerage/accounts")
+        if code >= 400:
+            return {"cash": 0.0, "equity": 0.0, "free_margin": 0.0, "used_margin": 0.0, "margin_ratio": 0.0, "account_currency": self.quote_currency, "raw": body}
+        accounts = body.get("accounts") if isinstance(body.get("accounts"), list) else []
+        equity = 0.0
+        cash = 0.0
+        for a in accounts:
+            if not isinstance(a, dict):
+                continue
+            ccy = str(a.get("currency") or "").upper()
+            avail = a.get("available_balance") if isinstance(a.get("available_balance"), dict) else {}
+            hold = a.get("hold") if isinstance(a.get("hold"), dict) else {}
+            qty = float(avail.get("value") or 0.0) + float(hold.get("value") or 0.0)
+            if ccy == self.quote_currency:
+                cash += qty
+                equity += qty
+        return {
+            "cash": float(cash),
+            "equity": float(equity),
+            "free_margin": float(cash),
+            "used_margin": 0.0,
+            "margin_ratio": 999.0 if cash > 0 else 0.0,
+            "account_currency": self.quote_currency,
+            "raw": {"accounts": accounts},
+        }
+
+    def fetch_open_orders(self) -> List[Dict[str, Any]]:
+        code, body = self._request("GET", "/api/v3/brokerage/orders/historical/batch", params={"limit": 100})
+        if code >= 400:
+            return []
+        rows = body.get("orders")
+        if not isinstance(rows, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            status = self._map_status(
+                str(r.get("status") or ""),
+                float(r.get("filled_size") or r.get("filled_quantity") or 0.0),
+                max(1e-12, float(r.get("base_size") or r.get("size") or 0.0)),
+            )
+            if status not in {"submitted", "partially_filled"}:
+                continue
+            out.append(
+                {
+                    "client_order_id": str(r.get("client_order_id") or ""),
+                    "venue_order_id": str(r.get("order_id") or r.get("id") or ""),
+                    "symbol": str(r.get("product_id") or ""),
+                    "side": str(r.get("side") or "").lower(),
+                    "qty": float(r.get("base_size") or r.get("size") or 0.0),
+                    "filled_qty": float(r.get("filled_size") or r.get("filled_quantity") or 0.0),
+                    "status": status,
+                    "created_at": r.get("created_time"),
+                    "updated_at": r.get("last_fill_time") or r.get("created_time"),
                 }
             )
         return out
@@ -1188,6 +1299,64 @@ class BitgetLiveAdapter(ExecutionAdapterBase):
                     "raw": r,
                 }
             )
+        return out
+
+    def fetch_balances(self) -> Dict[str, Any]:
+        cash = 0.0
+        equity = 0.0
+        raw: Dict[str, Any] = {}
+        code, body = self._request("GET", "/api/v2/spot/account/assets")
+        if code < 400 and str(body.get("code") or "00000") == "00000":
+            data = body.get("data")
+            rows = data if isinstance(data, list) else (data.get("assets") if isinstance(data, dict) else [])
+            if isinstance(rows, list):
+                raw["spot_assets"] = rows
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    coin = str(r.get("coin") or "").upper()
+                    avail = float(r.get("available") or r.get("availableAmount") or 0.0)
+                    frozen = float(r.get("frozen") or r.get("lock") or 0.0)
+                    qty = avail + frozen
+                    if coin == self.default_margin_coin:
+                        cash += qty
+                        equity += qty
+        free_margin = cash
+        used_margin = max(0.0, equity - free_margin)
+        margin_ratio = (equity / used_margin) if used_margin > 1e-9 else 999.0
+        return {
+            "cash": float(cash),
+            "equity": float(equity),
+            "free_margin": float(free_margin),
+            "used_margin": float(used_margin),
+            "margin_ratio": float(margin_ratio),
+            "account_currency": self.default_margin_coin,
+            "raw": raw,
+        }
+
+    def fetch_open_orders(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        code, body = self._request("GET", "/api/v2/spot/trade/unfilled-orders")
+        if code < 400 and str(body.get("code") or "00000") == "00000":
+            data = body.get("data")
+            rows = data if isinstance(data, list) else (data.get("orderList") if isinstance(data, dict) else [])
+            if isinstance(rows, list):
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    out.append(
+                        {
+                            "client_order_id": str(r.get("clientOid") or ""),
+                            "venue_order_id": str(r.get("orderId") or ""),
+                            "symbol": str(r.get("symbol") or ""),
+                            "side": str(r.get("side") or "").lower(),
+                            "qty": float(r.get("size") or 0.0),
+                            "filled_qty": float(r.get("baseVolume") or 0.0),
+                            "status": "submitted",
+                            "created_at": r.get("cTime"),
+                            "updated_at": r.get("uTime") or r.get("cTime"),
+                        }
+                    )
         return out
 
     def fetch_positions(self) -> List[Dict[str, Any]]:

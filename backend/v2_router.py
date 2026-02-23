@@ -67,9 +67,16 @@ from schemas_v2 import (
 )
 from features.feature_contract import FEATURE_KEYS as CONTRACT_FEATURE_KEYS
 from features.feature_contract import SCHEMA_VERSION as CONTRACT_SCHEMA_VERSION
+from account_state.aggregator import AccountStateAggregator
+from account_state.models import AccountHealth, AccountState, BalanceState, ExecutionStats
+from decision_trace.models import DecisionTrace
 from execution_engine import ExecutionEngine
 from execution_policy import build_execution_trace, resolve_order_execution_context
+from execution_style_selector import ExecutionStyleSelector
+from position_sizer import PositionSizer
 from portfolio_allocator import AllocatorSignal, allocate_targets
+from risk_manager import RiskManager
+from risk_state.models import RiskRegime
 from liquid_model_registry import get_candidate_model as get_liquid_candidate_model
 from liquid_model_registry import load_registry as load_liquid_registry
 from liquid_model_registry import promote_candidate as promote_liquid_candidate
@@ -175,6 +182,10 @@ def _init_repo() -> Any:
 
 repo = _init_repo()
 exec_engine = ExecutionEngine()
+_RISK_MANAGER = RiskManager()
+_POSITION_SIZER = PositionSizer()
+_STYLE_SELECTOR = ExecutionStyleSelector()
+_ACCOUNT_STATE_AGGREGATORS: Dict[Tuple[str, str], AccountStateAggregator] = {}
 DEFAULT_LIQUID_SYMBOLS = "BTC,ETH,SOL"
 LIQUID_FEATURE_KEYS: List[str] = list(CONTRACT_FEATURE_KEYS)
 _ROOT = Path(__file__).resolve().parents[1]
@@ -210,6 +221,64 @@ def _utcnow_iso_z() -> str:
 
 def _default_liquid_targets() -> List[str]:
     return [s.strip().upper() for s in os.getenv("LIQUID_SYMBOLS", DEFAULT_LIQUID_SYMBOLS).split(",") if s.strip()]
+
+
+def _get_account_state_aggregator(adapter_name: str, venue: str) -> Optional[AccountStateAggregator]:
+    key = (str(adapter_name), str(venue))
+    if key in _ACCOUNT_STATE_AGGREGATORS:
+        return _ACCOUNT_STATE_AGGREGATORS[key]
+    adapter = exec_engine.adapters.get(str(adapter_name))
+    if adapter is None:
+        return None
+    agg = AccountStateAggregator(
+        adapter=adapter,
+        venue=str(venue),
+        store=repo if hasattr(repo, "insert_account_state_snapshot") else None,
+        cache_ttl_s=max(1, int(float(os.getenv("ACCOUNT_STATE_TTL_SEC", "10") or 10))),
+    )
+    _ACCOUNT_STATE_AGGREGATORS[key] = agg
+    return agg
+
+
+def _get_account_state_for_signal() -> AccountState:
+    if not _env_flag("ENABLE_ACCOUNT_STATE_GUARD", "1"):
+        return AccountState(
+            health=AccountHealth(is_fresh=True, recon_ok=True, ws_ok=True, last_error="guard_disabled"),
+            balances=BalanceState(cash=0.0, equity=0.0, free_margin=1e9, used_margin=0.0, margin_ratio=999.0),
+            execution_stats=ExecutionStats(),
+        )
+    adapter_name = str(os.getenv("ACCOUNT_STATE_ADAPTER", "paper"))
+    venue = str(os.getenv("ACCOUNT_STATE_VENUE", "coinbase"))
+    agg = _get_account_state_aggregator(adapter_name=adapter_name, venue=venue)
+    if agg is None:
+        return AccountState(
+            venue=venue,
+            adapter=adapter_name,
+            health=AccountHealth(is_fresh=False, recon_ok=False, ws_ok=False, last_error="adapter_unavailable"),
+        )
+    try:
+        return agg.get_state(require_fresh=True)
+    except Exception:
+        try:
+            agg.refresh_full_state()
+            return agg.get_state(require_fresh=True)
+        except Exception as exc:
+            state = AccountState(
+                venue=venue,
+                adapter=adapter_name,
+                health=AccountHealth(is_fresh=False, recon_ok=False, ws_ok=False, last_error=str(exc)),
+            )
+            return state
+
+
+def _signal_market_snapshot(outputs: Dict[str, Any], selected_horizon: str) -> Dict[str, Any]:
+    vol_map = outputs.get("vol_forecast_horizons") if isinstance(outputs.get("vol_forecast_horizons"), dict) else {}
+    vol_now = float(vol_map.get(selected_horizon, vol_map.get("1h", outputs.get("vol_forecast", 0.0))) or 0.0)
+    return {
+        "realized_vol": float(max(0.0, vol_now)),
+        "vol_spike": bool(vol_now > float(os.getenv("VOL_SPIKE_THRESHOLD", "0.08") or 0.08)),
+        "adv_qty": float(outputs.get("adv_qty", 0.0) or 0.0),
+    }
 
 
 def _active_liquid_model() -> Tuple[str, str]:
@@ -2505,21 +2574,62 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
     score = float(pred["score"])
     confidence = float(pred["confidence"])
     pred_outputs = pred.get("outputs") if isinstance(pred.get("outputs"), dict) else {}
+    risk_state = None
+    account_state = None
+    order_intent: Dict[str, Any] = {}
+    style_cfg: Dict[str, Any] = {}
     if payload.track == "liquid":
         mh = _liquid_multi_horizon_signal(
             pred_outputs=pred_outputs,
             horizon=payload.horizon,
             cost_profile=payload.cost_profile,
         )
+        selected_h = str(mh.get("selected_horizon") or payload.horizon).lower()
         score = float(mh["score"])
         confidence = float(mh["confidence"])
-        action = str(mh["action"])
         predicted_score = float(score)
         predicted_conf = float(confidence)
+
+        account_state = _get_account_state_for_signal()
+        market_snapshot = _signal_market_snapshot(pred_outputs, selected_h)
+        risk_state = _RISK_MANAGER.evaluate(
+            account=account_state,
+            symbol=payload.target.upper(),
+            order_intent={"horizon": selected_h},
+            market_snapshot=market_snapshot,
+        )
+        _, band, order_intent = _POSITION_SIZER.compute_target_position(
+            pred={
+                "symbol": payload.target.upper(),
+                "mu": dict(mh.get("expected_return_horizons") or {}),
+                "sigma": dict(mh.get("vol_forecast_horizons") or {}),
+                "expected_return": float(score),
+                "vol_forecast": float((mh.get("vol_forecast_horizons") or {}).get(selected_h, 0.0) or 0.0),
+            },
+            cost_map=dict(mh.get("cost_horizons") or {}),
+            account=account_state,
+            risk_state=risk_state,
+            params={"symbol": payload.target.upper(), "horizon": selected_h},
+        )
+        order_intent["band"] = float(band)
+        style = _STYLE_SELECTOR.select_style(
+            order_intent=order_intent,
+            risk_state=risk_state,
+            market_snapshot=market_snapshot,
+            exec_stats=account_state.execution_stats,
+        )
+        style_cfg = dict(style or {})
+        if risk_state.regime == RiskRegime.RED or style is None:
+            action = "hold"
+            order_intent["action"] = "hold"
+            order_intent["qty"] = 0.0
+        else:
+            action = str(order_intent.get("action") or "hold")
     else:
         mh = {}
         predicted_score = float(pred_outputs.get("expected_return", score) or score)
         predicted_conf = float(pred_outputs.get("signal_confidence", confidence) or confidence)
+        action = "hold"
     divergence = abs(score - predicted_score) + abs(confidence - predicted_conf)
     SIGNAL_PREDICT_DIVERGENCE.labels(track=payload.track, target=payload.target.upper()).set(float(divergence))
     bucket = _strategy_bucket(payload.track, score, confidence, payload.target)
@@ -2538,6 +2648,8 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
     if payload.track == "liquid":
         if confidence < float(payload.min_confidence):
             action = "hold"
+        if risk_state is not None and risk_state.regime == RiskRegime.RED:
+            action = "hold"
     else:
         if confidence >= payload.min_confidence:
             if score > 0.01:
@@ -2546,6 +2658,49 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
                 action = "sell"
 
     reason = f"policy={payload.policy};model={model_name}:{model_version};score={round(score, 6)}"
+    if payload.track == "liquid" and risk_state is not None:
+        reason += f";risk={risk_state.regime.value}"
+        if risk_state.reason_codes:
+            reason += f";risk_reasons={','.join(sorted(set(risk_state.reason_codes))[:6])}"
+
+    if payload.track == "liquid" and hasattr(repo, "insert_decision_trace"):
+        try:
+            trace = DecisionTrace(
+                decision_id=decision_id,
+                symbol=payload.target.upper(),
+                action=action,
+                target_pos=float(order_intent.get("target_pos") or 0.0),
+                delta_pos=float(order_intent.get("delta_pos") or 0.0),
+                exec_style=str(style_cfg.get("style") or "marketable_limit"),
+                deadline_s=int(style_cfg.get("deadline_s") or 0),
+                slices=int(style_cfg.get("n_slices") or 1),
+                mu={str(k): float(v) for k, v in dict(mh.get("expected_return_horizons") or {}).items()},
+                sigma={str(k): float(v) for k, v in dict(mh.get("vol_forecast_horizons") or {}).items()},
+                direction_prob={str(k): float(v) for k, v in dict(mh.get("signal_confidence_horizons") or {}).items()},
+                cost={str(k): float(v) for k, v in dict(mh.get("cost_horizons") or {}).items()},
+                risk=(risk_state.model_dump(mode="json") if risk_state is not None else {}),
+                account=(account_state.summary() if account_state is not None else {}),
+                reason_codes=list(risk_state.reason_codes if risk_state is not None else []),
+            )
+            repo.insert_decision_trace(trace.model_dump(mode="json"))
+        except Exception:
+            pass
+    if payload.track == "liquid" and risk_state is not None and risk_state.regime == RiskRegime.RED and hasattr(repo, "save_risk_event"):
+        try:
+            repo.save_risk_event(
+                decision_id=decision_id,
+                severity="critical",
+                code="signal_blocked_by_risk",
+                message="signal blocked due to RED risk regime",
+                payload={
+                    "target": payload.target.upper(),
+                    "horizon": payload.horizon,
+                    "reason_codes": list(risk_state.reason_codes),
+                },
+            )
+        except Exception:
+            pass
+
     signal_id = repo.insert_signal_candidate(
         track=payload.track,
         target=payload.target.upper(),
@@ -2569,6 +2724,10 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
             "expected_return_horizons": dict(mh.get("expected_return_horizons") or {}),
             "signal_confidence_horizons": dict(mh.get("signal_confidence_horizons") or {}),
             "vol_forecast_horizons": dict(mh.get("vol_forecast_horizons") or {}),
+            "risk_state": (risk_state.model_dump(mode="json") if risk_state is not None else {}),
+            "account_state": (account_state.summary() if account_state is not None else {}),
+            "order_intent": dict(order_intent or {}),
+            "execution_style": dict(style_cfg or {}),
         },
     )
 

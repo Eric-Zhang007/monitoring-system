@@ -18,7 +18,7 @@ from features.feature_contract import FEATURE_DIM, FEATURE_INDEX, SCHEMA_HASH
 from models.liquid_model import DEFAULT_HORIZONS, DEFAULT_QUANTILES, LiquidModel, LiquidModelConfig
 from training.calibration.calibrate import build_calibration_bundle
 from training.datasets.liquid_sequence_dataset import HORIZONS, LiquidSequenceDataset, load_training_samples
-from training.losses.liquid_losses import compose_liquid_loss
+from training.losses.trading_losses import compose_liquid_loss
 from training.metrics.liquid_metrics import evaluate_liquid_metrics
 from training.splits.walkforward_purged import WalkForwardPurgedConfig, build_walkforward_purged_splits
 

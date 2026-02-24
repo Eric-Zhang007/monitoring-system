@@ -7,13 +7,14 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from artifacts.pack import pack_model_artifact
+from backend.v2_repository import V2Repository
+from mlops_artifacts.pack import pack_model_artifact
 from features.feature_contract import FEATURE_DIM, FEATURE_INDEX, SCHEMA_HASH
 from models.liquid_model import DEFAULT_HORIZONS, DEFAULT_QUANTILES, LiquidModel, LiquidModelConfig
 from training.calibration.calibrate import build_calibration_bundle
@@ -27,6 +28,8 @@ from training.splits.walkforward_purged import WalkForwardPurgedConfig, build_wa
 class TrainConfig:
     db_url: str
     symbols: List[str]
+    universe_track: str
+    use_universe_snapshot: bool
     start: datetime
     end: datetime
     lookback: int
@@ -70,6 +73,8 @@ def _build_cfg() -> TrainConfig:
     ap = argparse.ArgumentParser(description="Train strict liquid model with walk-forward purged validation")
     ap.add_argument("--database-url", default=os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor"))
     ap.add_argument("--symbols", default=os.getenv("LIQUID_SYMBOLS", "BTC,ETH,SOL"))
+    ap.add_argument("--universe-track", default=os.getenv("LIQUID_UNIVERSE_TRACK", "liquid"))
+    ap.add_argument("--use-universe-snapshot", type=int, default=int(os.getenv("LIQUID_USE_UNIVERSE_SNAPSHOT", "1")))
     ap.add_argument("--start", default=os.getenv("LIQUID_TRAIN_START", "2025-01-01T00:00:00Z"))
     ap.add_argument("--end", default=os.getenv("LIQUID_TRAIN_END", ""))
     ap.add_argument("--lookback", type=int, default=int(os.getenv("LIQUID_LOOKBACK", "96")))
@@ -99,6 +104,8 @@ def _build_cfg() -> TrainConfig:
     return TrainConfig(
         db_url=str(args.database_url),
         symbols=[s.strip().upper() for s in str(args.symbols).split(",") if s.strip()],
+        universe_track=str(args.universe_track).strip().lower() or "liquid",
+        use_universe_snapshot=bool(int(args.use_universe_snapshot)),
         start=_parse_dt(args.start),
         end=end,
         lookback=max(8, int(args.lookback)),
@@ -123,6 +130,72 @@ def _build_cfg() -> TrainConfig:
         step_days=max(1, int(args.step_days)),
         force_purged=bool(args.force_purged),
     )
+
+
+def _normalize_symbols(symbols: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for raw in symbols:
+        sym = str(raw or "").strip().upper()
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
+    out.sort()
+    return out
+
+
+def _resolve_training_universe(cfg: TrainConfig) -> Dict[str, Any]:
+    fallback = _normalize_symbols(cfg.symbols)
+    if not fallback:
+        raise RuntimeError("empty_fallback_symbols")
+    if not bool(cfg.use_universe_snapshot):
+        return {
+            "track": str(cfg.universe_track),
+            "as_of": cfg.start.isoformat(),
+            "symbols": fallback,
+            "source": "cli_symbols",
+            "universe_version": "manual",
+            "snapshot_at": None,
+        }
+
+    repo = V2Repository(cfg.db_url)
+    resolved = repo.resolve_asset_universe_asof(
+        track=str(cfg.universe_track),
+        as_of=cfg.start,
+        fallback_targets=fallback,
+    )
+    symbols = _normalize_symbols(list(resolved.get("symbols") or []))
+    if not symbols:
+        raise RuntimeError("resolved_universe_empty")
+    universe_version = str(resolved.get("universe_version") or "runtime_resolved")
+    source = str(resolved.get("source") or "snapshot")
+    repo.upsert_asset_universe_snapshot(
+        track=str(cfg.universe_track),
+        as_of=cfg.start,
+        symbols=symbols,
+        universe_version=universe_version,
+        source=source,
+    )
+    return {
+        "track": str(cfg.universe_track),
+        "as_of": cfg.start.isoformat(),
+        "symbols": symbols,
+        "source": source,
+        "universe_version": universe_version,
+        "snapshot_at": resolved.get("snapshot_at"),
+    }
+
+
+def _attach_universe_to_training_report(training_report: Dict[str, Any], universe_meta: Dict[str, Any]) -> None:
+    training_report["universe"] = {
+        "track": str(universe_meta.get("track") or "liquid"),
+        "source": str(universe_meta.get("source") or "unknown"),
+        "universe_version": str(universe_meta.get("universe_version") or "unknown"),
+        "snapshot_at": universe_meta.get("snapshot_at"),
+        "as_of": universe_meta.get("as_of"),
+        "symbols": list(universe_meta.get("symbols") or []),
+    }
 
 
 def _build_model(cfg: TrainConfig) -> LiquidModel:
@@ -300,9 +373,13 @@ def _avg_metrics(folds: List[Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str
 
 def main() -> int:
     cfg = _build_cfg()
+    universe_meta = _resolve_training_universe(cfg)
+    symbols_for_training = _normalize_symbols(list(universe_meta.get("symbols") or []))
+    if not symbols_for_training:
+        raise RuntimeError("training_universe_empty")
     samples = load_training_samples(
         db_url=cfg.db_url,
-        symbols=cfg.symbols,
+        symbols=symbols_for_training,
         start_ts=cfg.start,
         end_ts=cfg.end,
         lookback=cfg.lookback,
@@ -416,6 +493,7 @@ def main() -> int:
         "calibration": calibrator,
         "final_fit_loss": final_loss_trace,
     }
+    _attach_universe_to_training_report(training_report, universe_meta)
 
     state = {
         "state_dict": model.state_dict(),

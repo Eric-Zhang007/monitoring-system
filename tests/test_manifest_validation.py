@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from artifacts.validate import validate_manifest_dir
+from mlops_artifacts.validate import validate_manifest_dir
 from schema.schema_hash import compute_schema_hash
 
 

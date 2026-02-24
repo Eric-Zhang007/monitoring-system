@@ -10,7 +10,7 @@ from typing import Dict
 import numpy as np
 import torch
 
-from artifacts.validate import validate_manifest_dir
+from mlops_artifacts.validate import validate_manifest_dir
 from features.feature_contract import FEATURE_DIM, SCHEMA_HASH
 from inference.feature_reader import fetch_sequence
 from models.liquid_model import build_liquid_model_from_checkpoint

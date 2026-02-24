@@ -9,7 +9,7 @@ import numpy as np
 from fastapi import HTTPException
 import torch
 
-from artifacts.validate import validate_manifest_dir
+from mlops_artifacts.validate import validate_manifest_dir
 from vc.feature_spec import VC_FEATURE_KEYS, VC_SCHEMA_HASH, vector_from_context
 
 

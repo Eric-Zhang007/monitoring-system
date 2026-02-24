@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from artifacts.validate import validate_manifest_dir
+from mlops_artifacts.validate import validate_manifest_dir
 from features.feature_contract import FEATURE_DIM, FEATURE_KEYS, SCHEMA_HASH
 from training.datasets.liquid_sequence_dataset import SequenceSample
 
@@ -78,6 +78,8 @@ def test_strict_train_artifact_can_infer(monkeypatch, tmp_path: Path):
             "liquid_main",
             "--lookback",
             "16",
+            "--use-universe-snapshot",
+            "0",
             "--epochs",
             "1",
             "--batch-size",

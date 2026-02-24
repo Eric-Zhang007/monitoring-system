@@ -14,7 +14,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from psycopg2.pool import ThreadedConnectionPool
 
-from artifacts.validate import validate_manifest_dir
+from mlops_artifacts.validate import validate_manifest_dir
 from repository_modules import account_state_store, backtest_store, execution_oms_store, execution_store
 from schemas_v2 import Event
 
@@ -742,6 +742,51 @@ class V2Repository:
                         "style_bucket": style_bucket,
                     }
                 return out
+
+    def upsert_asset_universe_snapshot(
+        self,
+        *,
+        track: str,
+        as_of: datetime,
+        symbols: List[str],
+        universe_version: str,
+        source: str,
+    ) -> Dict[str, Any]:
+        normalized: List[str] = []
+        seen = set()
+        for raw in symbols:
+            sym = str(raw or "").strip().upper()
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            normalized.append(sym)
+        normalized.sort()
+        if not normalized:
+            raise ValueError("asset_universe_symbols_empty")
+        payload = {"symbols": normalized}
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO asset_universe_snapshots (
+                        track, as_of, universe_version, source, symbols_json, created_at
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb, NOW())
+                    ON CONFLICT (track, as_of, universe_version)
+                    DO UPDATE SET
+                        source = EXCLUDED.source,
+                        symbols_json = EXCLUDED.symbols_json
+                    RETURNING track, as_of, universe_version, source, symbols_json
+                    """,
+                    (
+                        str(track).strip().lower(),
+                        as_of,
+                        str(universe_version),
+                        str(source),
+                        json.dumps(payload),
+                    ),
+                )
+                row = cur.fetchone() or {}
+                return dict(row)
 
     def resolve_asset_universe_asof(
         self,

@@ -13,7 +13,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import torch
 
-from artifacts.pack import pack_model_artifact
+from mlops_artifacts.pack import pack_model_artifact
 from training.calibration.calibrate import fit_temperature_scaling
 from vc.feature_spec import VC_FEATURE_KEYS, VC_SCHEMA_HASH, VC_SCHEMA_PATH, label_from_event_row, vector_from_event_row
 

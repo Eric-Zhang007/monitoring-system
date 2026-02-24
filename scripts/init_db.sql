@@ -435,6 +435,18 @@ CREATE TABLE IF NOT EXISTS onchain_signals (
 );
 CREATE INDEX IF NOT EXISTS idx_onchain_signals_asset_ts ON onchain_signals(asset_symbol, ts DESC);
 
+CREATE TABLE IF NOT EXISTS asset_universe_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    track VARCHAR(16) NOT NULL,
+    as_of TIMESTAMPTZ NOT NULL,
+    universe_version VARCHAR(64) NOT NULL,
+    source VARCHAR(64) NOT NULL,
+    symbols_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (track, as_of, universe_version)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_universe_snapshots_track_asof ON asset_universe_snapshots(track, as_of DESC);
+
 ALTER TABLE feature_snapshots
     ADD COLUMN IF NOT EXISTS as_of_ts TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ,

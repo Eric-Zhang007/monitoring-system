@@ -9,7 +9,7 @@ import numpy as np
 from fastapi import HTTPException
 import torch
 
-from artifacts.validate import validate_manifest_dir
+from mlops_artifacts.validate import validate_manifest_dir
 from features.feature_contract import FEATURE_DIM, SCHEMA_HASH
 from inference.feature_reader import fetch_sequence
 from liquid_model_registry import get_active_model as get_registry_active_model

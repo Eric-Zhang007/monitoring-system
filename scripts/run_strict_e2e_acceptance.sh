@@ -40,6 +40,10 @@ fi
 "${PYTHON_BIN}" inference/main.py --symbol BTC
 
 pytest -q \
+  tests/test_clean_clone_imports.py \
+  tests/test_init_db_has_universe_table.py \
+  tests/test_train_report_records_universe.py \
+  tests/test_live_adapter_idempotency.py \
   tests/test_train_infer_parity.py \
   tests/test_execution_e2e_paper.py \
   tests/test_account_state_contract.py \

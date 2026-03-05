@@ -448,6 +448,9 @@ class CoinbaseLiveAdapter(ExecutionAdapterBase):
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        proxy_http = str(os.getenv("HTTP_PROXY", "")).strip() or str(os.getenv("ALL_PROXY", "")).strip()
+        proxy_https = str(os.getenv("HTTPS_PROXY", "")).strip() or str(os.getenv("ALL_PROXY", "")).strip()
+        proxies = {"http": proxy_http, "https": proxy_https} if (proxy_http or proxy_https) else None
         resp = None
         max_attempts = int(os.getenv("COINBASE_HTTP_MAX_RETRIES", "3") or 3)
         for i in range(max(1, max_attempts)):
@@ -457,6 +460,7 @@ class CoinbaseLiveAdapter(ExecutionAdapterBase):
                 headers=headers,
                 json=payload,
                 params=params,
+                proxies=proxies,
                 timeout=self.timeout_sec,
             )
             if resp.status_code not in {429, 500, 502, 503, 504}:
@@ -1013,6 +1017,9 @@ class BitgetLiveAdapter(ExecutionAdapterBase):
         body_str = json.dumps(payload or {}, separators=(",", ":")) if payload is not None else ""
         ts_ms = str(int(time.time() * 1000))
         headers = {"Content-Type": "application/json"}
+        proxy_http = str(os.getenv("HTTP_PROXY", "")).strip() or str(os.getenv("ALL_PROXY", "")).strip()
+        proxy_https = str(os.getenv("HTTPS_PROXY", "")).strip() or str(os.getenv("ALL_PROXY", "")).strip()
+        proxies = {"http": proxy_http, "https": proxy_https} if (proxy_http or proxy_https) else None
         if self.api_key and self.api_secret and self.api_passphrase:
             headers.update(
                 {
@@ -1032,6 +1039,7 @@ class BitgetLiveAdapter(ExecutionAdapterBase):
                 url=f"{self.base_url}{path}",
                 headers=headers,
                 data=body_str if payload is not None else None,
+                proxies=proxies,
                 timeout=self.timeout_sec,
             )
             if resp.status_code not in {429, 500, 502, 503, 504}:

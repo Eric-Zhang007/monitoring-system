@@ -13,7 +13,9 @@ def compute_label_targets(
     cost_bps: Mapping[str, float] | None = None,
     market_state: Mapping[str, Any] | None = None,
     liquidity_features: Mapping[str, Any] | None = None,
+    account_state: Mapping[str, Any] | None = None,
     turnover_estimate: float | None = None,
+    cost_config: Mapping[str, Any] | None = None,
     cost_profile_name: str = "standard",
 ) -> Dict[str, float]:
     p0 = float(prices[index])
@@ -29,7 +31,9 @@ def compute_label_targets(
                 profile=profile,
                 market_state=market_state,
                 liquidity_features=liquidity_features,
+                account_state=account_state,
                 turnover_estimate=turnover_estimate,
+                config=cost_config,
             )
         step = int(horizon_steps[h])
         p1 = float(prices[index + step])

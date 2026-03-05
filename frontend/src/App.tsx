@@ -1,121 +1,59 @@
-import { useState } from 'react'
-import { useEffect } from 'react'
-import Header from './components/Header'
-import Hero from './components/Hero'
-import Dashboard from './components/Dashboard'
-import NewsSection from './components/NewsSection'
-import PredictionsSection from './components/PredictionsSection'
-import MonitorPanel from './components/MonitorPanel'
-import V2Lab from './components/V2Lab'
-import MobileNav from './components/MobileNav'
-import { useWebSocket } from './hooks/useWebSocket'
-import { useColorScheme } from './contexts/ColorSchemeContext'
-import { WebSocketMessage } from './types'
+import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
+import ConfigCenterPage from './pages/ConfigCenterPage'
+import DashboardPage from './pages/DashboardPage'
+import LiveMonitorPage from './pages/LiveMonitorPage'
+import OfflineTrainingPage from './pages/OfflineTrainingPage'
+import PaperMonitorPage from './pages/PaperMonitorPage'
+import ProcessConsolePage from './pages/ProcessConsolePage'
+import RiskCenterPage from './pages/RiskCenterPage'
 
-function App() {
-  const [activeTab, setActiveTab] = useState('dashboard')
-  const { scheme } = useColorScheme()
-  const [activeSymbol, setActiveSymbol] = useState<string>('BTC')
-  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
+const nav = [
+  { to: '/dashboard', label: '总览' },
+  { to: '/offline-training', label: '离线训练' },
+  { to: '/paper', label: '模拟盘' },
+  { to: '/live', label: '实盘' },
+  { to: '/config', label: '配置中心' },
+  { to: '/process', label: '进程控制台' },
+  { to: '/risk', label: '风控中心' },
+]
 
-  // WebSocket connection
-  const { isConnected, subscribe, messages } = useWebSocket()
-
-  useEffect(() => {
-    if (!messages.length) return
-    const message: WebSocketMessage = messages[messages.length - 1]
-    console.log('Received message:', message)
-  }, [messages])
-
-  // Subscribe to active symbol
-  useEffect(() => {
-    if (isConnected && activeSymbol) {
-      subscribe(activeSymbol)
-    }
-  }, [isConnected, activeSymbol, subscribe])
-
-  const navigationItems = [
-    { id: 'dashboard', label: '仪表盘', icon: '📊' },
-    { id: 'predictions', label: '预测分析', icon: '📈' },
-    { id: 'v2lab', label: 'V2实验台', icon: '🧪' },
-    { id: 'news', label: '新闻资讯', icon: '📰' },
-    { id: 'monitor', label: '系统监控', icon: '🔍' },
-  ]
-
-  const renderContent = () => {
-    switch (activeTab) {
-      case 'dashboard':
-        return <Dashboard activeSymbol={activeSymbol} onSymbolChange={setActiveSymbol} />
-      case 'predictions':
-        return <PredictionsSection symbol={activeSymbol} />
-      case 'v2lab':
-        return <V2Lab />
-      case 'news':
-        return <NewsSection />
-      case 'monitor':
-        return <MonitorPanel />
-      default:
-        return <Dashboard activeSymbol={activeSymbol} onSymbolChange={setActiveSymbol} />
-    }
-  }
-
+export default function App() {
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
-      {/* Header - Desktop & Mobile */}
-      <Header
-        scheme={scheme}
-        onMenuToggle={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-      />
-
-      {/* Hero Section */}
-      <Hero />
-
-      {/* Main Content */}
-      <main className="container mx-auto px-4 py-6 md:py-8">
-        {/* Desktop Navigation */}
-        <div className="hidden mb-6">
-          <nav className="flex space-x-2 bg-white dark:bg-slate-800 rounded-lg p-2 shadow-sm">
-            {navigationItems.map((item) => (
-              <button
-                key={item.id}
-                onClick={() => setActiveTab(item.id)}
-                className={`
-                  flex items-center space-x-2 px-4 py-2 rounded-md transition-all duration-200
-                  ${activeTab === item.id
-                    ? 'bg-blue-600 text-white shadow-md'
-                    : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
-                  }
-                `}
+    <div className="min-h-screen bg-gradient-to-b from-slate-100 via-slate-50 to-white">
+      <header className="border-b border-slate-200 bg-white/90 backdrop-blur">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3">
+          <div>
+            <div className="text-lg font-bold text-slate-900">Quant Control Plane</div>
+            <div className="text-xs text-slate-500">strict-only production console</div>
+          </div>
+          <nav className="flex flex-wrap gap-2">
+            {nav.map((n) => (
+              <NavLink
+                key={n.to}
+                to={n.to}
+                className={({ isActive }) =>
+                  `rounded-lg px-3 py-2 text-sm font-medium ${isActive ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`
+                }
               >
-                <span className="text-lg">{item.icon}</span>
-                <span className="font-medium">{item.label}</span>
-              </button>
+                {n.label}
+              </NavLink>
             ))}
           </nav>
         </div>
+      </header>
 
-        {/* Mobile Navigation */}
-        <MobileNav
-          items={navigationItems}
-          activeTab={activeTab}
-          onTabChange={setActiveTab}
-        />
-
-        {/* Content Area */}
-        <div className="animate-in fade-in duration-300">
-          {renderContent()}
-        </div>
+      <main className="mx-auto max-w-7xl px-4 py-4">
+        <Routes>
+          <Route path="/" element={<Navigate to="/dashboard" replace />} />
+          <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/offline-training" element={<OfflineTrainingPage />} />
+          <Route path="/paper" element={<PaperMonitorPage />} />
+          <Route path="/live" element={<LiveMonitorPage />} />
+          <Route path="/config" element={<ConfigCenterPage />} />
+          <Route path="/process" element={<ProcessConsolePage />} />
+          <Route path="/risk" element={<RiskCenterPage />} />
+        </Routes>
       </main>
-
-      {/* Mobile Menu Overlay */}
-      {isMobileMenuOpen && (
-        <div
-          className="fixed inset-0 bg-black bg-opacity-50 z-40 xs:hidden"
-          onClick={() => setIsMobileMenuOpen(false)}
-        />
-      )}
     </div>
   )
 }
-
-export default App

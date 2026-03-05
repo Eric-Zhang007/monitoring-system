@@ -43,6 +43,14 @@ def _table_exists(cur, table_name: str) -> bool:
     return bool(row.get("reg"))
 
 
+def _ensure_feature_matrix_main_schema(cur) -> None:
+    # Keep strict pipeline columns present even when table was created by older migrations.
+    cur.execute("ALTER TABLE feature_matrix_main ADD COLUMN IF NOT EXISTS values JSONB")
+    cur.execute("ALTER TABLE feature_matrix_main ADD COLUMN IF NOT EXISTS mask JSONB")
+    cur.execute("ALTER TABLE feature_matrix_main ADD COLUMN IF NOT EXISTS schema_hash TEXT")
+    cur.execute("ALTER TABLE feature_matrix_main ADD COLUMN IF NOT EXISTS synthetic_ratio DOUBLE PRECISION NOT NULL DEFAULT 0.0")
+
+
 def _latest_before(ts_list: List[datetime], rows: List[Dict[str, Any]], ts: datetime) -> Dict[str, Any] | None:
     if not ts_list:
         return None
@@ -100,6 +108,7 @@ def main() -> int:
                 )
                 """
             )
+            _ensure_feature_matrix_main_schema(cur)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_feature_matrix_main_symbol_ts ON feature_matrix_main(symbol, as_of_ts DESC)")
             if bool(args.truncate):
                 cur.execute("TRUNCATE TABLE feature_matrix_main")

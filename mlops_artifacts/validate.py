@@ -32,7 +32,12 @@ def validate_manifest_dir(model_dir: str | Path, *, expected_schema_hash: Option
     files = manifest.get("files")
     if not isinstance(files, dict):
         raise RuntimeError("manifest_files_missing")
-    required_files = ("weights", "schema_snapshot", "training_report")
+    required_files = ["weights", "schema_snapshot", "training_report"]
+    extra_required = manifest.get("required_files")
+    if isinstance(extra_required, list):
+        for k in extra_required:
+            if isinstance(k, str) and k and k not in required_files:
+                required_files.append(k)
     for key in required_files:
         rel = files.get(key)
         if not isinstance(rel, str) or not rel.strip():
@@ -52,4 +57,3 @@ def validate_manifest_dir(model_dir: str | Path, *, expected_schema_hash: Option
         raise RuntimeError(f"schema_hash_mismatch_expected:{expected_schema_hash}:{manifest_hash}")
 
     return manifest
-

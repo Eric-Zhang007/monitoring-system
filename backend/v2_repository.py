@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from numbers import Number
 from contextlib import AbstractContextManager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -75,6 +75,12 @@ class V2Repository:
     def _fingerprint(event: Event) -> str:
         key = f"{event.event_type}|{event.title.strip().lower()}|{event.source_url or ''}|{event.occurred_at.isoformat()}"
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _table_exists(cur, table_name: str) -> bool:
+        cur.execute("SELECT to_regclass(%s) AS reg", (f"public.{str(table_name).lower()}",))
+        row = cur.fetchone() or {}
+        return bool(row.get("reg"))
 
     def upsert_entity(self, cur, entity: Dict[str, Any]) -> int:
         cur.execute(
@@ -768,6 +774,12 @@ class V2Repository:
             with conn.cursor() as cur:
                 cur.execute(
                     """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_universe_snapshots_track_asof_version
+                    ON asset_universe_snapshots(track, as_of, universe_version)
+                    """
+                )
+                cur.execute(
+                    """
                     INSERT INTO asset_universe_snapshots (
                         track, as_of, universe_version, source, symbols_json, created_at
                     ) VALUES (%s, %s, %s, %s, %s::jsonb, NOW())
@@ -1017,6 +1029,157 @@ class V2Repository:
                     row["timeframe_used"] = fallback_tf
                     row["price_fallback_used"] = True
                 return price_rows
+
+    @staticmethod
+    def _normalize_timeframes(raw: Any) -> List[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            parts = [x.strip() for x in raw.split(",")]
+        elif isinstance(raw, (list, tuple)):
+            parts = [str(x).strip() for x in raw]
+        else:
+            parts = [str(raw).strip()]
+        out: List[str] = []
+        seen = set()
+        for piece in parts:
+            tf = str(piece or "").strip().lower()
+            if not tf or tf in seen:
+                continue
+            if tf.endswith("m") and tf[:-1].isdigit():
+                pass
+            elif tf.endswith("h") and tf[:-1].isdigit():
+                pass
+            elif tf.endswith("d") and tf[:-1].isdigit():
+                pass
+            else:
+                continue
+            seen.add(tf)
+            out.append(tf)
+        return out
+
+    @staticmethod
+    def _parse_utc_optional(raw: Any) -> Optional[datetime]:
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            dt = raw
+        else:
+            text = str(raw or "").strip().replace(" ", "T")
+            if not text:
+                return None
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(text)
+            except Exception:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def load_multi_timeframe_context(
+        self,
+        *,
+        symbol: str,
+        as_of: Optional[datetime | str] = None,
+        timeframes: Optional[List[str]] = None,
+        primary_timeframe: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            raise RuntimeError("empty_symbol")
+        as_of_dt = self._parse_utc_optional(as_of) or datetime.now(timezone.utc)
+        tfs = self._normalize_timeframes(timeframes or os.getenv("ANALYST_CONTEXT_TIMEFRAMES", "5m,15m,1h,4h,1d"))
+        if not tfs:
+            raise RuntimeError("empty_context_timeframes")
+        primary_tf = str(primary_timeframe or os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m")).strip().lower() or "5m"
+        require_table = str(os.getenv("MULTI_TF_CONTEXT_REQUIRE_TABLE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+        payload: Dict[str, Any] = {
+            "symbol": sym,
+            "as_of": as_of_dt.isoformat(),
+            "primary_timeframe": primary_tf,
+            "timeframes": list(tfs),
+            "context": {},
+            "source": "",
+        }
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if self._table_exists(cur, "market_context_multi_tf"):
+                    cur.execute(
+                        """
+                        SELECT as_of_ts, context_json, coverage_json
+                        FROM market_context_multi_tf
+                        WHERE symbol = %s
+                          AND primary_timeframe = %s
+                          AND as_of_ts <= %s
+                        ORDER BY as_of_ts DESC
+                        LIMIT 1
+                        """,
+                        (sym, primary_tf, as_of_dt),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        ctx = dict(row.get("context_json") or {})
+                        cov = dict(row.get("coverage_json") or {})
+                        merged: Dict[str, Dict[str, Any]] = {}
+                        for tf in tfs:
+                            block = dict(ctx.get(tf) or {})
+                            c = dict(cov.get(tf) or {})
+                            if "missing" not in block:
+                                block["missing"] = int(c.get("missing", 1))
+                            merged[tf] = block
+                        payload["context"] = merged
+                        payload["source"] = "market_context_multi_tf"
+                        payload["as_of"] = str(row.get("as_of_ts").isoformat() if row.get("as_of_ts") else as_of_dt.isoformat())
+                        return payload
+                    if require_table:
+                        raise RuntimeError("multi_tf_context_missing_in_table")
+                elif require_table:
+                    raise RuntimeError("missing_table:market_context_multi_tf")
+
+                merged: Dict[str, Dict[str, Any]] = {}
+                for tf in tfs:
+                    cur.execute(
+                        """
+                        SELECT ts, close::float AS close, volume::float AS volume
+                        FROM market_bars
+                        WHERE symbol = %s
+                          AND timeframe = %s
+                          AND ts <= %s
+                        ORDER BY ts DESC
+                        LIMIT 2
+                        """,
+                        (sym, tf, as_of_dt),
+                    )
+                    rows = [dict(r) for r in cur.fetchall()]
+                    if not rows:
+                        merged[tf] = {"missing": 1, "close": 0.0, "ret_1": 0.0, "volume": 0.0, "as_of_ts": None}
+                        continue
+                    close0 = float(rows[0].get("close") or 0.0)
+                    volume0 = float(rows[0].get("volume") or 0.0)
+                    ts0 = rows[0].get("ts")
+                    ret_1 = 0.0
+                    if len(rows) > 1:
+                        prev = float(rows[1].get("close") or 0.0)
+                        if abs(prev) > 1e-12:
+                            ret_1 = float((close0 / prev) - 1.0)
+                    lag_sec = 0.0
+                    if isinstance(ts0, datetime):
+                        lag_sec = max(0.0, (as_of_dt - ts0.astimezone(timezone.utc)).total_seconds())
+                    merged[tf] = {
+                        "missing": 0,
+                        "close": close0,
+                        "ret_1": ret_1,
+                        "volume": volume0,
+                        "as_of_ts": ts0.isoformat() if isinstance(ts0, datetime) else None,
+                        "lag_sec": float(lag_sec),
+                    }
+                payload["context"] = merged
+                payload["source"] = "market_bars_ondemand"
+                return payload
 
     def latest_prediction(self, track: str, target: str, horizon: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -2785,3 +2948,979 @@ class V2Repository:
             "reject_rate": round(reject_rate, 8),
         }
         return {"totals": totals, "by_target": by_target}
+
+    def save_offline_data_audit(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        track: str,
+        symbols: List[str],
+        window_start: Optional[datetime],
+        window_end: Optional[datetime],
+        lookback: int,
+        bucket: str,
+        ready: bool,
+        reasons: List[str],
+        payload: Dict[str, Any],
+        created_by: str = "system",
+    ) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO offline_data_audits (
+                        task_id, status, track, symbols_json, window_start, window_end,
+                        lookback, bucket, ready, reasons, payload, created_by, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s::jsonb, %s, %s,
+                        %s, %s, %s, %s::jsonb, %s::jsonb, %s, NOW(), NOW()
+                    )
+                    ON CONFLICT (task_id)
+                    DO UPDATE SET
+                        status = EXCLUDED.status,
+                        track = EXCLUDED.track,
+                        symbols_json = EXCLUDED.symbols_json,
+                        window_start = EXCLUDED.window_start,
+                        window_end = EXCLUDED.window_end,
+                        lookback = EXCLUDED.lookback,
+                        bucket = EXCLUDED.bucket,
+                        ready = EXCLUDED.ready,
+                        reasons = EXCLUDED.reasons,
+                        payload = EXCLUDED.payload,
+                        created_by = EXCLUDED.created_by,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (
+                        str(task_id),
+                        str(status),
+                        str(track),
+                        json.dumps(list(symbols or [])),
+                        window_start,
+                        window_end,
+                        int(lookback),
+                        str(bucket),
+                        bool(ready),
+                        json.dumps(list(reasons or [])),
+                        json.dumps(payload or {}),
+                        str(created_by),
+                    ),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {}
+
+    def get_offline_data_audit_by_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM offline_data_audits WHERE task_id = %s LIMIT 1", (str(task_id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def get_latest_offline_data_audit(self, track: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if track:
+                    cur.execute(
+                        """
+                        SELECT * FROM offline_data_audits
+                        WHERE track = %s
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                        """,
+                        (str(track),),
+                    )
+                else:
+                    cur.execute("SELECT * FROM offline_data_audits ORDER BY created_at DESC, id DESC LIMIT 1")
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def list_runtime_config(
+        self,
+        *,
+        scope: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        config_key: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        cond: List[str] = []
+        params: List[Any] = []
+        if scope is not None:
+            cond.append("scope = %s")
+            params.append(str(scope))
+        if scope_id is not None:
+            cond.append("scope_id = %s")
+            params.append(str(scope_id))
+        if config_key is not None:
+            cond.append("config_key = %s")
+            params.append(str(config_key))
+        where = f"WHERE {' AND '.join(cond)}" if cond else ""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM runtime_config
+                    {where}
+                    ORDER BY scope ASC, scope_id ASC, config_key ASC
+                    """
+                    ,
+                    tuple(params),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def upsert_runtime_config(
+        self,
+        *,
+        config_key: str,
+        scope: str,
+        scope_id: str,
+        value_json: Dict[str, Any],
+        requires_restart: bool,
+        description: str,
+        updated_by: str,
+    ) -> Dict[str, Any]:
+        if not str(config_key or "").strip():
+            raise ValueError("config_key_required")
+        scope_norm = str(scope or "global").strip().lower() or "global"
+        scope_id_norm = str(scope_id or "").strip()
+        old_row: Optional[Dict[str, Any]] = None
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM runtime_config
+                    WHERE config_key=%s AND scope=%s AND scope_id=%s
+                    LIMIT 1
+                    """,
+                    (str(config_key), scope_norm, scope_id_norm),
+                )
+                raw_old = cur.fetchone()
+                old_row = dict(raw_old) if raw_old else None
+                cur.execute(
+                    """
+                    INSERT INTO runtime_config (
+                        config_key, scope, scope_id, value_json, version, requires_restart, description, updated_by, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s::jsonb, 1, %s, %s, %s, NOW()
+                    )
+                    ON CONFLICT (config_key, scope, scope_id)
+                    DO UPDATE SET
+                        value_json = EXCLUDED.value_json,
+                        version = runtime_config.version + 1,
+                        requires_restart = EXCLUDED.requires_restart,
+                        description = EXCLUDED.description,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (
+                        str(config_key),
+                        scope_norm,
+                        scope_id_norm,
+                        json.dumps(value_json or {}),
+                        bool(requires_restart),
+                        str(description or ""),
+                        str(updated_by or "system"),
+                    ),
+                )
+                row = cur.fetchone()
+                out = dict(row) if row else {}
+                cur.execute(
+                    """
+                    INSERT INTO runtime_config_audit_logs (
+                        config_key, scope, scope_id, old_value_json, new_value_json,
+                        old_version, new_version, requires_restart, updated_by, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s::jsonb, %s::jsonb,
+                        %s, %s, %s, %s, NOW()
+                    )
+                    """,
+                    (
+                        str(config_key),
+                        scope_norm,
+                        scope_id_norm,
+                        json.dumps(old_row.get("value_json") if old_row else {}),
+                        json.dumps(out.get("value_json") if isinstance(out.get("value_json"), dict) else (value_json or {})),
+                        int(old_row.get("version") or 0) if old_row else None,
+                        int(out.get("version") or 1),
+                        bool(requires_restart),
+                        str(updated_by or "system"),
+                    ),
+                )
+                return out
+
+    def list_runtime_config_audit_logs(
+        self,
+        *,
+        limit: int = 200,
+        scope: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        config_key: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        cond: List[str] = []
+        params: List[Any] = []
+        if scope is not None:
+            cond.append("scope = %s")
+            params.append(str(scope))
+        if scope_id is not None:
+            cond.append("scope_id = %s")
+            params.append(str(scope_id))
+        if config_key is not None:
+            cond.append("config_key = %s")
+            params.append(str(config_key))
+        where = f"WHERE {' AND '.join(cond)}" if cond else ""
+        params.append(int(max(1, min(2000, limit))))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM runtime_config_audit_logs
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def upsert_ops_process(self, process_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(payload or {})
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ops_processes (
+                        process_id, task_type, status, pid, start_time, end_time,
+                        command, env_overrides, config_snapshot, log_path, metrics_path,
+                        account_id, track, symbols_json, restart_policy, restart_count,
+                        auto_restart, max_restarts, exit_code, error, created_by,
+                        created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s::jsonb, %s::jsonb, %s::jsonb, %s, %s,
+                        %s, %s, %s::jsonb, %s::jsonb, %s,
+                        %s, %s, %s, %s, %s,
+                        COALESCE(%s, NOW()), NOW()
+                    )
+                    ON CONFLICT (process_id)
+                    DO UPDATE SET
+                        task_type = EXCLUDED.task_type,
+                        status = EXCLUDED.status,
+                        pid = EXCLUDED.pid,
+                        start_time = EXCLUDED.start_time,
+                        end_time = EXCLUDED.end_time,
+                        command = EXCLUDED.command,
+                        env_overrides = EXCLUDED.env_overrides,
+                        config_snapshot = EXCLUDED.config_snapshot,
+                        log_path = EXCLUDED.log_path,
+                        metrics_path = EXCLUDED.metrics_path,
+                        account_id = EXCLUDED.account_id,
+                        track = EXCLUDED.track,
+                        symbols_json = EXCLUDED.symbols_json,
+                        restart_policy = EXCLUDED.restart_policy,
+                        restart_count = EXCLUDED.restart_count,
+                        auto_restart = EXCLUDED.auto_restart,
+                        max_restarts = EXCLUDED.max_restarts,
+                        exit_code = EXCLUDED.exit_code,
+                        error = EXCLUDED.error,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (
+                        str(process_id),
+                        str(data.get("task_type") or "UNKNOWN"),
+                        str(data.get("status") or "created"),
+                        data.get("pid"),
+                        data.get("start_time"),
+                        data.get("end_time"),
+                        json.dumps(list(data.get("command") or [])),
+                        json.dumps(dict(data.get("env_overrides") or {})),
+                        json.dumps(dict(data.get("config_snapshot") or {})),
+                        str(data.get("log_path") or ""),
+                        data.get("metrics_path"),
+                        data.get("account_id"),
+                        str(data.get("track") or "liquid"),
+                        json.dumps(list(data.get("symbols") or [])),
+                        json.dumps(dict(data.get("restart_policy") or {})),
+                        int(data.get("restart_count") or 0),
+                        bool(data.get("auto_restart") or False),
+                        int(data.get("max_restarts") or 0),
+                        data.get("exit_code"),
+                        data.get("error"),
+                        str(data.get("created_by") or "system"),
+                        data.get("created_at"),
+                    ),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {}
+
+    def append_ops_process_event(self, process_id: str, event_type: str, payload: Dict[str, Any]) -> int:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ops_process_events(process_id, event_type, payload, created_at)
+                    VALUES (%s, %s, %s::jsonb, NOW())
+                    RETURNING id
+                    """,
+                    (str(process_id), str(event_type), json.dumps(payload or {})),
+                )
+                row = cur.fetchone() or {}
+                return int(row.get("id") or 0)
+
+    def list_ops_processes(self, *, status: Optional[str] = None, task_type: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+        cond: List[str] = []
+        params: List[Any] = []
+        if status is not None:
+            cond.append("status = %s")
+            params.append(str(status))
+        if task_type is not None:
+            cond.append("task_type = %s")
+            params.append(str(task_type))
+        where = f"WHERE {' AND '.join(cond)}" if cond else ""
+        params.append(int(max(1, min(2000, limit))))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM ops_processes
+                    {where}
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def get_ops_process(self, process_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM ops_processes WHERE process_id = %s LIMIT 1", (str(process_id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def list_ops_process_events(self, process_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM ops_process_events
+                    WHERE process_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (str(process_id), int(max(1, min(2000, limit)))),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def upsert_bitget_account(
+        self,
+        *,
+        account_id: str,
+        account_name: str,
+        api_key_enc: str,
+        api_secret_enc: str,
+        passphrase_enc: str,
+        is_default: bool,
+        enabled: bool,
+        updated_by: str,
+    ) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if is_default:
+                    cur.execute("UPDATE bitget_accounts SET is_default = FALSE WHERE is_default = TRUE")
+                cur.execute(
+                    """
+                    INSERT INTO bitget_accounts (
+                        account_id, account_name, api_key_enc, api_secret_enc, passphrase_enc,
+                        is_default, enabled, created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, NOW(), NOW()
+                    )
+                    ON CONFLICT (account_id)
+                    DO UPDATE SET
+                        account_name = EXCLUDED.account_name,
+                        api_key_enc = EXCLUDED.api_key_enc,
+                        api_secret_enc = EXCLUDED.api_secret_enc,
+                        passphrase_enc = EXCLUDED.passphrase_enc,
+                        is_default = EXCLUDED.is_default,
+                        enabled = EXCLUDED.enabled,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    RETURNING account_id, account_name, is_default, enabled, created_at, updated_at
+                    """,
+                    (
+                        str(account_id),
+                        str(account_name),
+                        str(api_key_enc),
+                        str(api_secret_enc),
+                        str(passphrase_enc),
+                        bool(is_default),
+                        bool(enabled),
+                        str(updated_by or "system"),
+                        str(updated_by or "system"),
+                    ),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {}
+
+    def list_bitget_accounts(self) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT account_id, account_name, is_default, enabled, created_at, updated_at
+                    FROM bitget_accounts
+                    ORDER BY is_default DESC, updated_at DESC
+                    """
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def get_bitget_account_secret_row(self, account_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM bitget_accounts
+                    WHERE account_id = %s
+                    LIMIT 1
+                    """,
+                    (str(account_id),),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def delete_bitget_account(self, account_id: str) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM bitget_accounts WHERE account_id = %s", (str(account_id),))
+                return bool(cur.rowcount and cur.rowcount > 0)
+
+    def save_risk_command_log(
+        self,
+        *,
+        source: str,
+        command_text: str,
+        parse_ok: bool,
+        execute_ok: bool,
+        result: Dict[str, Any],
+        error: Optional[str],
+        created_by: str = "system",
+    ) -> int:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO risk_command_logs (
+                        source, command_text, parse_ok, execute_ok, result_json, error, created_by, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s::jsonb, %s, %s, NOW()
+                    ) RETURNING id
+                    """,
+                    (
+                        str(source),
+                        str(command_text),
+                        bool(parse_ok),
+                        bool(execute_ok),
+                        json.dumps(result or {}),
+                        error,
+                        str(created_by or "system"),
+                    ),
+                )
+                row = cur.fetchone() or {}
+                return int(row.get("id") or 0)
+
+    def list_risk_command_logs(self, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM risk_command_logs
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (int(max(1, min(2000, limit))),),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def save_mail_delivery_log(
+        self,
+        *,
+        event_type: str,
+        recipients: List[str],
+        subject: str,
+        body_preview: str,
+        send_ok: bool,
+        error: Optional[str],
+    ) -> int:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO mail_delivery_logs (
+                        event_type, recipients, subject, body_preview, send_ok, error, created_at
+                    ) VALUES (
+                        %s, %s::jsonb, %s, %s, %s, %s, NOW()
+                    ) RETURNING id
+                    """,
+                    (
+                        str(event_type),
+                        json.dumps(list(recipients or [])),
+                        str(subject),
+                        str(body_preview),
+                        bool(send_ok),
+                        error,
+                    ),
+                )
+                row = cur.fetchone() or {}
+                return int(row.get("id") or 0)
+
+    def list_mail_delivery_logs(self, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM mail_delivery_logs
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (int(max(1, min(5000, limit))),),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def list_recent_risk_events(self, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM risk_events
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (int(max(1, min(5000, limit))),),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def list_recent_reconciliation_logs(self, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM reconciliation_logs
+                    ORDER BY checked_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (int(max(1, min(5000, limit))),),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def save_venue_connectivity_status(
+        self,
+        *,
+        venue: str,
+        rest_ok: bool,
+        ws_ok: bool,
+        latency_ms: Optional[float],
+        error: Optional[str],
+        using_proxy_profile: Optional[str],
+        payload: Dict[str, Any],
+    ) -> int:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO venue_connectivity_status (
+                        ts, venue, rest_ok, ws_ok, latency_ms, error, using_proxy_profile, payload
+                    ) VALUES (
+                        NOW(), %s, %s, %s, %s, %s, %s, %s::jsonb
+                    ) RETURNING id
+                    """,
+                    (
+                        str(venue),
+                        bool(rest_ok),
+                        bool(ws_ok),
+                        (float(latency_ms) if latency_ms is not None else None),
+                        error,
+                        using_proxy_profile,
+                        json.dumps(payload or {}),
+                    ),
+                )
+                row = cur.fetchone() or {}
+                return int(row.get("id") or 0)
+
+    def list_venue_connectivity_status(self, *, venue: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if venue:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM venue_connectivity_status
+                        WHERE venue = %s
+                        ORDER BY ts DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (str(venue), int(max(1, min(2000, limit)))),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM venue_connectivity_status
+                        ORDER BY ts DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (int(max(1, min(2000, limit))),),
+                    )
+                return [dict(r) for r in cur.fetchall()]
+
+    def get_latest_venue_connectivity(self, venue: str) -> Optional[Dict[str, Any]]:
+        rows = self.list_venue_connectivity_status(venue=venue, limit=1)
+        return rows[0] if rows else None
+
+    def upsert_proxy_profile(
+        self,
+        *,
+        profile_id: str,
+        name: str,
+        proxy_type: str,
+        host: str,
+        port: int,
+        username: Optional[str],
+        password_enc: Optional[str],
+        enabled: bool,
+        note: str,
+        updated_by: str,
+    ) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO proxy_profiles (
+                        profile_id, name, proxy_type, host, port, username, password_enc, enabled,
+                        note, updated_by, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, NOW(), NOW()
+                    )
+                    ON CONFLICT (profile_id)
+                    DO UPDATE SET
+                        name = EXCLUDED.name,
+                        proxy_type = EXCLUDED.proxy_type,
+                        host = EXCLUDED.host,
+                        port = EXCLUDED.port,
+                        username = EXCLUDED.username,
+                        password_enc = COALESCE(EXCLUDED.password_enc, proxy_profiles.password_enc),
+                        enabled = EXCLUDED.enabled,
+                        note = EXCLUDED.note,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    RETURNING profile_id, name, proxy_type, host, port, username, enabled, note, updated_by, created_at, updated_at
+                    """,
+                    (
+                        str(profile_id),
+                        str(name),
+                        str(proxy_type),
+                        str(host),
+                        int(port),
+                        username,
+                        password_enc,
+                        bool(enabled),
+                        str(note or ""),
+                        str(updated_by or "system"),
+                    ),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {}
+
+    def list_proxy_profiles(self, *, include_disabled: bool = True) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if include_disabled:
+                    cur.execute(
+                        """
+                        SELECT profile_id, name, proxy_type, host, port, username, enabled, note, updated_by, created_at, updated_at
+                        FROM proxy_profiles
+                        ORDER BY updated_at DESC
+                        """
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT profile_id, name, proxy_type, host, port, username, enabled, note, updated_by, created_at, updated_at
+                        FROM proxy_profiles
+                        WHERE enabled = TRUE
+                        ORDER BY updated_at DESC
+                        """
+                    )
+                return [dict(r) for r in cur.fetchall()]
+
+    def get_proxy_profile_secret_row(self, profile_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM proxy_profiles WHERE profile_id = %s LIMIT 1", (str(profile_id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def delete_proxy_profile(self, profile_id: str) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM proxy_profiles WHERE profile_id = %s", (str(profile_id),))
+                return bool(cur.rowcount and cur.rowcount > 0)
+
+    def upsert_proxy_binding(
+        self,
+        *,
+        target_type: str,
+        target_id: str,
+        profile_id: str,
+        requires_restart: bool,
+        updated_by: str,
+    ) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO proxy_profile_bindings (
+                        target_type, target_id, profile_id, requires_restart, updated_by, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, NOW(), NOW()
+                    )
+                    ON CONFLICT (target_type, target_id)
+                    DO UPDATE SET
+                        profile_id = EXCLUDED.profile_id,
+                        requires_restart = EXCLUDED.requires_restart,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    (str(target_type), str(target_id), str(profile_id), bool(requires_restart), str(updated_by or "system")),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {}
+
+    def get_proxy_binding(self, *, target_type: str, target_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM proxy_profile_bindings
+                    WHERE target_type = %s AND target_id = %s
+                    LIMIT 1
+                    """,
+                    (str(target_type), str(target_id)),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def list_proxy_bindings(self) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM proxy_profile_bindings ORDER BY updated_at DESC")
+                return [dict(r) for r in cur.fetchall()]
+
+    def delete_proxy_binding(self, *, target_type: str, target_id: str) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM proxy_profile_bindings
+                    WHERE target_type = %s AND target_id = %s
+                    """,
+                    (str(target_type), str(target_id)),
+                )
+                return bool(cur.rowcount and cur.rowcount > 0)
+
+    def resolve_proxy_profile_for_target(
+        self,
+        *,
+        process_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        # Precedence: process -> account -> global
+        candidates: List[Tuple[str, str]] = []
+        if process_id:
+            candidates.append(("process", str(process_id)))
+        if account_id:
+            candidates.append(("account", str(account_id)))
+        candidates.append(("global", ""))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                for t, i in candidates:
+                    cur.execute(
+                        """
+                        SELECT b.*, p.profile_id, p.name, p.proxy_type, p.host, p.port, p.username, p.password_enc, p.enabled
+                        FROM proxy_profile_bindings b
+                        JOIN proxy_profiles p ON p.profile_id = b.profile_id
+                        WHERE b.target_type = %s AND b.target_id = %s
+                        LIMIT 1
+                        """,
+                        (t, i),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        out = dict(row)
+                        if not bool(out.get("enabled")):
+                            return None
+                        return out
+        return None
+
+    def save_audit_log(
+        self,
+        *,
+        actor: str,
+        role: str,
+        action: str,
+        target: str,
+        old_value: Dict[str, Any],
+        new_value: Dict[str, Any],
+        metadata: Dict[str, Any],
+    ) -> int:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO audit_logs (
+                        ts, actor, role, action, target, old_value, new_value, metadata
+                    ) VALUES (
+                        NOW(), %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb
+                    ) RETURNING id
+                    """,
+                    (
+                        str(actor or "system"),
+                        str(role or "viewer"),
+                        str(action),
+                        str(target or ""),
+                        json.dumps(old_value or {}),
+                        json.dumps(new_value or {}),
+                        json.dumps(metadata or {}),
+                    ),
+                )
+                row = cur.fetchone() or {}
+                return int(row.get("id") or 0)
+
+    def list_audit_logs(self, *, limit: int = 200, action: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if action:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM audit_logs
+                        WHERE action = %s
+                        ORDER BY ts DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (str(action), int(max(1, min(5000, limit)))),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM audit_logs
+                        ORDER BY ts DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (int(max(1, min(5000, limit))),),
+                    )
+                return [dict(r) for r in cur.fetchall()]
+
+    def upsert_secret(self, *, secret_key: str, secret_value_enc: str, updated_by: str) -> Dict[str, Any]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ops_secrets (
+                        secret_key, secret_value_enc, updated_by, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, NOW(), NOW()
+                    )
+                    ON CONFLICT (secret_key)
+                    DO UPDATE SET
+                        secret_value_enc = EXCLUDED.secret_value_enc,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    RETURNING secret_key, updated_by, created_at, updated_at
+                    """,
+                    (str(secret_key), str(secret_value_enc), str(updated_by or "system")),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {}
+
+    def get_secret(self, secret_key: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM ops_secrets WHERE secret_key = %s LIMIT 1", (str(secret_key),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def list_secrets_meta(self) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT secret_key, updated_by, created_at, updated_at
+                    FROM ops_secrets
+                    ORDER BY updated_at DESC
+                    """
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def save_clock_drift_status(
+        self,
+        *,
+        source: str,
+        local_utc: datetime,
+        remote_utc: Optional[datetime],
+        drift_ms: Optional[float],
+        level: str,
+        error: Optional[str],
+        payload: Dict[str, Any],
+    ) -> int:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clock_drift_status (
+                        ts, source, local_utc, remote_utc, drift_ms, level, error, payload
+                    ) VALUES (
+                        NOW(), %s, %s, %s, %s, %s, %s, %s::jsonb
+                    ) RETURNING id
+                    """,
+                    (
+                        str(source),
+                        local_utc,
+                        remote_utc,
+                        (float(drift_ms) if drift_ms is not None else None),
+                        str(level),
+                        error,
+                        json.dumps(payload or {}),
+                    ),
+                )
+                row = cur.fetchone() or {}
+                return int(row.get("id") or 0)
+
+    def get_latest_clock_drift_status(self) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM clock_drift_status
+                    ORDER BY ts DESC, id DESC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None

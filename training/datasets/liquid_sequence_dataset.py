@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover
 
 from features.feature_contract import FEATURE_DIM, FEATURE_INDEX, SCHEMA_HASH
 from features.sequence import build_sequence
+from training.cache.panel_cache import compute_regime_features
 from training.labels.liquid_labels import compute_label_targets
 
 
@@ -25,9 +26,12 @@ HORIZONS = ("1h", "4h", "1d", "7d")
 @dataclass(frozen=True)
 class SequenceSample:
     symbol: str
+    symbol_id: int
     end_ts: datetime
     x_values: np.ndarray
     x_mask: np.ndarray
+    regime_features: np.ndarray
+    regime_mask: np.ndarray
     y: Dict[str, float]
     schema_hash: str
 
@@ -51,6 +55,7 @@ class LiquidSequenceDataset(Dataset):
         direction = torch.tensor([float(s.y[f"direction_{h}"]) for h in HORIZONS], dtype=torch.float32)
         return {
             "symbol": s.symbol,
+            "symbol_id": torch.tensor(int(s.symbol_id), dtype=torch.long),
             "end_ts": s.end_ts.isoformat(),
             "x_values": x_values,
             "x_mask": x_mask,
@@ -59,6 +64,8 @@ class LiquidSequenceDataset(Dataset):
             "y_net": y_net,
             "cost_bps": cost_bps,
             "direction": direction,
+            "regime_features": torch.tensor(np.asarray(s.regime_features, dtype=np.float32), dtype=torch.float32),
+            "regime_mask": torch.tensor(np.asarray(s.regime_mask, dtype=np.float32), dtype=torch.float32),
             "schema_hash": s.schema_hash,
         }
 
@@ -87,6 +94,17 @@ def _liquidity_context(last_values: np.ndarray) -> Dict[str, float]:
     return context
 
 
+def _estimate_turnover_base_from_prices(prices: Sequence[float], idx: int, lookback: int) -> float:
+    lo = max(1, int(idx - max(8, lookback) + 1))
+    win = np.asarray(prices[lo : idx + 1], dtype=np.float64)
+    if win.size < 3:
+        return 0.35
+    ret = np.diff(win) / np.clip(win[:-1], 1e-12, None)
+    # Scale absolute return activity into a turnover baseline range.
+    base = float(np.mean(np.abs(ret)) * 24.0)
+    return float(np.clip(base, 0.02, 1.5))
+
+
 def load_training_samples(
     *,
     db_url: str,
@@ -98,6 +116,7 @@ def load_training_samples(
     cost_profile_name: str = "standard",
 ) -> List[SequenceSample]:
     out: List[SequenceSample] = []
+    symbol_to_id = {str(s).upper(): i for i, s in enumerate(sorted({str(x).upper() for x in symbols if str(x).strip()}))}
     horizon_steps = {
         "1h": 12,
         "4h": 48,
@@ -138,6 +157,9 @@ def load_training_samples(
                     seq = build_sequence(db_url=db_url, symbol=sym, end_ts=ts, lookback=lookback)
                     if seq.values.shape != (lookback, FEATURE_DIM):
                         continue
+                    regime_features_arr, regime_mask_arr = compute_regime_features(seq.values, seq.mask)
+                    regime_features = np.asarray(regime_features_arr[-1], dtype=np.float32)
+                    regime_mask = np.asarray(regime_mask_arr[-1], dtype=np.float32)
 
                     liq_ctx = _liquidity_context(seq.values[-1, :])
                     labels = compute_label_targets(
@@ -146,15 +168,19 @@ def load_training_samples(
                         horizon_steps=horizon_steps,
                         market_state={"realized_vol": float(abs(liq_ctx.get("realized_vol", 0.0)))},
                         liquidity_features=liq_ctx,
-                        turnover_estimate=0.5,
+                        account_state={"turnover_estimate": _estimate_turnover_base_from_prices(px_list, i, lookback)},
+                        turnover_estimate=None,
                         cost_profile_name=cost_profile_name,
                     )
                     out.append(
                         SequenceSample(
                             symbol=sym,
+                            symbol_id=int(symbol_to_id.get(sym, 0)),
                             end_ts=ts,
                             x_values=seq.values,
                             x_mask=seq.mask,
+                            regime_features=regime_features,
+                            regime_mask=regime_mask,
                             y=labels,
                             schema_hash=SCHEMA_HASH,
                         )

@@ -25,3 +25,29 @@ def test_liquid_multi_horizon_signal_returns_edge_and_score_maps(monkeypatch):
     assert set(out["score_horizons"].keys()) == {"1h", "4h", "1d", "7d"}
     assert set(out["edge_horizons"].keys()) == {"1h", "4h", "1d", "7d"}
     assert out["action"] in {"buy", "sell", "hold"}
+
+
+def test_router_hint_only_widens_no_trade_band(monkeypatch):
+    monkeypatch.setenv("SIGNAL_SCORE_ENTRY_BY_HORIZON", "1h=0.3,4h=0.3,1d=0.3,7d=0.3")
+    monkeypatch.setenv("SIGNAL_CONFIDENCE_MIN_BY_HORIZON", "1h=0.4,4h=0.4,1d=0.4,7d=0.4")
+    base = router_mod._liquid_multi_horizon_signal(
+        pred_outputs={
+            "expected_return_horizons": {"1h": 0.02, "4h": 0.02, "1d": 0.02, "7d": 0.02},
+            "signal_confidence_horizons": {"1h": 0.8, "4h": 0.8, "1d": 0.8, "7d": 0.8},
+            "vol_forecast_horizons": {"1h": 0.03, "4h": 0.03, "1d": 0.03, "7d": 0.03},
+        },
+        horizon="1h",
+        cost_profile="standard",
+    )
+    hinted = router_mod._liquid_multi_horizon_signal(
+        pred_outputs={
+            "expected_return_horizons": {"1h": 0.02, "4h": 0.02, "1d": 0.02, "7d": 0.02},
+            "signal_confidence_horizons": {"1h": 0.8, "4h": 0.8, "1d": 0.8, "7d": 0.8},
+            "vol_forecast_horizons": {"1h": 0.03, "4h": 0.03, "1d": 0.03, "7d": 0.03},
+        },
+        horizon="1h",
+        cost_profile="standard",
+        router_hint={"trend": 0.1, "meanrev": 0.1, "liquidation": 0.7, "neutral": 0.1},
+    )
+    for h in ("1h", "4h", "1d", "7d"):
+        assert float(hinted["band_horizons"][h]) >= float(base["band_horizons"][h])

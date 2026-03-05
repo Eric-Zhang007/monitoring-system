@@ -33,3 +33,11 @@ def test_chunk_id_contains_index_and_window():
     cid = mod._chunk_id(7, 1234, 5678)
     assert cid.startswith("00007_")
     assert "1234-5678" in cid
+
+
+def test_retryable_error_classification():
+    mod = _load_module()
+    assert mod._is_rate_limit_error("HTTP 429 too many requests")
+    assert mod._is_retryable_fetch_error("ReadTimeout while connecting")
+    assert mod._is_retryable_fetch_error("502 bad gateway")
+    assert not mod._is_retryable_fetch_error("schema_hash_mismatch_cache")

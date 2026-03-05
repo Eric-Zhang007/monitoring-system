@@ -138,6 +138,23 @@ def insert_snapshot(
 
 def insert_decision_trace(connector, trace: Dict[str, Any]) -> int:
     data = dict(trace or {})
+    risk_payload = dict(data.get("risk") or {})
+    account_payload = dict(data.get("account") or {})
+    # Persist extended audit payload without requiring immediate schema migrations.
+    risk_payload.setdefault(
+        "_extended",
+        {
+            "quantiles": data.get("quantiles") or {},
+            "expert_weights": data.get("expert_weights") or {},
+            "regime_probs": data.get("regime_probs") or {},
+            "cost_breakdown": data.get("cost_breakdown") or {},
+            "score": data.get("score") or {},
+            "thresholds": data.get("thresholds") or {},
+            "analyst": data.get("analyst") or {},
+            "position": data.get("position") or {},
+        },
+    )
+    account_payload.setdefault("_decision_context", {"position": data.get("position") or {}})
     with connector() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -165,8 +182,8 @@ def insert_decision_trace(connector, trace: Dict[str, Any]) -> int:
                     json.dumps(data.get("sigma") or {}),
                     json.dumps(data.get("direction_prob") or {}),
                     json.dumps(data.get("cost") or {}),
-                    json.dumps(data.get("risk") or {}),
-                    json.dumps(data.get("account") or {}),
+                    json.dumps(risk_payload),
+                    json.dumps(account_payload),
                     json.dumps(list(data.get("reason_codes") or [])),
                 ),
             )

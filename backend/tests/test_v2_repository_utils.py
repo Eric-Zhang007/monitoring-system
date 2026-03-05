@@ -176,3 +176,112 @@ def test_upsert_ops_control_state_writes_payload_json():
     assert cur.executed_params is not None
     assert cur.executed_params[0] == "manual_candidate"
     assert "INSERT INTO ops_control_state" in cur.executed_sql
+
+
+def test_normalize_timeframes_filters_invalid_and_duplicates():
+    out = V2Repository._normalize_timeframes("5m,1h,foo,1h,4h, 15m ,1x")
+    assert out == ["5m", "1h", "4h", "15m"]
+
+
+class _ContextCursor:
+    def __init__(self):
+        self.executed_sql = ""
+        self.executed_params = None
+        self._rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed_sql = str(sql)
+        self.executed_params = params
+        text = self.executed_sql.lower()
+        if "to_regclass" in text:
+            self._rows = [{"reg": None}]
+            return
+        if "from market_bars" in text:
+            tf = str((params or [None, ""])[1]).lower()
+            if tf == "5m":
+                now = datetime.now(timezone.utc)
+                self._rows = [
+                    {"ts": now, "close": 101.0, "volume": 10.0},
+                    {"ts": now, "close": 100.0, "volume": 9.0},
+                ]
+            else:
+                self._rows = []
+            return
+        self._rows = []
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def fetchone(self):
+        if not self._rows:
+            return None
+        return self._rows[0]
+
+
+def test_load_multi_timeframe_context_ondemand_marks_missing():
+    cur = _ContextCursor()
+    conn = _FakeConn(cur)
+    repo = object.__new__(V2Repository)
+    repo._connect = lambda: conn  # type: ignore[assignment]
+
+    out = repo.load_multi_timeframe_context(
+        symbol="BTC",
+        as_of=datetime.now(timezone.utc),
+        timeframes=["5m", "1h"],
+        primary_timeframe="5m",
+    )
+    assert out["source"] == "market_bars_ondemand"
+    assert "5m" in out["context"]
+    assert "1h" in out["context"]
+    assert int(out["context"]["5m"]["missing"]) == 0
+    assert int(out["context"]["1h"]["missing"]) == 1
+
+
+class _UpsertCursor:
+    def __init__(self):
+        self.sqls = []
+        self.params = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sqls.append(str(sql))
+        self.params.append(params)
+
+    def fetchone(self):
+        return {
+            "track": "liquid",
+            "as_of": datetime.now(timezone.utc),
+            "universe_version": "abc",
+            "source": "db",
+            "symbols_json": {"symbols": ["BTC", "ETH"]},
+        }
+
+
+def test_upsert_universe_snapshot_ensures_unique_index_before_conflict():
+    cur = _UpsertCursor()
+    conn = _FakeConn(cur)
+    repo = object.__new__(V2Repository)
+    repo._connect = lambda: conn  # type: ignore[assignment]
+
+    row = repo.upsert_asset_universe_snapshot(
+        track="liquid",
+        as_of=datetime.now(timezone.utc),
+        symbols=["BTC", "ETH"],
+        universe_version="abc",
+        source="db",
+    )
+    joined = "\n".join(cur.sqls)
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_universe_snapshots_track_asof_version" in joined
+    assert "ON CONFLICT (track, as_of, universe_version)" in joined
+    assert row["track"] == "liquid"

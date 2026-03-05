@@ -4,6 +4,7 @@
 
 1. Python：`3.12.x`
 2. PostgreSQL：可连通，`DATABASE_URL` 有效
+3. PostgreSQL 扩展：需安装 `pgvector`（`vector` 扩展）
 3. 执行：
 ```bash
 bash scripts/server_quickstart.sh
@@ -30,6 +31,13 @@ print("init_db_ok")
 PY
 ```
 
+若初始化时报 `extension "vector" is not available`：
+```bash
+sudo apt-get update
+sudo apt-get install -y postgresql-16-pgvector
+sudo service postgresql restart
+```
+
 ## 3. 准备文本编码模型
 
 ```bash
@@ -43,6 +51,11 @@ export TEXT_EMBED_MODEL_PATH=artifacts/models/text_encoder/multilingual-e5-small
 python scripts/build_feature_store.py --start 2018-01-01T00:00:00Z
 python scripts/build_text_embeddings.py --start 2018-01-01T00:00:00Z --model-path "$TEXT_EMBED_MODEL_PATH"
 python scripts/merge_feature_views.py --start 2018-01-01T00:00:00Z
+```
+
+可选：先补齐全历史多分辨率 K 线并生成对齐上下文（供 Agent/风控按需读取）：
+```bash
+bash scripts/collect_all_timeframe_market_bars.sh
 ```
 
 ## 5. 训练与推理

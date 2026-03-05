@@ -32,7 +32,7 @@ def test_training_loss_outputs_and_calibration_bundle():
         w_direction=0.2,
         w_gate=0.05,
     )
-    for k in ("total", "gaussian_nll", "quantile", "direction", "gate"):
+    for k in ("total", "gaussian_nll", "quantile", "direction", "gate", "horizon_smoothness", "vol_monotonic"):
         assert k in losses
         assert torch.isfinite(losses[k]).item()
 
@@ -44,4 +44,3 @@ def test_training_loss_outputs_and_calibration_bundle():
     )
     assert float(cal.get("sigma_scale", 0.0)) > 0.0
     assert float(cal.get("direction_temperature", 0.0)) > 0.0
-

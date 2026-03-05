@@ -167,6 +167,15 @@ def _save_checkpoint(path: str, state: Dict[str, Any]) -> None:
     os.replace(str(tmp), str(p))
 
 
+def _save_json_atomic(path: str, payload: Dict[str, Any]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(str(tmp), str(p))
+
+
 def _ensure_checkpoint(
     *,
     path: str,
@@ -223,6 +232,25 @@ def _build_session(proxy: str = "") -> requests.Session:
     if p:
         sess.proxies.update({"http": p, "https": p})
     return sess
+
+
+def _is_rate_limit_error(err: str) -> bool:
+    text = str(err or "").lower()
+    return ("429" in text) or ("rate limit" in text) or ("too many requests" in text)
+
+
+def _is_retryable_fetch_error(err: str) -> bool:
+    text = str(err or "").lower()
+    return bool(
+        _is_rate_limit_error(text)
+        or ("timeout" in text)
+        or ("timed out" in text)
+        or ("temporarily unavailable" in text)
+        or ("503" in text)
+        or ("504" in text)
+        or ("502" in text)
+        or ("connection reset" in text)
+    )
 
 
 def _fetch_bitget(
@@ -382,7 +410,15 @@ def _fetch_one_symbol(
     return target_symbol, bars, used_source
 
 
-def _upsert_market_bars(db_url: str, target_symbol: str, timeframe: str, bars: List[Bar], source: str) -> int:
+def _upsert_market_bars(
+    conn: Any,
+    target_symbol: str,
+    timeframe: str,
+    bars: List[Bar],
+    source: str,
+    *,
+    page_size: int,
+) -> int:
     if not bars:
         return 0
     values = [
@@ -400,28 +436,45 @@ def _upsert_market_bars(db_url: str, target_symbol: str, timeframe: str, bars: L
         )
         for bar in bars
     ]
-    with psycopg2.connect(db_url) as conn:
-        with conn.cursor() as cur:
-            execute_values(
-                cur,
-                """
-                INSERT INTO market_bars (
-                    symbol, timeframe, ts, open, high, low, close, volume, trades_count, source
-                ) VALUES %s
-                ON CONFLICT (symbol, timeframe, ts)
-                DO UPDATE SET
-                    open = EXCLUDED.open,
-                    high = EXCLUDED.high,
-                    low = EXCLUDED.low,
-                    close = EXCLUDED.close,
-                    volume = EXCLUDED.volume,
-                    source = EXCLUDED.source
-                """,
-                values,
-                template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                page_size=500,
-            )
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            INSERT INTO market_bars (
+                symbol, timeframe, ts, open, high, low, close, volume, trades_count, source
+            ) VALUES %s
+            ON CONFLICT (symbol, timeframe, ts)
+            DO UPDATE SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                source = EXCLUDED.source
+            """,
+            values,
+            template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            page_size=max(200, int(page_size)),
+        )
     return len(values)
+
+
+def _log_progress(event: str, **payload: object) -> None:
+    body: Dict[str, object] = {
+        "event": str(event),
+        "ts": _to_iso_z(datetime.now(timezone.utc)),
+    }
+    for k, v in payload.items():
+        body[str(k)] = v
+    print(json.dumps(body, ensure_ascii=False), flush=True)
+
+
+def _write_progress_file(path: str, payload: Dict[str, Any]) -> None:
+    if not str(path or "").strip():
+        return
+    out = dict(payload)
+    out["updated_at"] = _to_iso_z(datetime.now(timezone.utc))
+    _save_json_atomic(path, out)
 
 
 def main() -> int:
@@ -451,10 +504,20 @@ def main() -> int:
     ap.add_argument("--database-url", default=DATABASE_URL)
     ap.add_argument("--source", default="bitget_api")
     ap.add_argument("--workers", type=int, default=max(1, int(os.getenv("INGEST_WORKERS", "4"))))
+    ap.add_argument("--min-workers", type=int, default=max(1, int(os.getenv("INGEST_MIN_WORKERS", "1"))))
+    ap.add_argument("--max-workers", type=int, default=max(0, int(os.getenv("INGEST_MAX_WORKERS", "0"))))
+    ap.add_argument("--adaptive-workers", type=int, default=int(os.getenv("INGEST_ADAPTIVE_WORKERS", "1")))
+    ap.add_argument("--rate-limit-backoff-sec", type=float, default=float(os.getenv("INGEST_RATE_LIMIT_BACKOFF_SEC", "5.0")))
+    ap.add_argument("--max-rate-limit-backoff-sec", type=float, default=float(os.getenv("INGEST_MAX_RATE_LIMIT_BACKOFF_SEC", "120.0")))
     ap.add_argument("--max-fetch-retries", type=int, default=max(1, int(os.getenv("INGEST_MAX_FETCH_RETRIES", "4"))))
     ap.add_argument("--retry-backoff-sec", type=float, default=float(os.getenv("INGEST_RETRY_BACKOFF_SEC", "1.0")))
     ap.add_argument("--chunk-days", type=int, default=max(1, int(os.getenv("INGEST_CHUNK_DAYS", "30"))))
+    ap.add_argument("--min-split-chunk-days", type=float, default=float(os.getenv("INGEST_MIN_SPLIT_CHUNK_DAYS", "2.0")))
+    ap.add_argument("--split-failed-symbols", type=int, default=int(os.getenv("INGEST_SPLIT_FAILED_SYMBOLS", "1")))
+    ap.add_argument("--db-page-size", type=int, default=max(200, int(os.getenv("INGEST_DB_PAGE_SIZE", "1200"))))
+    ap.add_argument("--db-commit-every-symbols", type=int, default=max(1, int(os.getenv("INGEST_DB_COMMIT_EVERY_SYMBOLS", "4"))))
     ap.add_argument("--checkpoint-file", default="", help="json checkpoint file for resumable long-range backfill")
+    ap.add_argument("--progress-file", default=os.getenv("INGEST_PROGRESS_FILE", ""))
     ap.add_argument("--resume", action="store_true", help="resume from checkpoint-file")
     ap.add_argument("--max-chunks", type=int, default=0, help="optional chunk cap for staged backfill")
     ap.add_argument("--dry-run", action="store_true", help="plan chunks only; no network/db/csv writes")
@@ -482,6 +545,9 @@ def main() -> int:
         chunk_days=max(1, int(args.chunk_days)),
     )
     checkpoint_file = str(args.checkpoint_file).strip()
+    progress_file = str(args.progress_file).strip()
+    if (not progress_file) and checkpoint_file:
+        progress_file = f"{checkpoint_file}.progress.json"
     checkpoint = None
     completed_chunk_ids = set()
     if checkpoint_file:
@@ -514,15 +580,77 @@ def main() -> int:
     chunks_skipped_resume = 0
     chunks_completed = 0
     workers = max(1, int(args.workers))
+    min_workers = max(1, int(args.min_workers))
+    max_workers = max(workers, int(args.max_workers or workers))
+    current_workers = min(max_workers, max(min_workers, workers))
+    adaptive_workers = bool(int(args.adaptive_workers))
+    backoff_sec = 0.0
+    no_error_streak = 0
+    run_started = time.monotonic()
+    _log_progress(
+        "ingest_start",
+        market=args.market,
+        timeframe=args.timeframe,
+        symbols=len(req_symbols),
+        start=_to_iso_z(start_dt),
+        end=_to_iso_z(end_dt),
+        chunks_total=len(chunks),
+        checkpoint_file=checkpoint_file or None,
+    )
+    _write_progress_file(
+        progress_file,
+        {
+            "status": "running",
+            "market": str(args.market),
+            "timeframe": str(args.timeframe),
+            "start": _to_iso_z(start_dt),
+            "end": _to_iso_z(end_dt),
+            "chunks_total": int(len(chunks)),
+            "chunks_completed": int(chunks_completed),
+            "chunks_attempted": int(chunks_attempted),
+            "chunks_skipped_resume": int(chunks_skipped_resume),
+            "workers": int(current_workers),
+            "checkpoint_file": checkpoint_file or None,
+        },
+    )
     try:
         for idx, (chunk_start_ms, chunk_end_ms) in enumerate(chunks):
             if int(args.max_chunks) > 0 and chunks_attempted >= int(args.max_chunks):
                 break
+            # Bitget may reject zero-width ranges; skip degenerate chunk.
+            if int(chunk_end_ms) <= int(chunk_start_ms):
+                continue
             chunk_name = _chunk_id(idx, chunk_start_ms, chunk_end_ms)
             if chunk_name in completed_chunk_ids:
                 chunks_skipped_resume += 1
                 continue
             chunks_attempted += 1
+            chunk_started = time.monotonic()
+            _log_progress(
+                "chunk_start",
+                chunk=chunk_name,
+                chunk_index=int(idx + 1),
+                chunks_total=len(chunks),
+                start=_to_iso_z(_utc_from_ms(chunk_start_ms)),
+                end=_to_iso_z(_utc_from_ms(chunk_end_ms)),
+                workers=int(current_workers),
+            )
+            _write_progress_file(
+                progress_file,
+                {
+                    "status": "running",
+                    "market": str(args.market),
+                    "timeframe": str(args.timeframe),
+                    "chunk": chunk_name,
+                    "chunk_index": int(idx + 1),
+                    "chunks_total": int(len(chunks)),
+                    "chunks_completed": int(chunks_completed),
+                    "chunks_attempted": int(chunks_attempted),
+                    "chunks_skipped_resume": int(chunks_skipped_resume),
+                    "workers": int(current_workers),
+                    "checkpoint_file": checkpoint_file or None,
+                },
+            )
             if bool(args.dry_run):
                 dry_plan.append(
                     {
@@ -537,67 +665,200 @@ def main() -> int:
             chunk_failed: List[Dict[str, str]] = []
             chunk_rows = 0
             days_for_fallback = max(1, int(((chunk_end_ms - chunk_start_ms) / (24 * 60 * 60 * 1000)) + 2))
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {}
-                for src_symbol in req_symbols:
-                    target = symbol_map.get(src_symbol) or (src_symbol[:-4] if src_symbol.endswith("USDT") else src_symbol)
-                    fut = ex.submit(
-                        _fetch_one_symbol,
-                        src_symbol=src_symbol,
-                        target_symbol=target,
-                        market=str(args.market),
-                        timeframe=str(args.timeframe),
-                        start_ms=chunk_start_ms,
-                        end_ms=chunk_end_ms,
-                        fallback_source=str(args.fallback_source),
-                        coingecko_map=coingecko_map,
-                        proxy=str(args.proxy),
-                        source_label=str(args.source),
-                        days_for_fallback=days_for_fallback,
-                        max_retries=int(args.max_fetch_retries),
-                        retry_backoff_sec=float(args.retry_backoff_sec),
-                    )
-                    futs[fut] = {"src_symbol": src_symbol, "target_symbol": target}
-                for fut in as_completed(futs):
-                    meta = futs[fut]
-                    src_symbol = str(meta.get("src_symbol") or "")
-                    target = str(meta.get("target_symbol") or "")
-                    try:
-                        target, bars, used_source = fut.result()
-                        if csv_writer is not None:
-                            for bar in bars:
-                                csv_writer.writerow(
-                                    {
-                                        "symbol": target,
-                                        "timeframe": str(args.timeframe),
-                                        "ts": datetime.fromtimestamp(bar.ts_ms / 1000.0, tz=timezone.utc).isoformat(),
-                                        "open": float(bar.open),
-                                        "high": float(bar.high),
-                                        "low": float(bar.low),
-                                        "close": float(bar.close),
-                                        "volume": float(bar.volume),
-                                        "trades_count": 0,
-                                        "source": used_source,
-                                    }
+            failed_by_symbol: Dict[str, Dict[str, str]] = {}
+            split_recovered = 0
+            db_conn = psycopg2.connect(args.database_url) if not bool(args.skip_db) else None
+            symbols_since_commit = 0
+            try:
+                with ThreadPoolExecutor(max_workers=int(current_workers)) as ex:
+                    futs = {}
+                    for src_symbol in req_symbols:
+                        target = symbol_map.get(src_symbol) or (src_symbol[:-4] if src_symbol.endswith("USDT") else src_symbol)
+                        fut = ex.submit(
+                            _fetch_one_symbol,
+                            src_symbol=src_symbol,
+                            target_symbol=target,
+                            market=str(args.market),
+                            timeframe=str(args.timeframe),
+                            start_ms=chunk_start_ms,
+                            end_ms=chunk_end_ms,
+                            fallback_source=str(args.fallback_source),
+                            coingecko_map=coingecko_map,
+                            proxy=str(args.proxy),
+                            source_label=str(args.source),
+                            days_for_fallback=days_for_fallback,
+                            max_retries=int(args.max_fetch_retries),
+                            retry_backoff_sec=float(args.retry_backoff_sec),
+                        )
+                        futs[fut] = {"src_symbol": src_symbol, "target_symbol": target}
+                    for fut in as_completed(futs):
+                        meta = futs[fut]
+                        src_symbol = str(meta.get("src_symbol") or "")
+                        target = str(meta.get("target_symbol") or "")
+                        try:
+                            target, bars, used_source = fut.result()
+                            if csv_writer is not None:
+                                for bar in bars:
+                                    csv_writer.writerow(
+                                        {
+                                            "symbol": target,
+                                            "timeframe": str(args.timeframe),
+                                            "ts": datetime.fromtimestamp(bar.ts_ms / 1000.0, tz=timezone.utc).isoformat(),
+                                            "open": float(bar.open),
+                                            "high": float(bar.high),
+                                            "low": float(bar.low),
+                                            "close": float(bar.close),
+                                            "volume": float(bar.volume),
+                                            "trades_count": 0,
+                                            "source": used_source,
+                                        }
+                                    )
+                            if bool(args.skip_db):
+                                count = int(len(bars))
+                            else:
+                                assert db_conn is not None
+                                count = _upsert_market_bars(
+                                    db_conn,
+                                    target_symbol=target,
+                                    timeframe=str(args.timeframe),
+                                    bars=bars,
+                                    source=used_source,
+                                    page_size=int(args.db_page_size),
                                 )
-                        if bool(args.skip_db):
-                            count = int(len(bars))
-                        else:
-                            count = _upsert_market_bars(
-                                args.database_url,
+                                symbols_since_commit += 1
+                                if symbols_since_commit >= int(args.db_commit_every_symbols):
+                                    db_conn.commit()
+                                    symbols_since_commit = 0
+                            chunk_rows += int(count)
+                            summary_rows[target] = int(summary_rows.get(target, 0)) + int(count)
+                            summary_sources.setdefault(target, set()).add(str(used_source))
+                        except Exception as exc:
+                            row = {"src_symbol": src_symbol, "target_symbol": target, "error": str(exc)}
+                            failed_by_symbol[src_symbol] = row
+                            chunk_failed.append(row)
+                            failed.append({"chunk": chunk_name, **row})
+                            summary_rows.setdefault(target or src_symbol, 0)
+                            summary_sources.setdefault(target or src_symbol, set()).add("failed")
+
+                window_days = float(max(0.01, (chunk_end_ms - chunk_start_ms + 1) / (24 * 60 * 60 * 1000)))
+                allow_split = bool(int(args.split_failed_symbols)) and (window_days >= float(args.min_split_chunk_days))
+                if allow_split and failed_by_symbol:
+                    split_start_1 = int(chunk_start_ms)
+                    split_end_1 = int((chunk_start_ms + chunk_end_ms) // 2)
+                    split_start_2 = int(split_end_1 + 1)
+                    split_end_2 = int(chunk_end_ms)
+                    recovered_symbols: List[str] = []
+                    for src_symbol, row in list(failed_by_symbol.items()):
+                        target = str(row.get("target_symbol") or "")
+                        err_msg = str(row.get("error") or "")
+                        if not _is_retryable_fetch_error(err_msg):
+                            continue
+                        try:
+                            _, bars_a, src_a = _fetch_one_symbol(
+                                src_symbol=src_symbol,
                                 target_symbol=target,
+                                market=str(args.market),
                                 timeframe=str(args.timeframe),
-                                bars=bars,
-                                source=used_source,
+                                start_ms=split_start_1,
+                                end_ms=split_end_1,
+                                fallback_source=str(args.fallback_source),
+                                coingecko_map=coingecko_map,
+                                proxy=str(args.proxy),
+                                source_label=str(args.source),
+                                days_for_fallback=max(1, int(((split_end_1 - split_start_1) / (24 * 60 * 60 * 1000)) + 2)),
+                                max_retries=int(args.max_fetch_retries),
+                                retry_backoff_sec=float(args.retry_backoff_sec),
                             )
-                        chunk_rows += int(count)
-                        summary_rows[target] = int(summary_rows.get(target, 0)) + int(count)
-                        summary_sources.setdefault(target, set()).add(str(used_source))
-                    except Exception as exc:
-                        chunk_failed.append({"src_symbol": src_symbol, "target_symbol": target, "error": str(exc)})
-                        failed.append({"chunk": chunk_name, "src_symbol": src_symbol, "target_symbol": target, "error": str(exc)})
-                        summary_rows.setdefault(target or src_symbol, 0)
-                        summary_sources.setdefault(target or src_symbol, set()).add("failed")
+                            _, bars_b, src_b = _fetch_one_symbol(
+                                src_symbol=src_symbol,
+                                target_symbol=target,
+                                market=str(args.market),
+                                timeframe=str(args.timeframe),
+                                start_ms=split_start_2,
+                                end_ms=split_end_2,
+                                fallback_source=str(args.fallback_source),
+                                coingecko_map=coingecko_map,
+                                proxy=str(args.proxy),
+                                source_label=str(args.source),
+                                days_for_fallback=max(1, int(((split_end_2 - split_start_2) / (24 * 60 * 60 * 1000)) + 2)),
+                                max_retries=int(args.max_fetch_retries),
+                                retry_backoff_sec=float(args.retry_backoff_sec),
+                            )
+                            merged: Dict[int, Bar] = {}
+                            for bar in list(bars_a) + list(bars_b):
+                                merged[int(bar.ts_ms)] = bar
+                            bars = [merged[k] for k in sorted(merged.keys())]
+                            if csv_writer is not None:
+                                split_src = src_a if src_a == src_b else "split_mixed"
+                                for bar in bars:
+                                    csv_writer.writerow(
+                                        {
+                                            "symbol": target,
+                                            "timeframe": str(args.timeframe),
+                                            "ts": datetime.fromtimestamp(bar.ts_ms / 1000.0, tz=timezone.utc).isoformat(),
+                                            "open": float(bar.open),
+                                            "high": float(bar.high),
+                                            "low": float(bar.low),
+                                            "close": float(bar.close),
+                                            "volume": float(bar.volume),
+                                            "trades_count": 0,
+                                            "source": split_src,
+                                        }
+                                    )
+                            if bool(args.skip_db):
+                                count = int(len(bars))
+                            else:
+                                assert db_conn is not None
+                                split_src = src_a if src_a == src_b else "split_mixed"
+                                count = _upsert_market_bars(
+                                    db_conn,
+                                    target_symbol=target,
+                                    timeframe=str(args.timeframe),
+                                    bars=bars,
+                                    source=split_src,
+                                    page_size=int(args.db_page_size),
+                                )
+                                symbols_since_commit += 1
+                                if symbols_since_commit >= int(args.db_commit_every_symbols):
+                                    db_conn.commit()
+                                    symbols_since_commit = 0
+                            chunk_rows += int(count)
+                            summary_rows[target] = int(summary_rows.get(target, 0)) + int(count)
+                            summary_sources.setdefault(target, set()).add("split_recovered")
+                            split_recovered += 1
+                            recovered_symbols.append(src_symbol)
+                            _log_progress(
+                                "chunk_split_recover",
+                                chunk=chunk_name,
+                                symbol=src_symbol,
+                                rows=int(count),
+                                window_days=window_days,
+                            )
+                        except Exception as split_exc:
+                            failed_by_symbol[src_symbol] = {
+                                "src_symbol": src_symbol,
+                                "target_symbol": target,
+                                "error": f"{err_msg} | split_retry_failed:{split_exc}",
+                            }
+                    if recovered_symbols:
+                        survived = [r for r in chunk_failed if str(r.get("src_symbol") or "") not in set(recovered_symbols)]
+                        chunk_failed = survived
+                        for src_symbol in recovered_symbols:
+                            failed_by_symbol.pop(src_symbol, None)
+                        failed = [
+                            r
+                            for r in failed
+                            if not (str(r.get("chunk") or "") == chunk_name and str(r.get("src_symbol") or "") in set(recovered_symbols))
+                        ]
+                if db_conn is not None:
+                    db_conn.commit()
+            except Exception:
+                if db_conn is not None:
+                    db_conn.rollback()
+                raise
+            finally:
+                if db_conn is not None:
+                    db_conn.close()
 
             if checkpoint_file and checkpoint is not None:
                 completed_map = checkpoint.setdefault("completed_chunks", {})
@@ -613,6 +874,63 @@ def main() -> int:
                 completed_chunk_ids.add(chunk_name)
 
             chunks_completed += 1
+            _log_progress(
+                "chunk_done",
+                chunk=chunk_name,
+                rows=int(chunk_rows),
+                failed_symbols=len(chunk_failed),
+                split_recovered=int(split_recovered),
+                chunks_completed=int(chunks_completed),
+                chunks_attempted=int(chunks_attempted),
+                chunks_total=len(chunks),
+                workers=int(current_workers),
+                elapsed_sec=round(float(time.monotonic() - chunk_started), 3),
+            )
+            rate_limit_hits = sum(1 for row in chunk_failed if _is_rate_limit_error(str(row.get("error") or "")))
+            retryable_hits = sum(1 for row in chunk_failed if _is_retryable_fetch_error(str(row.get("error") or "")))
+            if adaptive_workers:
+                if rate_limit_hits > 0 or retryable_hits > 0:
+                    old_workers = int(current_workers)
+                    current_workers = max(min_workers, current_workers - 1)
+                    no_error_streak = 0
+                    backoff_sec = min(float(args.max_rate_limit_backoff_sec), max(float(args.rate_limit_backoff_sec), (backoff_sec * 1.6) + 1.0))
+                    if old_workers != current_workers:
+                        _log_progress(
+                            "workers_downshift",
+                            old_workers=old_workers,
+                            new_workers=int(current_workers),
+                            rate_limit_hits=int(rate_limit_hits),
+                            retryable_hits=int(retryable_hits),
+                            chunk=chunk_name,
+                        )
+                    _log_progress("rate_limit_backoff", sleep_sec=round(float(backoff_sec), 3), chunk=chunk_name)
+                    time.sleep(max(0.0, float(backoff_sec)))
+                else:
+                    no_error_streak += 1
+                    if no_error_streak >= 3 and current_workers < max_workers:
+                        old_workers = int(current_workers)
+                        current_workers += 1
+                        no_error_streak = 0
+                        backoff_sec = max(0.0, backoff_sec * 0.5)
+                        _log_progress("workers_upshift", old_workers=old_workers, new_workers=int(current_workers), chunk=chunk_name)
+            _write_progress_file(
+                progress_file,
+                {
+                    "status": "running",
+                    "market": str(args.market),
+                    "timeframe": str(args.timeframe),
+                    "chunk": chunk_name,
+                    "chunks_total": int(len(chunks)),
+                    "chunks_completed": int(chunks_completed),
+                    "chunks_attempted": int(chunks_attempted),
+                    "chunks_skipped_resume": int(chunks_skipped_resume),
+                    "rows_last_chunk": int(chunk_rows),
+                    "failed_last_chunk": int(len(chunk_failed)),
+                    "split_recovered_last_chunk": int(split_recovered),
+                    "workers": int(current_workers),
+                    "checkpoint_file": checkpoint_file or None,
+                },
+            )
             if chunk_failed and not bool(args.allow_partial):
                 raise RuntimeError(json.dumps({"failed_symbols": chunk_failed, "chunk": chunk_name}, ensure_ascii=False))
     finally:
@@ -620,6 +938,20 @@ def main() -> int:
             csv_file.close()
 
     if bool(args.dry_run):
+        _write_progress_file(
+            progress_file,
+            {
+                "status": "dry_run",
+                "market": str(args.market),
+                "timeframe": str(args.timeframe),
+                "chunks_total": int(len(chunks)),
+                "chunks_completed": int(chunks_completed),
+                "chunks_attempted": int(chunks_attempted),
+                "chunks_skipped_resume": int(chunks_skipped_resume),
+                "workers": int(current_workers),
+                "checkpoint_file": checkpoint_file or None,
+            },
+        )
         print(
             json.dumps(
                 {
@@ -640,6 +972,22 @@ def main() -> int:
         return 0
 
     if failed and not bool(args.allow_partial):
+        _write_progress_file(
+            progress_file,
+            {
+                "status": "failed",
+                "market": str(args.market),
+                "timeframe": str(args.timeframe),
+                "chunks_total": int(len(chunks)),
+                "chunks_completed": int(chunks_completed),
+                "chunks_attempted": int(chunks_attempted),
+                "chunks_skipped_resume": int(chunks_skipped_resume),
+                "workers": int(current_workers),
+                "checkpoint_file": checkpoint_file or None,
+                "failed_count": int(len(failed)),
+                "error": "failed_symbols_present_and_allow_partial_disabled",
+            },
+        )
         raise RuntimeError(json.dumps({"failed_symbols": failed}, ensure_ascii=False))
 
     summary = {
@@ -663,9 +1011,26 @@ def main() -> int:
                 "checkpoint_file": checkpoint_file or None,
                 "failed": failed,
                 "inserted": summary,
+                "elapsed_sec": round(float(time.monotonic() - run_started), 3),
             },
             ensure_ascii=False,
         )
+    )
+    _write_progress_file(
+        progress_file,
+        {
+            "status": "completed",
+            "market": str(args.market),
+            "timeframe": str(args.timeframe),
+            "chunks_total": int(len(chunks)),
+            "chunks_completed": int(chunks_completed),
+            "chunks_attempted": int(chunks_attempted),
+            "chunks_skipped_resume": int(chunks_skipped_resume),
+            "workers": int(current_workers),
+            "checkpoint_file": checkpoint_file or None,
+            "failed_count": int(len(failed)),
+            "elapsed_sec": round(float(time.monotonic() - run_started), 3),
+        },
     )
     return 0
 

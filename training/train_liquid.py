@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,10 @@ from typing import Any, Dict, List, Sequence
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from backend.v2_repository import V2Repository
 from mlops_artifacts.pack import pack_model_artifact
@@ -22,6 +27,7 @@ from training.datasets.liquid_sequence_dataset import HORIZONS, LiquidSequenceDa
 from training.losses.trading_losses import compose_liquid_loss
 from training.metrics.liquid_metrics import evaluate_liquid_metrics
 from training.splits.walkforward_purged import WalkForwardPurgedConfig, build_walkforward_purged_splits
+from scripts.audit_offline_training_data import AuditArgs, run_audit
 
 
 @dataclass
@@ -53,6 +59,10 @@ class TrainConfig:
     purge_gap_hours: int
     step_days: int
     force_purged: bool
+    top_n: int = 50
+    enable_offline_audit: bool = True
+    audit_enforce_blocked_exclusion: bool = True
+    audit_bucket: str = "5m"
 
 
 def _parse_dt(raw: str) -> datetime:
@@ -77,7 +87,8 @@ def _build_cfg() -> TrainConfig:
     ap.add_argument("--use-universe-snapshot", type=int, default=int(os.getenv("LIQUID_USE_UNIVERSE_SNAPSHOT", "1")))
     ap.add_argument("--start", default=os.getenv("LIQUID_TRAIN_START", "2025-01-01T00:00:00Z"))
     ap.add_argument("--end", default=os.getenv("LIQUID_TRAIN_END", ""))
-    ap.add_argument("--lookback", type=int, default=int(os.getenv("LIQUID_LOOKBACK", "96")))
+    # Trend setup default: 5m bars * 2016 ~= 7 days context.
+    ap.add_argument("--lookback", type=int, default=int(os.getenv("LIQUID_LOOKBACK", "2016")))
     ap.add_argument("--epochs", type=int, default=int(os.getenv("LIQUID_EPOCHS", "6")))
     ap.add_argument("--batch-size", type=int, default=int(os.getenv("LIQUID_BATCH", "32")))
     ap.add_argument("--lr", type=float, default=float(os.getenv("LIQUID_LR", "1e-3")))
@@ -98,6 +109,14 @@ def _build_cfg() -> TrainConfig:
     ap.add_argument("--purge-gap-hours", type=int, default=int(os.getenv("LIQUID_WF_PURGE_GAP_HOURS", "24")))
     ap.add_argument("--step-days", type=int, default=int(os.getenv("LIQUID_WF_STEP_DAYS", "7")))
     ap.add_argument("--force-purged", action="store_true", default=str(os.getenv("LIQUID_FORCE_PURGED", "1")).lower() in {"1", "true", "yes", "on"})
+    ap.add_argument("--top-n", type=int, default=int(os.getenv("LIQUID_TOP_N", "50")))
+    ap.add_argument("--enable-offline-audit", type=int, default=int(os.getenv("LIQUID_ENABLE_OFFLINE_AUDIT", "1")))
+    ap.add_argument(
+        "--audit-enforce-blocked-exclusion",
+        type=int,
+        default=int(os.getenv("LIQUID_AUDIT_ENFORCE_BLOCKED_EXCLUSION", "1")),
+    )
+    ap.add_argument("--audit-bucket", default=os.getenv("LIQUID_AUDIT_BUCKET", os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m")))
     args = ap.parse_args()
 
     end = _parse_dt(args.end) if str(args.end).strip() else datetime.now(timezone.utc)
@@ -129,6 +148,10 @@ def _build_cfg() -> TrainConfig:
         purge_gap_hours=max(0, int(args.purge_gap_hours)),
         step_days=max(1, int(args.step_days)),
         force_purged=bool(args.force_purged),
+        top_n=max(1, int(args.top_n)),
+        enable_offline_audit=bool(int(args.enable_offline_audit)),
+        audit_enforce_blocked_exclusion=bool(int(args.audit_enforce_blocked_exclusion)),
+        audit_bucket=str(args.audit_bucket).strip().lower() or "5m",
     )
 
 
@@ -168,6 +191,8 @@ def _resolve_training_universe(cfg: TrainConfig) -> Dict[str, Any]:
     symbols = _normalize_symbols(list(resolved.get("symbols") or []))
     if not symbols:
         raise RuntimeError("resolved_universe_empty")
+    if cfg.top_n > 0:
+        symbols = symbols[: int(cfg.top_n)]
     universe_version = str(resolved.get("universe_version") or "runtime_resolved")
     source = str(resolved.get("source") or "snapshot")
     repo.upsert_asset_universe_snapshot(
@@ -187,6 +212,48 @@ def _resolve_training_universe(cfg: TrainConfig) -> Dict[str, Any]:
     }
 
 
+def _audit_and_filter_symbols(cfg: TrainConfig, symbols: Sequence[str]) -> Dict[str, Any]:
+    syms = _normalize_symbols(symbols)
+    if not syms:
+        raise RuntimeError("audit_symbols_empty")
+    args = AuditArgs(
+        database_url=str(cfg.db_url),
+        track=str(cfg.universe_track),
+        symbols=list(syms),
+        start=cfg.start,
+        end=cfg.end,
+        lookback=int(cfg.lookback),
+        bucket=str(cfg.audit_bucket),
+        min_market_ratio=float(os.getenv("AUDIT_MIN_MARKET_RATIO", "0.98")),
+        min_feature_matrix_ratio=float(os.getenv("AUDIT_MIN_FEATURE_MATRIX_RATIO", "0.95")),
+        strict_schema_mismatch_zero=True,
+        min_text_coverage=float(os.getenv("AUDIT_MIN_TEXT_COVERAGE", "0.05")),
+        enforce_text_coverage=bool(int(os.getenv("AUDIT_ENFORCE_TEXT_COVERAGE", "0"))),
+        created_by="train_liquid",
+        task_id=f"train-liq-{cfg.start.strftime('%Y%m%d%H%M%S')}",
+        as_of=cfg.start,
+        top_n=int(cfg.top_n),
+    )
+    audit = run_audit(args)
+    blocked = sorted(list(audit.get("blocked_symbols") or []))
+    degraded = sorted(list(audit.get("degraded_symbols") or []))
+    ready = sorted(list(audit.get("ready_symbols") or []))
+    keep = [s for s in syms if s not in set(blocked)]
+    if cfg.audit_enforce_blocked_exclusion and not keep:
+        raise RuntimeError("all_symbols_blocked_by_offline_audit")
+    if not cfg.audit_enforce_blocked_exclusion:
+        keep = list(syms)
+    return {
+        "symbols_requested": syms,
+        "symbols_kept": keep,
+        "symbols_blocked": blocked,
+        "symbols_degraded": degraded,
+        "symbols_ready": ready,
+        "audit_summary": dict(audit.get("summary") or {}),
+        "audit_task_id": str(audit.get("task_id") or ""),
+    }
+
+
 def _attach_universe_to_training_report(training_report: Dict[str, Any], universe_meta: Dict[str, Any]) -> None:
     training_report["universe"] = {
         "track": str(universe_meta.get("track") or "liquid"),
@@ -198,7 +265,7 @@ def _attach_universe_to_training_report(training_report: Dict[str, Any], univers
     }
 
 
-def _build_model(cfg: TrainConfig) -> LiquidModel:
+def _build_model(cfg: TrainConfig, *, num_symbols: int, regime_dim: int) -> LiquidModel:
     text_indices = [FEATURE_INDEX[k] for k in sorted(k for k in FEATURE_INDEX if k.startswith("text_emb_"))]
     quality_indices = [
         FEATURE_INDEX[k]
@@ -218,26 +285,44 @@ def _build_model(cfg: TrainConfig) -> LiquidModel:
         quantiles=list(DEFAULT_QUANTILES),
         text_indices=text_indices,
         quality_indices=quality_indices,
+        num_symbols=max(1, int(num_symbols)),
+        regime_dim=max(1, int(regime_dim)),
     )
     return LiquidModel(model_cfg)
 
 
 def _train_one_epoch(model: LiquidModel, loader: DataLoader, device: torch.device, opt: torch.optim.Optimizer) -> Dict[str, float]:
     model.train()
-    logs: Dict[str, List[float]] = {"total": [], "gaussian_nll": [], "quantile": [], "direction": [], "gate": []}
+    logs: Dict[str, List[float]] = {
+        "total": [],
+        "gaussian_nll": [],
+        "quantile": [],
+        "direction": [],
+        "gate": [],
+        "calibration": [],
+        "load_balance": [],
+        "router_entropy": [],
+        "horizon_smoothness": [],
+        "vol_monotonic": [],
+    }
     for batch in loader:
         xv = batch["x_values"].to(device)
         xm = batch["x_mask"].to(device)
+        sid = batch["symbol_id"].to(device)
+        regime = batch["regime_features"].to(device)
+        regime_mask = batch["regime_mask"].to(device)
         y = batch["y_net"].to(device)
         cost_bps = batch["cost_bps"].to(device)
 
-        out = model(xv, xm)
+        out = model(xv, xm, symbol_id=sid, regime_features=regime, regime_mask=regime_mask)
         losses = compose_liquid_loss(
             mu=out.mu,
             log_sigma=out.log_sigma,
             q=out.q,
             direction_logit=out.direction_logit,
             gate=out.aux.get("gate") if isinstance(out.aux, dict) else None,
+            df=out.df,
+            expert_weights=out.expert_weights,
             y=y,
             cost_bps=cost_bps,
             quantiles=list(DEFAULT_QUANTILES),
@@ -245,6 +330,11 @@ def _train_one_epoch(model: LiquidModel, loader: DataLoader, device: torch.devic
             w_quantile=0.3,
             w_direction=0.2,
             w_gate=0.05,
+            w_calibration=0.05,
+            w_load_balance=0.02,
+            w_router_entropy=0.01,
+            w_horizon_smoothness=0.02,
+            w_vol_monotonic=0.02,
         )
 
         opt.zero_grad(set_to_none=True)
@@ -253,7 +343,7 @@ def _train_one_epoch(model: LiquidModel, loader: DataLoader, device: torch.devic
         opt.step()
 
         for k in logs:
-            logs[k].append(float(losses[k].detach().cpu().item()))
+            logs[k].append(float(losses.get(k, torch.tensor(0.0, device=y.device)).detach().cpu().item()))
 
     return {k: float(np.mean(v)) if v else 0.0 for k, v in logs.items()}
 
@@ -265,16 +355,21 @@ def _collect_predictions(model: LiquidModel, loader: DataLoader, device: torch.d
     out_q: List[np.ndarray] = []
     out_dir: List[np.ndarray] = []
     out_gate: List[np.ndarray] = []
+    out_expert: List[np.ndarray] = []
+    out_regime: List[np.ndarray] = []
     y_raw: List[np.ndarray] = []
     y_net: List[np.ndarray] = []
     with torch.no_grad():
         for batch in loader:
             xv = batch["x_values"].to(device)
             xm = batch["x_mask"].to(device)
+            sid = batch["symbol_id"].to(device)
+            regime = batch["regime_features"].to(device)
+            regime_mask = batch["regime_mask"].to(device)
             y_raw.append(_to_numpy(batch["y_raw"]))
             y_net.append(_to_numpy(batch["y_net"]))
 
-            pred = model(xv, xm)
+            pred = model(xv, xm, symbol_id=sid, regime_features=regime, regime_mask=regime_mask)
             out_mu.append(_to_numpy(pred.mu))
             out_sigma.append(_to_numpy(torch.exp(pred.log_sigma)))
             if pred.q is not None:
@@ -284,6 +379,10 @@ def _collect_predictions(model: LiquidModel, loader: DataLoader, device: torch.d
             gate_t = pred.aux.get("gate") if isinstance(pred.aux, dict) else None
             if isinstance(gate_t, torch.Tensor):
                 out_gate.append(_to_numpy(gate_t))
+            if isinstance(pred.expert_weights, torch.Tensor):
+                out_expert.append(_to_numpy(pred.expert_weights))
+            if isinstance(pred.regime_probs, torch.Tensor):
+                out_regime.append(_to_numpy(pred.regime_probs))
 
     pack: Dict[str, np.ndarray] = {
         "mu": np.concatenate(out_mu, axis=0) if out_mu else np.zeros((0, len(HORIZONS)), dtype=np.float32),
@@ -293,6 +392,8 @@ def _collect_predictions(model: LiquidModel, loader: DataLoader, device: torch.d
         "direction_logit": np.concatenate(out_dir, axis=0) if out_dir else np.zeros((0, len(HORIZONS)), dtype=np.float32),
         "gate": np.concatenate(out_gate, axis=0) if out_gate else np.zeros((0, len(HORIZONS)), dtype=np.float32),
         "q": np.concatenate(out_q, axis=0) if out_q else np.zeros((0, len(HORIZONS), len(DEFAULT_QUANTILES)), dtype=np.float32),
+        "expert_weights": np.concatenate(out_expert, axis=0) if out_expert else np.zeros((0, 4), dtype=np.float32),
+        "regime_probs": np.concatenate(out_regime, axis=0) if out_regime else np.zeros((0, 3), dtype=np.float32),
     }
     return pack
 
@@ -303,13 +404,15 @@ def _run_fold(
     samples: Sequence,
     fold: Dict[str, np.ndarray],
     device: torch.device,
+    num_symbols: int,
+    regime_dim: int,
 ) -> Dict[str, object]:
     ds = LiquidSequenceDataset(samples)
     tr = DataLoader(Subset(ds, fold["train"].tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=False)
     va = DataLoader(Subset(ds, fold["val"].tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False)
     te = DataLoader(Subset(ds, fold["test"].tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False)
 
-    model = _build_model(cfg).to(device)
+    model = _build_model(cfg, num_symbols=num_symbols, regime_dim=regime_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     best_state = None
@@ -375,6 +478,10 @@ def main() -> int:
     cfg = _build_cfg()
     universe_meta = _resolve_training_universe(cfg)
     symbols_for_training = _normalize_symbols(list(universe_meta.get("symbols") or []))
+    readiness = {}
+    if cfg.enable_offline_audit:
+        readiness = _audit_and_filter_symbols(cfg, symbols_for_training)
+        symbols_for_training = _normalize_symbols(list(readiness.get("symbols_kept") or []))
     if not symbols_for_training:
         raise RuntimeError("training_universe_empty")
     samples = load_training_samples(
@@ -404,6 +511,9 @@ def main() -> int:
         raise RuntimeError("no_training_folds")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    unique_symbols = sorted({str(s.symbol).upper() for s in samples})
+    num_symbols = max(1, len(unique_symbols))
+    regime_dim = int(getattr(samples[0], "regime_features", np.zeros((16,), dtype=np.float32)).shape[0]) if samples else 16
 
     fold_reports: List[Dict[str, object]] = []
     fold_metrics: List[Dict[str, Dict[str, float]]] = []
@@ -414,7 +524,14 @@ def main() -> int:
     oof_gate: List[np.ndarray] = []
 
     for i, fold in enumerate(folds):
-        fr = _run_fold(cfg=cfg, samples=samples, fold=fold, device=device)
+        fr = _run_fold(
+            cfg=cfg,
+            samples=samples,
+            fold=fold,
+            device=device,
+            num_symbols=num_symbols,
+            regime_dim=regime_dim,
+        )
         f_metrics = dict(fr["metrics"])
         fold_metrics.append(f_metrics)
         pred = dict(fr["pred"])
@@ -444,7 +561,7 @@ def main() -> int:
     # final fit on all samples with fold-selected config
     full_ds = LiquidSequenceDataset(samples)
     full_loader = DataLoader(full_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False)
-    model = _build_model(cfg).to(device)
+    model = _build_model(cfg, num_symbols=num_symbols, regime_dim=regime_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     final_loss_trace: List[Dict[str, float]] = []
     for _ in range(cfg.epochs):
@@ -494,12 +611,15 @@ def main() -> int:
         "final_fit_loss": final_loss_trace,
     }
     _attach_universe_to_training_report(training_report, universe_meta)
+    if readiness:
+        training_report["readiness"] = readiness
 
     state = {
         "state_dict": model.state_dict(),
         "schema_hash": str(SCHEMA_HASH),
         "calibration": calibrator,
         "cost_profile": cfg.cost_profile,
+        "symbol_to_id": {sym: i for i, sym in enumerate(unique_symbols)},
         **model.export_meta(),
     }
 

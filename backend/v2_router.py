@@ -6,13 +6,17 @@ import time
 import uuid
 import logging
 import sys
+import threading
+import asyncio
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Query
+import requests
+from fastapi import APIRouter, HTTPException, Query, Body, Request
+from fastapi.responses import StreamingResponse
 
 from schemas_v2 import (
     AsyncTaskSubmitResponse,
@@ -90,9 +94,10 @@ from execution_api import (
     order_to_risk_weight as _executionapi_order_to_risk_weight,
 )
 from feature_signal import feature_signal_score
-from cost.cost_profile import compute_cost_map, load_cost_profile
+from cost.cost_profile import compute_cost_breakdown_bps, compute_cost_map, estimate_turnover, load_cost_profile
 from liquid_model_service import LiquidModelService
 from vc_model_service import VCModelService
+from financial_analysis_agent import FinancialAnalysisAgent, FinancialAnalysisConfig
 try:
     from backend.metrics import (
         BACKTEST_FAILED_RUNS_TOTAL,
@@ -150,6 +155,16 @@ from strategy_backtest import score_source_filter as _strategybacktest_score_sou
 from strategy_signal import strategy_bucket as _strategysignal_strategy_bucket
 from v2_repository import V2Repository
 from task_queue import enqueue_task, get_task
+from runtime_config_service import RuntimeConfigService
+from process_manager import ProcessManager
+from risk_command_center import RiskCommandExecutor, SUPPORTED_COMMANDS, parse_risk_command
+from secrets_manager import SecretsManager
+from mailer import send_risk_email
+from connectivity_service import ConnectivityService
+from clock_drift_service import ClockDriftService
+from execution_safety import ExecutionSafetyController
+from proxy_utils import mask_sensitive, proxy_env_overrides, proxy_url_from_profile
+from rbac import ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER, require_role, resolve_actor_role
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +200,13 @@ exec_engine = ExecutionEngine()
 _RISK_MANAGER = RiskManager()
 _POSITION_SIZER = PositionSizer()
 _STYLE_SELECTOR = ExecutionStyleSelector()
+_FINANCIAL_ANALYSIS_AGENT = FinancialAnalysisAgent(
+    FinancialAnalysisConfig(
+        enabled=str(os.getenv("FINANCIAL_ANALYSIS_AGENT_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"},
+        router_hint_enabled=str(os.getenv("AGENT_ROUTER_HINT_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"},
+    )
+)
+_EXECUTION_SAFETY = ExecutionSafetyController()
 _ACCOUNT_STATE_AGGREGATORS: Dict[Tuple[str, str], AccountStateAggregator] = {}
 DEFAULT_LIQUID_SYMBOLS = "BTC,ETH,SOL"
 LIQUID_FEATURE_KEYS: List[str] = list(CONTRACT_FEATURE_KEYS)
@@ -192,6 +214,15 @@ _ROOT = Path(__file__).resolve().parents[1]
 _INFER_DIR = _ROOT / "inference"
 if str(_INFER_DIR) not in sys.path:
     sys.path.append(str(_INFER_DIR))
+_SCRIPTS_DIR = _ROOT / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.append(str(_SCRIPTS_DIR))
+try:
+    from audit_offline_training_data import AuditArgs as OfflineAuditArgs  # type: ignore
+    from audit_offline_training_data import run_audit as run_offline_data_audit_impl  # type: ignore
+except Exception:
+    OfflineAuditArgs = None  # type: ignore
+    run_offline_data_audit_impl = None  # type: ignore
 try:
     from liquid_feature_contract import LIQUID_FEATURE_KEYS as _CONTRACT_KEYS  # type: ignore
     from liquid_feature_contract import LIQUID_FEATURE_SCHEMA_VERSION as _CONTRACT_SCHEMA  # type: ignore
@@ -207,6 +238,30 @@ _LIQUID_MODEL_SERVICE: Optional[LiquidModelService] = None
 _VC_MODEL_SERVICE: Optional[VCModelService] = None
 
 
+def _repo_has(name: str) -> bool:
+    try:
+        attr = getattr(repo, name)
+    except Exception:
+        return False
+    return callable(attr)
+
+
+_RUNTIME_CONFIG_SERVICE: Optional[RuntimeConfigService] = RuntimeConfigService(repo) if _repo_has("list_runtime_config") else None
+_PROCESS_MANAGER: Optional[ProcessManager] = ProcessManager(repo) if _repo_has("upsert_ops_process") else None
+_RISK_COMMAND_EXECUTOR: Optional[RiskCommandExecutor] = (
+    RiskCommandExecutor(repo, _PROCESS_MANAGER, _RUNTIME_CONFIG_SERVICE)
+    if (_PROCESS_MANAGER is not None and _RUNTIME_CONFIG_SERVICE is not None)
+    else None
+)
+_SECRETS_MANAGER: Optional[SecretsManager] = SecretsManager()
+_CONNECTIVITY_SERVICE: Optional[ConnectivityService] = (
+    ConnectivityService(repo=repo, secrets_manager=_SECRETS_MANAGER) if _repo_has("save_venue_connectivity_status") else None
+)
+_CLOCK_DRIFT_SERVICE: Optional[ClockDriftService] = ClockDriftService(repo=repo) if _repo_has("save_clock_drift_status") else None
+_OFFLINE_AUDIT_TASKS: Dict[str, Dict[str, Any]] = {}
+_OFFLINE_AUDIT_LOCK = threading.Lock()
+
+
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -217,6 +272,98 @@ def _utcnow() -> datetime:
 
 def _utcnow_iso_z() -> str:
     return _utcnow().isoformat().replace("+00:00", "Z")
+
+
+def _store_offline_task(task_id: str, payload: Dict[str, Any]) -> None:
+    with _OFFLINE_AUDIT_LOCK:
+        prev = dict(_OFFLINE_AUDIT_TASKS.get(str(task_id)) or {})
+        prev.update(payload or {})
+        prev["task_id"] = str(task_id)
+        prev.setdefault("updated_at", _utcnow_iso_z())
+        _OFFLINE_AUDIT_TASKS[str(task_id)] = prev
+
+
+def _read_offline_task(task_id: str) -> Optional[Dict[str, Any]]:
+    with _OFFLINE_AUDIT_LOCK:
+        row = _OFFLINE_AUDIT_TASKS.get(str(task_id))
+        return dict(row) if row else None
+
+
+def _notify_risk_mail(event_type: str, subject: str, body: str) -> Dict[str, Any]:
+    smtp_overrides: Dict[str, Any] = {}
+    try:
+        secret = repo.get_secret("smtp.password")
+        if secret and _SECRETS_MANAGER is not None:
+            smtp_overrides["SMTP_PASS"] = _SECRETS_MANAGER.decrypt(str(secret.get("secret_value_enc") or ""))
+    except Exception:
+        smtp_overrides = {}
+    try:
+        return send_risk_email(event_type=event_type, subject=subject, body=body, repo=repo, smtp_overrides=smtp_overrides)
+    except Exception as exc:
+        return {"send_ok": False, "reason": str(exc), "event_type": event_type}
+
+
+def _audit_action(
+    *,
+    actor: str,
+    role: str,
+    action: str,
+    target: str,
+    old_value: Optional[Dict[str, Any]] = None,
+    new_value: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        repo.save_audit_log(
+            actor=actor,
+            role=role,
+            action=action,
+            target=target,
+            old_value=mask_sensitive(old_value or {}),
+            new_value=mask_sensitive(new_value or {}),
+            metadata=mask_sensitive(metadata or {}),
+        )
+    except Exception:
+        pass
+
+
+def _run_offline_audit_task(task_id: str, params: Dict[str, Any]) -> None:
+    if OfflineAuditArgs is None or run_offline_data_audit_impl is None:
+        _store_offline_task(task_id, {"status": "failed", "error": "offline_audit_module_unavailable", "finished_at": _utcnow_iso_z()})
+        return
+
+    def _progress(stage: str, extra: Dict[str, Any]) -> None:
+        _store_offline_task(
+            task_id,
+            {
+                "status": "running",
+                "stage": str(stage),
+                "progress": dict(extra or {}),
+                "updated_at": _utcnow_iso_z(),
+            },
+        )
+
+    try:
+        args_obj = OfflineAuditArgs(
+            database_url=str(params.get("database_url") or DATABASE_URL),
+            track=str(params.get("track") or "liquid"),
+            symbols=[str(s).upper() for s in list(params.get("symbols") or []) if str(s).strip()],
+            start=params["start_dt"],
+            end=params["end_dt"],
+            lookback=int(params.get("lookback") or 96),
+            bucket=str(params.get("bucket") or "5m"),
+            min_market_ratio=float(params.get("min_market_ratio") or 0.98),
+            min_feature_matrix_ratio=float(params.get("min_feature_matrix_ratio") or 0.95),
+            strict_schema_mismatch_zero=bool(params.get("strict_schema_mismatch_zero", True)),
+            min_text_coverage=float(params.get("min_text_coverage") or 0.05),
+            enforce_text_coverage=bool(params.get("enforce_text_coverage", False)),
+            created_by=str(params.get("created_by") or "api"),
+            task_id=str(task_id),
+        )
+        result = run_offline_data_audit_impl(args_obj, progress_cb=_progress)
+        _store_offline_task(task_id, {"status": "completed", "result": result, "finished_at": _utcnow_iso_z(), "stage": "done"})
+    except Exception as exc:
+        _store_offline_task(task_id, {"status": "failed", "error": str(exc), "finished_at": _utcnow_iso_z(), "stage": "failed"})
 
 
 def _default_liquid_targets() -> List[str]:
@@ -738,6 +885,25 @@ def _kill_switch_block_reason(track: str, strategy_id: str = "global") -> Option
         return f"kill_switch_triggered:{track}:{strategy_id}"
     if strategy_id != "global" and repo.is_kill_switch_triggered(track, "global"):
         return f"kill_switch_triggered:{track}:global"
+    return None
+
+
+def _execution_safety_block_reason(track: str, strategy_id: str = "global") -> Optional[str]:
+    sqlite_value = None
+    try:
+        ks_row = repo.get_kill_switch_state(track=track, strategy_id=strategy_id) or repo.get_kill_switch_state(track=track, strategy_id="global")
+        if isinstance(ks_row, dict) and str(ks_row.get("state") or "").strip().lower() == "triggered":
+            sqlite_value = "safe_mode"
+    except Exception:
+        sqlite_value = None
+    state = _EXECUTION_SAFETY.preflight(
+        sqlite_value=sqlite_value,
+        file_path=str(os.getenv("TRADER_KILL_SWITCH_FILE", "./KILL_SWITCH")),
+        env_key="TRADER_KILL_SWITCH",
+    )
+    if bool(state.get("blocked")):
+        reason = str(state.get("reason") or "safe_mode")
+        return f"execution_safety_blocked:{reason}"
     return None
 
 
@@ -1663,6 +1829,13 @@ def _default_model_by_track(track: str) -> Tuple[str, str]:
     return "vc_main", "main"
 
 
+def _default_model_dir() -> Path:
+    env_dir = str(os.getenv("MODEL_DIR", "")).strip()
+    if env_dir:
+        return Path(env_dir)
+    return Path(__file__).resolve().parent / "models"
+
+
 def _parity_check(
     track: str,
     max_deviation: float = 0.10,
@@ -1865,22 +2038,95 @@ def _parse_horizon_float_map(raw: str, defaults: Dict[str, float]) -> Dict[str, 
     return out
 
 
-def _liquid_cost_profile(cost_profile: str, stack: Dict[str, Any]) -> Dict[str, float]:
+def _runtime_config_value(config_key: str) -> Dict[str, Any]:
+    if _RUNTIME_CONFIG_SERVICE is None:
+        return {}
+    try:
+        row = _RUNTIME_CONFIG_SERVICE.resolve(config_key=config_key, scope="global", scope_id="")
+        if not bool(row.get("found", False)):
+            return {}
+        val = row.get("value_json")
+        if isinstance(val, dict):
+            return dict(val)
+    except Exception:
+        return {}
+    return {}
+
+
+def _runtime_horizon_map(config_key: str, defaults: Dict[str, float]) -> Dict[str, float]:
+    out = dict(defaults)
+    runtime_v = _runtime_config_value(config_key)
+    if runtime_v:
+        for k, v in runtime_v.items():
+            kk = str(k).strip().lower()
+            if kk in out:
+                try:
+                    out[kk] = float(v)
+                except Exception:
+                    continue
+        return out
+    return out
+
+
+def _liquid_cost_profile(cost_profile: str, stack: Dict[str, Any]) -> Dict[str, Any]:
     cov = stack.get("coverage_summary") if isinstance(stack.get("coverage_summary"), dict) else {}
+    per_h_unc = stack.get("per_horizon_uncertainty") if isinstance(stack.get("per_horizon_uncertainty"), dict) else {}
     profile = load_cost_profile(str(cost_profile or "standard"))
-    cost_bps = compute_cost_map(
-        horizons=("1h", "4h", "1d", "7d"),
-        profile=profile,
-        market_state={"realized_vol": float(cov.get("missing_ratio", 0.0) or 0.0)},
-        liquidity_features={"liquidity_score": float(cov.get("observed_ratio", 0.0) or 0.0)},
-        turnover_estimate=0.5,
-    )
-    return {h: float(v) / 10000.0 for h, v in cost_bps.items()}
+    total_map: Dict[str, float] = {}
+    breakdown_map: Dict[str, Dict[str, float]] = {}
+    turnover_map: Dict[str, float] = {}
+    for h in ("1h", "4h", "1d", "7d"):
+        vol_h = float(per_h_unc.get(h, stack.get("vol_forecast", cov.get("missing_ratio", 0.0))) or 0.0)
+        market_state = {
+            "realized_vol": vol_h,
+            "funding_rate": float(stack.get("funding_rate", 0.0) or 0.0),
+            "spread_bps": float(stack.get("spread_proxy", 0.0) or 0.0),
+            "notional_usd": float(stack.get("notional_usd", 0.0) or 0.0),
+        }
+        liq_state = {
+            "liquidity_score": float(cov.get("observed_ratio", 0.0) or 0.0),
+            "orderbook_depth_total": float(stack.get("depth_proxy", 0.0) or 0.0),
+            "spread_bps": float(stack.get("spread_proxy", 0.0) or 0.0),
+            "funding_rate": float(stack.get("funding_rate", 0.0) or 0.0),
+        }
+        turnover_base = stack.get("turnover_estimate")
+        if turnover_base is not None:
+            try:
+                turnover_base = float(turnover_base)
+            except Exception:
+                turnover_base = None
+        turn_est = estimate_turnover(
+            horizon=h,
+            market_state=market_state,
+            liquidity_features=liq_state,
+            account_state={"turnover_estimate": turnover_base, "notional_usd": float(stack.get("notional_usd", 0.0) or 0.0)},
+        )
+        turnover_map[h] = float(turn_est)
+        bd = compute_cost_breakdown_bps(
+            horizon=h,
+            profile=profile,
+            market_state=market_state,
+            liquidity_features=liq_state,
+            turnover_estimate=float(turn_est),
+            account_state={"notional_usd": float(stack.get("notional_usd", 0.0) or 0.0)},
+        )
+        total_map[h] = float(bd["total_bps"]) / 10000.0
+        breakdown_map[h] = {
+            "fee": float(bd["fee_bps"]) / 10000.0,
+            "slippage": float(bd["slippage_bps"]) / 10000.0,
+            "impact": float(bd["impact_bps"]) / 10000.0,
+            "funding": float(bd["funding_bps"]) / 10000.0,
+            "infra": float(bd["infra_bps"]) / 10000.0,
+            "total": float(bd["total_bps"]) / 10000.0,
+        }
+    return {"total": total_map, "breakdown": breakdown_map, "turnover_estimate_horizons": turnover_map}
 
 
 def _horizon_signal_thresholds() -> Dict[str, Dict[str, float]]:
     score_defaults = {"1h": 0.20, "4h": 0.16, "1d": 0.10, "7d": 0.08}
     conf_defaults = {"1h": 0.55, "4h": 0.52, "1d": 0.50, "7d": 0.48}
+    score_defaults = _runtime_horizon_map("signal.score_entry_by_horizon", score_defaults)
+    conf_defaults = _runtime_horizon_map("signal.confidence_min_by_horizon", conf_defaults)
     return {
         "score_entry": _parse_horizon_float_map(os.getenv("SIGNAL_SCORE_ENTRY_BY_HORIZON", ""), score_defaults),
         "confidence_min": _parse_horizon_float_map(os.getenv("SIGNAL_CONFIDENCE_MIN_BY_HORIZON", ""), conf_defaults),
@@ -1892,6 +2138,7 @@ def _liquid_multi_horizon_signal(
     pred_outputs: Dict[str, Any],
     horizon: str,
     cost_profile: str,
+    router_hint: Dict[str, float] | None = None,
 ) -> Dict[str, Any]:
     horizon_key = str(horizon or "1h").strip().lower() or "1h"
     expected = pred_outputs.get("expected_return_horizons") if isinstance(pred_outputs.get("expected_return_horizons"), dict) else {}
@@ -1905,31 +2152,48 @@ def _liquid_multi_horizon_signal(
         vol = {"1h": float(pred_outputs.get("vol_forecast", 0.0) or 0.0)}
     if horizon_key not in expected:
         horizon_key = "1h" if "1h" in expected else sorted(expected.keys())[0]
-    costs = _liquid_cost_profile(cost_profile, pred_outputs.get("stack") if isinstance(pred_outputs.get("stack"), dict) else {})
+    cost_pack = _liquid_cost_profile(cost_profile, pred_outputs.get("stack") if isinstance(pred_outputs.get("stack"), dict) else {})
+    costs = dict(cost_pack.get("total") or {})
+    cost_breakdown = dict(cost_pack.get("breakdown") or {})
     thresholds = _horizon_signal_thresholds()
     eps = max(1e-6, float(os.getenv("SIGNAL_VOL_EPS", "1e-4") or 1e-4))
+    band_cfg = _runtime_config_value("signal.no_trade_band_mult")
+    band_mult = float(band_cfg.get("value", os.getenv("SIGNAL_NO_TRADE_BAND_MULT", "1.0")) or 1.0)
     edge_map: Dict[str, float] = {}
     score_map: Dict[str, float] = {}
     action_map: Dict[str, str] = {}
+    risk_map: Dict[str, float] = {}
+    band_map: Dict[str, float] = {}
     for h, ret in expected.items():
         hh = str(h).strip().lower()
         edge = float(ret or 0.0) - float(costs.get(hh, costs.get("1h", 0.0)))
         vv = float(vol.get(hh, vol.get("1h", 0.0)) or 0.0)
-        sc = float(edge / max(vv, eps))
+        qh = pred_outputs.get("quantiles_horizons") if isinstance(pred_outputs.get("quantiles_horizons"), dict) else {}
+        band_risk = 0.0
+        if isinstance(qh.get(hh), dict):
+            band_risk = abs(float((qh.get(hh) or {}).get("p90", 0.0) or 0.0) - float((qh.get(hh) or {}).get("p10", 0.0) or 0.0))
+        risk = max(vv, band_risk, eps)
+        sc = float(edge / risk)
         cf = float(conf.get(hh, conf.get("1h", 0.0)) or 0.0)
         score_th = float(thresholds["score_entry"].get(hh, thresholds["score_entry"]["1h"]))
         conf_th = float(thresholds["confidence_min"].get(hh, thresholds["confidence_min"]["1h"]))
+        dyn_band = abs(score_th) * max(0.1, band_mult) * (1.0 + min(3.0, risk / max(eps, abs(edge) + eps)))
+        if router_hint and isinstance(router_hint, dict):
+            liq_hint = float(router_hint.get("liquidation", 0.0) or 0.0)
+            dyn_band *= float(1.0 + 0.8 * max(0.0, liq_hint))
         if cf < conf_th:
             act = "hold"
-        elif sc >= score_th:
+        elif sc >= dyn_band:
             act = "buy"
-        elif sc <= -score_th:
+        elif sc <= -dyn_band:
             act = "sell"
         else:
             act = "hold"
         edge_map[hh] = edge
         score_map[hh] = sc
         action_map[hh] = act
+        risk_map[hh] = risk
+        band_map[hh] = dyn_band
     selected_score = float(score_map.get(horizon_key, 0.0))
     selected_conf = float(conf.get(horizon_key, 0.0) or 0.0)
     selected_action = str(action_map.get(horizon_key, "hold"))
@@ -1942,10 +2206,65 @@ def _liquid_multi_horizon_signal(
         "score_horizons": score_map,
         "action_horizons": action_map,
         "cost_horizons": costs,
+        "cost_breakdown_horizons": cost_breakdown,
+        "risk_horizons": risk_map,
+        "band_horizons": band_map,
         "expected_return_horizons": {str(k).lower(): float(v) for k, v in expected.items()},
         "signal_confidence_horizons": {str(k).lower(): float(v) for k, v in conf.items()},
         "vol_forecast_horizons": {str(k).lower(): float(v) for k, v in vol.items()},
     }
+
+
+def _parse_timeframe_list(raw: str) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for part in str(raw or "").split(","):
+        tf = str(part or "").strip().lower()
+        if not tf or tf in seen:
+            continue
+        ok = (tf.endswith("m") and tf[:-1].isdigit()) or (tf.endswith("h") and tf[:-1].isdigit()) or (tf.endswith("d") and tf[:-1].isdigit())
+        if not ok:
+            continue
+        seen.add(tf)
+        out.append(tf)
+    return out
+
+
+def _analyst_context_timeframes() -> List[str]:
+    return _parse_timeframe_list(os.getenv("ANALYST_CONTEXT_TIMEFRAMES", "5m,15m,1h,4h,1d"))
+
+
+def _multi_tf_context_to_regime_features(context_payload: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    ctx = dict(context_payload.get("context") or {})
+    for tf, row in ctx.items():
+        key = str(tf).strip().lower().replace(" ", "")
+        block = dict(row or {})
+        out[f"mtf_{key}_missing"] = float(block.get("missing", 1) or 0.0)
+        out[f"mtf_{key}_ret_1"] = float(block.get("ret_1", 0.0) or 0.0)
+        out[f"mtf_{key}_volume"] = float(block.get("volume", 0.0) or 0.0)
+        out[f"mtf_{key}_lag_sec"] = float(block.get("lag_sec", 0.0) or 0.0)
+    return out
+
+
+def _load_multi_tf_context_safe(*, symbol: str, as_of: str, primary_timeframe: str) -> Dict[str, Any]:
+    if not hasattr(repo, "load_multi_timeframe_context"):
+        return {}
+    tfs = _analyst_context_timeframes()
+    if not tfs:
+        return {}
+    try:
+        return dict(
+            repo.load_multi_timeframe_context(
+                symbol=str(symbol).upper(),
+                as_of=str(as_of),
+                timeframes=list(tfs),
+                primary_timeframe=str(primary_timeframe).lower(),
+            )
+            or {}
+        )
+    except Exception:
+        return {}
 
 
 def _ks_statistic(a: List[float], b: List[float]) -> float:
@@ -2041,6 +2360,9 @@ async def predict_liquid(payload: LiquidPredictRequest):
             "score_horizons": mh["score_horizons"],
             "edge_horizons": mh["edge_horizons"],
             "cost_horizons": mh["cost_horizons"],
+            "cost_breakdown_horizons": mh.get("cost_breakdown_horizons", {}),
+            "risk_horizons": mh.get("risk_horizons", {}),
+            "band_horizons": mh.get("band_horizons", {}),
             "selected_horizon": mh["selected_horizon"],
         },
         explanation=result["explanation"],
@@ -2067,6 +2389,9 @@ async def predict_liquid(payload: LiquidPredictRequest):
         "score_horizons": dict(mh.get("score_horizons") or {}),
         "edge_horizons": dict(mh.get("edge_horizons") or {}),
         "cost_horizons": dict(mh.get("cost_horizons") or {}),
+        "cost_breakdown_horizons": dict(mh.get("cost_breakdown_horizons") or {}),
+        "risk_horizons": dict(mh.get("risk_horizons") or {}),
+        "band_horizons": dict(mh.get("band_horizons") or {}),
         "action_horizons": dict(mh.get("action_horizons") or {}),
         "selected_horizon": compat_horizon,
         "stack": dict(outputs.get("stack") or {}),
@@ -2564,7 +2889,7 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
     if payload.track == "liquid":
         pred = _build_liquid_prediction(payload.target, payload.horizon)
         model_name = str(pred.get("model_name") or "liquid_main")
-        model_version = str(pred.get("model_version") or "v2.1")
+        model_version = str(pred.get("model_version") or "main")
     else:
         pred = _build_vc_prediction(payload.target, 12)
         model_name = "vc_main"
@@ -2584,6 +2909,70 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
             horizon=payload.horizon,
             cost_profile=payload.cost_profile,
         )
+        analyst_out: Dict[str, Any] = {}
+        agent_enabled_cfg = _runtime_config_value("analyst.enabled")
+        agent_hint_cfg = _runtime_config_value("analyst.router_hint_enabled")
+        agent_enabled = bool(
+            agent_enabled_cfg.get("value", _FINANCIAL_ANALYSIS_AGENT.config.enabled)
+            if isinstance(agent_enabled_cfg, dict)
+            else _FINANCIAL_ANALYSIS_AGENT.config.enabled
+        )
+        agent_hint_enabled = bool(
+            agent_hint_cfg.get("value", _FINANCIAL_ANALYSIS_AGENT.config.router_hint_enabled)
+            if isinstance(agent_hint_cfg, dict)
+            else _FINANCIAL_ANALYSIS_AGENT.config.router_hint_enabled
+        )
+        runtime_agent = FinancialAnalysisAgent(FinancialAnalysisConfig(enabled=agent_enabled, router_hint_enabled=agent_hint_enabled))
+        if runtime_agent.config.enabled:
+            selected_h0 = str(mh.get("selected_horizon") or payload.horizon).lower()
+            quant_h = (pred_outputs.get("quantiles_horizons") or {}).get(selected_h0, {}) if isinstance(pred_outputs.get("quantiles_horizons"), dict) else {}
+            infer_ts = str(pred_outputs.get("as_of") or _utcnow().isoformat())
+            base_regime_features = (
+                dict((pred_outputs.get("regime_features_horizons") or {}).get(selected_h0, {}))
+                if isinstance(pred_outputs.get("regime_features_horizons"), dict)
+                else {}
+            )
+            primary_tf_cfg = _runtime_config_value("signal.primary_timeframe")
+            primary_tf = str(primary_tf_cfg.get("value")) if isinstance(primary_tf_cfg, dict) and primary_tf_cfg.get("value") else str(os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m"))
+            mtf_ctx = _load_multi_tf_context_safe(
+                symbol=payload.target.upper(),
+                as_of=infer_ts,
+                primary_timeframe=primary_tf,
+            )
+            base_regime_features.update(_multi_tf_context_to_regime_features(mtf_ctx))
+            try:
+                analyst_out = runtime_agent.analyze(
+                    model_pred={
+                        "mu": float((mh.get("expected_return_horizons") or {}).get(selected_h0, 0.0) or 0.0),
+                        "sigma": float((mh.get("vol_forecast_horizons") or {}).get(selected_h0, 0.0) or 0.0),
+                        "quantiles": quant_h if isinstance(quant_h, dict) else {},
+                        "direction": float((mh.get("signal_confidence_horizons") or {}).get(selected_h0, 0.0) or 0.0),
+                    },
+                    expert_weights=dict((pred_outputs.get("expert_weights_horizons") or {}).get(selected_h0, {}))
+                    if isinstance(pred_outputs.get("expert_weights_horizons"), dict)
+                    else {},
+                    regime_features=base_regime_features,
+                    cost_profile=dict((mh.get("cost_breakdown_horizons") or {}).get(selected_h0, {})),
+                    account_state=_get_account_state_for_signal().summary(),
+                    position_state={},
+                    recent_trades_summary={},
+                    ts=infer_ts,
+                )
+                if mtf_ctx:
+                    analyst_out["multi_tf_context"] = mtf_ctx
+                if runtime_agent.config.router_hint_enabled:
+                    hint = FinancialAnalysisAgent.validate_router_hint(
+                        hint=dict(analyst_out.get("regime_hint") or {}),
+                        expected_ts=infer_ts,
+                    )
+                    mh = _liquid_multi_horizon_signal(
+                        pred_outputs=pred_outputs,
+                        horizon=payload.horizon,
+                        cost_profile=payload.cost_profile,
+                        router_hint=hint,
+                    )
+            except Exception as exc:
+                analyst_out = {"status": "error", "error": str(exc)}
         selected_h = str(mh.get("selected_horizon") or payload.horizon).lower()
         score = float(mh["score"])
         confidence = float(mh["confidence"])
@@ -2625,8 +3014,10 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
             order_intent["qty"] = 0.0
         else:
             action = str(order_intent.get("action") or "hold")
+        pred_outputs["analyst"] = analyst_out
     else:
         mh = {}
+        analyst_out = {}
         predicted_score = float(pred_outputs.get("expected_return", score) or score)
         predicted_conf = float(pred_outputs.get("signal_confidence", confidence) or confidence)
         action = "hold"
@@ -2676,10 +3067,22 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
                 slices=int(style_cfg.get("n_slices") or 1),
                 mu={str(k): float(v) for k, v in dict(mh.get("expected_return_horizons") or {}).items()},
                 sigma={str(k): float(v) for k, v in dict(mh.get("vol_forecast_horizons") or {}).items()},
+                quantiles={str(k): dict(v) for k, v in dict(pred_outputs.get("quantiles_horizons") or {}).items()},
                 direction_prob={str(k): float(v) for k, v in dict(mh.get("signal_confidence_horizons") or {}).items()},
+                expert_weights={str(k): dict(v) for k, v in dict(pred_outputs.get("expert_weights_horizons") or {}).items()},
+                regime_probs={str(k): dict(v) for k, v in dict(pred_outputs.get("regime_probs_horizons") or {}).items()},
                 cost={str(k): float(v) for k, v in dict(mh.get("cost_horizons") or {}).items()},
+                cost_breakdown={str(k): dict(v) for k, v in dict(mh.get("cost_breakdown_horizons") or {}).items()},
+                score={str(k): float(v) for k, v in dict(mh.get("score_horizons") or {}).items()},
+                thresholds={str(k): float(v) for k, v in dict(mh.get("band_horizons") or {}).items()},
                 risk=(risk_state.model_dump(mode="json") if risk_state is not None else {}),
                 account=(account_state.summary() if account_state is not None else {}),
+                position={
+                    "target_pos": float(order_intent.get("target_pos") or 0.0),
+                    "delta_pos": float(order_intent.get("delta_pos") or 0.0),
+                    "action": str(order_intent.get("action") or action),
+                },
+                analyst=dict(analyst_out or {}),
                 reason_codes=list(risk_state.reason_codes if risk_state is not None else []),
             )
             repo.insert_decision_trace(trace.model_dump(mode="json"))
@@ -2719,11 +3122,15 @@ async def generate_signal(payload: SignalGenerateRequest) -> SignalGenerateRespo
             "score_horizons": dict(mh.get("score_horizons") or {}),
             "edge_horizons": dict(mh.get("edge_horizons") or {}),
             "cost_horizons": dict(mh.get("cost_horizons") or {}),
+            "cost_breakdown_horizons": dict(mh.get("cost_breakdown_horizons") or {}),
             "action_horizons": dict(mh.get("action_horizons") or {}),
+            "risk_horizons": dict(mh.get("risk_horizons") or {}),
+            "band_horizons": dict(mh.get("band_horizons") or {}),
             "selected_horizon": str(mh.get("selected_horizon") or payload.horizon),
             "expected_return_horizons": dict(mh.get("expected_return_horizons") or {}),
             "signal_confidence_horizons": dict(mh.get("signal_confidence_horizons") or {}),
             "vol_forecast_horizons": dict(mh.get("vol_forecast_horizons") or {}),
+            "analyst": dict(analyst_out or {}),
             "risk_state": (risk_state.model_dump(mode="json") if risk_state is not None else {}),
             "account_state": (account_state.summary() if account_state is not None else {}),
             "order_intent": dict(order_intent or {}),
@@ -3102,7 +3509,8 @@ async def get_opening_status(
 
 
 @router.post("/risk/kill-switch/trigger", response_model=KillSwitchStateResponse)
-async def trigger_kill_switch(payload: KillSwitchTriggerRequest) -> KillSwitchStateResponse:
+async def trigger_kill_switch(request: Request, payload: KillSwitchTriggerRequest) -> KillSwitchStateResponse:
+    actor, role = require_role(request, ROLE_ADMIN)
     row = repo.upsert_kill_switch_state(
         track=payload.track,
         strategy_id=payload.strategy_id,
@@ -3110,6 +3518,30 @@ async def trigger_kill_switch(payload: KillSwitchTriggerRequest) -> KillSwitchSt
         reason=payload.reason,
         duration_minutes=payload.duration_minutes,
         metadata={"source": "manual", "duration_minutes": payload.duration_minutes},
+    )
+    _notify_risk_mail(
+        event_type="kill_switch_trigger",
+        subject=f"[risk] kill switch ON {payload.track}/{payload.strategy_id}",
+        body=json.dumps(
+            {
+                "track": payload.track,
+                "strategy_id": payload.strategy_id,
+                "reason": payload.reason,
+                "duration_minutes": payload.duration_minutes,
+                "state": "triggered",
+            },
+            ensure_ascii=False,
+            default=str,
+            indent=2,
+        ),
+    )
+    _audit_action(
+        actor=actor,
+        role=role,
+        action="kill_switch.trigger",
+        target=f"{payload.track}:{payload.strategy_id}",
+        new_value={"state": "triggered", "reason": payload.reason, "duration_minutes": payload.duration_minutes},
+        metadata={},
     )
     return KillSwitchStateResponse(
         track=payload.track,
@@ -3125,7 +3557,8 @@ async def trigger_kill_switch(payload: KillSwitchTriggerRequest) -> KillSwitchSt
 
 
 @router.post("/risk/kill-switch/reset", response_model=KillSwitchStateResponse)
-async def reset_kill_switch(payload: KillSwitchResetRequest) -> KillSwitchStateResponse:
+async def reset_kill_switch(request: Request, payload: KillSwitchResetRequest) -> KillSwitchStateResponse:
+    actor, role = require_role(request, ROLE_ADMIN)
     row = repo.upsert_kill_switch_state(
         track=payload.track,
         strategy_id=payload.strategy_id,
@@ -3133,6 +3566,29 @@ async def reset_kill_switch(payload: KillSwitchResetRequest) -> KillSwitchStateR
         reason=payload.reason,
         duration_minutes=None,
         metadata={"source": "manual_reset"},
+    )
+    _notify_risk_mail(
+        event_type="kill_switch_reset",
+        subject=f"[risk] kill switch OFF {payload.track}/{payload.strategy_id}",
+        body=json.dumps(
+            {
+                "track": payload.track,
+                "strategy_id": payload.strategy_id,
+                "reason": payload.reason,
+                "state": "armed",
+            },
+            ensure_ascii=False,
+            default=str,
+            indent=2,
+        ),
+    )
+    _audit_action(
+        actor=actor,
+        role=role,
+        action="kill_switch.reset",
+        target=f"{payload.track}:{payload.strategy_id}",
+        new_value={"state": "armed", "reason": payload.reason},
+        metadata={},
     )
     return KillSwitchStateResponse(
         track=payload.track,
@@ -3363,6 +3819,20 @@ async def submit_execution_orders(payload: SubmitExecutionOrdersRequest) -> Subm
         block_reason = _kill_switch_block_reason(order.track, order.strategy_id)
         if block_reason:
             raise HTTPException(status_code=423, detail=block_reason)
+        safety_reason = _execution_safety_block_reason(order.track, order.strategy_id)
+        if safety_reason:
+            try:
+                repo.upsert_kill_switch_state(
+                    track=order.track,
+                    strategy_id=order.strategy_id,
+                    state="triggered",
+                    reason=str(safety_reason),
+                    duration_minutes=_risk_hard_block_minutes(),
+                    metadata={"source": "execution_safety"},
+                )
+            except Exception:
+                pass
+            raise HTTPException(status_code=423, detail=safety_reason)
     repo.create_execution_decision(
         {
             "decision_id": decision_id,
@@ -3377,7 +3847,7 @@ async def submit_execution_orders(payload: SubmitExecutionOrdersRequest) -> Subm
             "requested_by": "api",
             "strategy_id": str(payload.orders[0].strategy_id if payload.orders else "default-liquid-v1"),
             "policy_snapshot": policy_preview,
-            "risk_snapshot": {"pre_submit_kill_switch_checked": True},
+            "risk_snapshot": {"pre_submit_kill_switch_checked": True, "execution_safety_checked": True},
             "status": "created",
         }
     )
@@ -3429,12 +3899,47 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
     orders = repo.fetch_orders_for_decision(payload.decision_id, limit=payload.max_orders)
     if not orders:
         raise HTTPException(status_code=404, detail="no orders for decision")
+    if str(payload.adapter).strip().lower().endswith("_live") and _CONNECTIVITY_SERVICE is not None:
+        try:
+            conn_row = _CONNECTIVITY_SERVICE.assert_live_reachable(
+                venue=resolved_venue,
+                max_age_sec=max(30, int(os.getenv("LIVE_CONNECTIVITY_MAX_AGE_SEC", "120"))),
+                require_ws=False,
+            )
+            ws_ok = bool(conn_row.get("ws_ok"))
+            rest_ok = bool(conn_row.get("rest_ok"))
+        except Exception as exc:
+            ws_ok = False
+            rest_ok = False
+            _EXECUTION_SAFETY.safe_mode = True
+            _EXECUTION_SAFETY.safe_mode_reason = f"connectivity_check_failed:{exc}"
+        price_state = _EXECUTION_SAFETY.apply_price_feed_status(
+            ws_ok=ws_ok,
+            rest_ok=rest_ok,
+            rest_fallback_action_when_local_guard="safe_mode",
+        )
+        if bool(price_state.get("safe_mode")):
+            raise HTTPException(status_code=423, detail=f"execution_safety_blocked:{price_state.get('reason') or 'price_feed_guard'}")
     for order in orders:
         order_track = str(order.get("track") or "liquid")
         strategy_id = str(order.get("strategy_id") or "default-liquid-v1")
         block_reason = _kill_switch_block_reason(order_track, strategy_id)
         if block_reason:
             raise HTTPException(status_code=423, detail=block_reason)
+        safety_reason = _execution_safety_block_reason(order_track, strategy_id)
+        if safety_reason:
+            try:
+                repo.upsert_kill_switch_state(
+                    track=order_track,
+                    strategy_id=strategy_id,
+                    state="triggered",
+                    reason=str(safety_reason),
+                    duration_minutes=_risk_hard_block_minutes(),
+                    metadata={"source": "execution_safety"},
+                )
+            except Exception:
+                pass
+            raise HTTPException(status_code=423, detail=safety_reason)
     scaled_orders: List[Dict[str, Any]] = []
     for order in orders:
         order_track = str(order.get("track") or "liquid")
@@ -3446,6 +3951,32 @@ async def run_execution(payload: ExecuteOrdersRequest) -> ExecuteOrdersResponse:
         od["quantity"] = round(q, 8)
         od["metadata"] = {**(order.get("metadata") or {}), "rollout_stage_pct": pct}
         scaled_orders.append(od)
+    if _env_flag("EXECUTION_UNKNOWN_POSITION_GUARD", "1"):
+        adapter_obj = exec_engine.adapters.get(str(payload.adapter))
+        if adapter_obj is not None and hasattr(adapter_obj, "fetch_positions"):
+            try:
+                exchange_positions = adapter_obj.fetch_positions()
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail=f"positions_fetch_failed:{exc}") from exc
+            known_symbols = [str(o.get("target") or "").upper() for o in scaled_orders if str(o.get("target") or "").strip()]
+            unknown_state = _EXECUTION_SAFETY.apply_unknown_positions(
+                known_symbols=known_symbols,
+                exchange_positions=exchange_positions if isinstance(exchange_positions, list) else [],
+            )
+            unknown = list(unknown_state.get("unknown_symbols") or [])
+            if unknown:
+                reason = str(unknown_state.get("reason") or "unknown_position_detected")
+                try:
+                    repo.save_risk_event(
+                        decision_id=f"risk-precheck-{uuid.uuid4().hex[:12]}",
+                        severity="critical",
+                        code="unknown_position_detected",
+                        message=reason,
+                        payload={"unknown_symbols": unknown, "decision_id": payload.decision_id},
+                    )
+                except Exception:
+                    pass
+                raise HTTPException(status_code=423, detail=f"execution_safety_blocked:{reason}")
     market_fit_violations = _order_market_fit_violations(scaled_orders, payload.market_type)
     if market_fit_violations:
         for code in market_fit_violations:
@@ -3929,6 +4460,11 @@ async def ingest_alert_notification(payload: Dict[str, Any]):
             message=str(annotations.get("summary") or code),
             payload={"status": status, "labels": labels, "annotations": annotations},
         )
+        _notify_risk_mail(
+            event_type="alertmanager_risk_event",
+            subject=f"[risk-alert] {code}",
+            body=json.dumps({"status": status, "code": code, "severity": severity, "labels": labels, "annotations": annotations}, ensure_ascii=False, default=str, indent=2),
+        )
     return {"status": "ok", "alerts_received": len(alerts)}
 
 
@@ -4000,3 +4536,623 @@ async def update_data_quality_audit(payload: DataQualityAuditUpdate):
         note=payload.note,
     )
     return {"status": "ok", "audit_id": payload.audit_id}
+
+
+@router.get("/audit/offline_data")
+async def get_offline_data_audit(track: Optional[str] = Query(default=None)):
+    row = repo.get_latest_offline_data_audit(track=track)
+    if not row:
+        return {"status": "missing", "track": track}
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    return {
+        "status": "ok",
+        "task_id": row.get("task_id"),
+        "track": row.get("track"),
+        "created_at": _to_utc_datetime(row.get("created_at")),
+        "updated_at": _to_utc_datetime(row.get("updated_at")),
+        "ready": bool(row.get("ready")),
+        "reasons": list(row.get("reasons") or []),
+        "result": payload,
+    }
+
+
+@router.post("/audit/offline_data/run")
+async def run_offline_data_audit(payload: Dict[str, Any] = Body(default_factory=dict)):
+    now = _utcnow()
+    start_dt = _to_utc_datetime(payload.get("start")) or (now - timedelta(days=420))
+    end_dt = _to_utc_datetime(payload.get("end")) or now
+    if end_dt <= start_dt:
+        raise HTTPException(status_code=400, detail="invalid_time_window")
+    symbols_raw = payload.get("symbols")
+    if isinstance(symbols_raw, list):
+        symbols = [str(x).strip().upper() for x in symbols_raw if str(x).strip()]
+    else:
+        symbols = [s.strip().upper() for s in str(symbols_raw or os.getenv("LIQUID_SYMBOLS", DEFAULT_LIQUID_SYMBOLS)).split(",") if s.strip()]
+    if not symbols:
+        raise HTTPException(status_code=400, detail="empty_symbols")
+    task_id = f"offline-audit-{uuid.uuid4().hex[:16]}"
+    run_params = {
+        "database_url": str(payload.get("database_url") or DATABASE_URL),
+        "track": str(payload.get("track") or "liquid"),
+        "symbols": symbols,
+        "start_dt": start_dt,
+        "end_dt": end_dt,
+        "lookback": int(payload.get("lookback") or int(os.getenv("LIQUID_LOOKBACK", "96"))),
+        "bucket": str(payload.get("bucket") or os.getenv("LIQUID_PRIMARY_TIMEFRAME", "5m")),
+        "min_market_ratio": float(payload.get("min_market_ratio") or os.getenv("AUDIT_MIN_MARKET_RATIO", "0.98")),
+        "min_feature_matrix_ratio": float(payload.get("min_feature_matrix_ratio") or os.getenv("AUDIT_MIN_FEATURE_MATRIX_RATIO", "0.95")),
+        "strict_schema_mismatch_zero": bool(int(payload.get("strict_schema_mismatch_zero", 1))),
+        "min_text_coverage": float(payload.get("min_text_coverage") or os.getenv("AUDIT_MIN_TEXT_COVERAGE", "0.05")),
+        "enforce_text_coverage": bool(int(payload.get("enforce_text_coverage", int(os.getenv("AUDIT_ENFORCE_TEXT_COVERAGE", "0"))))),
+        "created_by": str(payload.get("created_by") or "api"),
+    }
+    _store_offline_task(
+        task_id,
+        {
+            "status": "queued",
+            "stage": "queued",
+            "created_at": _utcnow_iso_z(),
+            "updated_at": _utcnow_iso_z(),
+            "params": {**run_params, "start_dt": start_dt.isoformat(), "end_dt": end_dt.isoformat()},
+        },
+    )
+    th = threading.Thread(target=_run_offline_audit_task, args=(task_id, run_params), name=f"offline-audit-{task_id}", daemon=True)
+    th.start()
+    return {"status": "queued", "task_id": task_id, "created_at": _utcnow_iso_z()}
+
+
+@router.get("/audit/offline_data/tasks/{task_id}")
+async def get_offline_data_audit_task(task_id: str):
+    row = _read_offline_task(task_id)
+    if row:
+        return row
+    db_row = repo.get_offline_data_audit_by_task(task_id)
+    if db_row:
+        return {
+            "task_id": db_row.get("task_id"),
+            "status": db_row.get("status"),
+            "ready": bool(db_row.get("ready")),
+            "reasons": list(db_row.get("reasons") or []),
+            "result": db_row.get("payload") if isinstance(db_row.get("payload"), dict) else {},
+            "created_at": _to_utc_datetime(db_row.get("created_at")),
+            "updated_at": _to_utc_datetime(db_row.get("updated_at")),
+        }
+    raise HTTPException(status_code=404, detail="task_not_found")
+
+
+@router.get("/audit/offline_data/stream/{task_id}")
+async def stream_offline_data_audit(task_id: str):
+    async def _event_stream():
+        last_payload = ""
+        while True:
+            row = _read_offline_task(task_id)
+            if not row:
+                db_row = repo.get_offline_data_audit_by_task(task_id)
+                if db_row:
+                    row = {
+                        "task_id": db_row.get("task_id"),
+                        "status": db_row.get("status"),
+                        "ready": bool(db_row.get("ready")),
+                        "reasons": list(db_row.get("reasons") or []),
+                        "result": db_row.get("payload") if isinstance(db_row.get("payload"), dict) else {},
+                    }
+            payload = row or {"task_id": task_id, "status": "missing"}
+            wire = json.dumps(payload, ensure_ascii=False, default=str)
+            if wire != last_payload:
+                last_payload = wire
+                yield f"event: progress\ndata: {wire}\n\n"
+            if str(payload.get("status")) in {"completed", "failed"}:
+                break
+            await asyncio.sleep(1.0)
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
+@router.get("/config")
+async def get_runtime_config(
+    scope: Optional[str] = Query(default=None),
+    scope_id: Optional[str] = Query(default=None),
+    key: Optional[str] = Query(default=None),
+):
+    if _RUNTIME_CONFIG_SERVICE is None:
+        raise HTTPException(status_code=503, detail="runtime_config_service_unavailable")
+    items = _RUNTIME_CONFIG_SERVICE.list_config(scope=scope, scope_id=scope_id, config_key=key)
+    return {"status": "ok", "items": items, "count": len(items)}
+
+
+@router.put("/config")
+async def put_runtime_config(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _RUNTIME_CONFIG_SERVICE is None:
+        raise HTTPException(status_code=503, detail="runtime_config_service_unavailable")
+    actor, role = require_role(request, ROLE_OPERATOR)
+    items_in = payload.get("items")
+    items: List[Dict[str, Any]]
+    if isinstance(items_in, list) and items_in:
+        items = [dict(x) for x in items_in if isinstance(x, dict)]
+    else:
+        items = [dict(payload)]
+    updated: List[Dict[str, Any]] = []
+    for item in items:
+        config_key = str(item.get("config_key") or item.get("key") or "").strip()
+        if not config_key:
+            raise HTTPException(status_code=400, detail="config_key_required")
+        lower_key = config_key.lower()
+        if any(x in lower_key for x in ("risk_", "kill_switch", "proxy", "bitget", "smtp")) and role != ROLE_ADMIN:
+            raise HTTPException(status_code=403, detail="rbac_forbidden:admin_required_for_sensitive_config")
+        value_json = item.get("value_json")
+        if not isinstance(value_json, dict):
+            value_json = {"value": item.get("value")}
+        row = _RUNTIME_CONFIG_SERVICE.upsert_config(
+            config_key=config_key,
+            value_json=value_json,
+            scope=str(item.get("scope") or "global"),
+            scope_id=str(item.get("scope_id") or ""),
+            requires_restart=bool(item.get("requires_restart") or False),
+            description=str(item.get("description") or ""),
+            updated_by=actor,
+        )
+        updated.append(row)
+        _audit_action(
+            actor=actor,
+            role=role,
+            action="config.update",
+            target=f"{row.get('scope')}:{row.get('scope_id')}:{row.get('config_key')}",
+            old_value={},
+            new_value=row,
+            metadata={"source": "api"},
+        )
+    return {"status": "ok", "updated": updated, "count": len(updated)}
+
+
+@router.get("/config/audit")
+async def get_runtime_config_audit(
+    limit: int = Query(default=200, ge=1, le=2000),
+    scope: Optional[str] = Query(default=None),
+    scope_id: Optional[str] = Query(default=None),
+    key: Optional[str] = Query(default=None),
+):
+    if _RUNTIME_CONFIG_SERVICE is None:
+        raise HTTPException(status_code=503, detail="runtime_config_service_unavailable")
+    rows = _RUNTIME_CONFIG_SERVICE.list_audit_logs(limit=limit, scope=scope, scope_id=scope_id, config_key=key)
+    return {"status": "ok", "items": rows, "count": len(rows)}
+
+
+@router.post("/ops/process/start")
+async def ops_process_start(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _PROCESS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="process_manager_unavailable")
+    actor, role = require_role(request, ROLE_OPERATOR)
+    task_type = str(payload.get("task_type") or "").strip().upper()
+    if not task_type:
+        raise HTTPException(status_code=400, detail="task_type_required")
+    params = dict(payload.get("params") or payload)
+    if task_type == "LIVE_TRADER":
+        if _CONNECTIVITY_SERVICE is None:
+            raise HTTPException(status_code=503, detail="connectivity_service_unavailable")
+        if _CLOCK_DRIFT_SERVICE is None:
+            raise HTTPException(status_code=503, detail="clock_drift_service_unavailable")
+        venue = str(params.get("venue") or "bitget").strip().lower() or "bitget"
+        account_id = str(params.get("account_id") or "").strip() or None
+        proxy_profile_id = str(params.get("proxy_profile_id") or "").strip() or None
+        probe = _CONNECTIVITY_SERVICE.probe(
+            venue=venue,
+            proxy_profile_id=proxy_profile_id,
+            account_id=account_id,
+            process_id=str(params.get("process_id") or ""),
+            persist=True,
+        )
+        if not bool(probe.get("rest_ok")) or not bool(probe.get("ws_ok")):
+            raise HTTPException(
+                status_code=503,
+                detail=f"network_unreachable_for_live:{venue}:rest_ok={probe.get('rest_ok')}:ws_ok={probe.get('ws_ok')}:configure_proxy_or_change_host",
+            )
+        drift = _CLOCK_DRIFT_SERVICE.probe(persist=True)
+        if str(drift.get("level") or "red").lower() == "red":
+            raise HTTPException(status_code=503, detail=f"clock_drift_red:{drift.get('drift_ms')}")
+        ctx = _CONNECTIVITY_SERVICE._resolve_proxy_context(  # type: ignore[attr-defined]
+            proxy_profile_id=proxy_profile_id,
+            account_id=account_id,
+            process_id=str(params.get("process_id") or ""),
+        )
+        env_overrides = dict(params.get("env_overrides") or {})
+        env_overrides.update(dict(ctx.get("proxy_env") or {}))
+        params["env_overrides"] = env_overrides
+        params["proxy_profile_id_applied"] = (ctx.get("profile") or {}).get("profile_id") if isinstance(ctx.get("profile"), dict) else None
+
+    out = _PROCESS_MANAGER.start(task_type=task_type, params=params, created_by=actor)
+    _audit_action(
+        actor=actor,
+        role=role,
+        action="process.start",
+        target=str(out.get("process_id") or ""),
+        new_value=out,
+        metadata={"task_type": task_type},
+    )
+    return {"status": "ok", "process": out}
+
+
+@router.post("/ops/process/stop")
+async def ops_process_stop(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _PROCESS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="process_manager_unavailable")
+    actor, role = require_role(request, ROLE_OPERATOR)
+    process_id = str(payload.get("process_id") or payload.get("id") or "").strip()
+    if not process_id:
+        raise HTTPException(status_code=400, detail="process_id_required")
+    out = _PROCESS_MANAGER.stop(process_id, force=bool(payload.get("force") or False))
+    _audit_action(actor=actor, role=role, action="process.stop", target=process_id, new_value=out, metadata={})
+    return {"status": "ok", "process": out}
+
+
+@router.post("/ops/process/restart")
+async def ops_process_restart(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _PROCESS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="process_manager_unavailable")
+    actor, role = require_role(request, ROLE_OPERATOR)
+    process_id = str(payload.get("process_id") or payload.get("id") or "").strip()
+    if not process_id:
+        raise HTTPException(status_code=400, detail="process_id_required")
+    out = _PROCESS_MANAGER.restart(process_id, created_by=actor)
+    _audit_action(actor=actor, role=role, action="process.restart", target=process_id, new_value=out, metadata={})
+    return {"status": "ok", "process": out}
+
+
+@router.get("/ops/processes")
+async def ops_processes(
+    status: Optional[str] = Query(default=None),
+    task_type: Optional[str] = Query(default=None),
+):
+    if _PROCESS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="process_manager_unavailable")
+    rows = _PROCESS_MANAGER.list_processes(status=status, task_type=task_type)
+    return {"status": "ok", "items": rows, "count": len(rows)}
+
+
+@router.get("/ops/process/{process_id}/logs")
+async def ops_process_logs(
+    process_id: str,
+    lines: int = Query(default=200, ge=1, le=5000),
+):
+    if _PROCESS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="process_manager_unavailable")
+    try:
+        return {"status": "ok", **_PROCESS_MANAGER.tail_logs(process_id, lines=lines)}
+    except ValueError:
+        raise HTTPException(status_code=404, detail="process_not_found")
+
+
+@router.get("/ops/process/{process_id}/metrics")
+async def ops_process_metrics(process_id: str):
+    if _PROCESS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="process_manager_unavailable")
+    try:
+        return {"status": "ok", **_PROCESS_MANAGER.process_metrics(process_id)}
+    except ValueError:
+        raise HTTPException(status_code=404, detail="process_not_found")
+
+
+@router.get("/ops/process/{process_id}/stream")
+async def ops_process_stream(process_id: str):
+    if _PROCESS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="process_manager_unavailable")
+
+    async def _stream():
+        while True:
+            info = _PROCESS_MANAGER.get_process(process_id)
+            if info is None:
+                payload = {"process_id": process_id, "status": "missing"}
+                yield f"event: process\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                break
+            metrics = _PROCESS_MANAGER.process_metrics(process_id)
+            payload = {"process": info, "metrics": metrics, "timestamp": _utcnow_iso_z()}
+            yield f"event: process\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+            if str(info.get("status")) in {"finished", "failed", "stopped"}:
+                break
+            await asyncio.sleep(1.0)
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+@router.get("/ops/connectivity")
+async def get_connectivity_status(
+    venue: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=2000),
+):
+    if _CONNECTIVITY_SERVICE is None:
+        raise HTTPException(status_code=503, detail="connectivity_service_unavailable")
+    return {"status": "ok", **_CONNECTIVITY_SERVICE.latest(venue=venue, limit=limit)}
+
+
+@router.post("/ops/connectivity/probe")
+async def run_connectivity_probe(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _CONNECTIVITY_SERVICE is None:
+        raise HTTPException(status_code=503, detail="connectivity_service_unavailable")
+    actor, role = require_role(request, ROLE_OPERATOR)
+    venue = str(payload.get("venue") or "bitget").strip().lower()
+    out = _CONNECTIVITY_SERVICE.probe(
+        venue=venue,
+        proxy_profile_id=(str(payload.get("proxy_profile_id")).strip() if payload.get("proxy_profile_id") else None),
+        process_id=(str(payload.get("process_id")).strip() if payload.get("process_id") else None),
+        account_id=(str(payload.get("account_id")).strip() if payload.get("account_id") else None),
+        timeout_sec=float(payload.get("timeout_sec") or 5.0),
+        persist=True,
+    )
+    _audit_action(actor=actor, role=role, action="connectivity.probe", target=venue, new_value=out, metadata={})
+    return {"status": "ok", "probe": out}
+
+
+@router.get("/ops/proxy_profiles")
+async def list_proxy_profiles(include_disabled: int = Query(default=1)):
+    rows_raw = repo.list_proxy_profiles(include_disabled=bool(int(include_disabled)))
+    rows = [
+        {k: v for k, v in dict(r).items() if str(k).lower() not in {"password", "password_enc", "secret", "api_secret"}}
+        for r in rows_raw
+    ]
+    return {"status": "ok", "items": rows, "count": len(rows)}
+
+
+@router.post("/ops/proxy_profiles")
+async def create_or_update_proxy_profile(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _SECRETS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="secrets_manager_unavailable")
+    actor, role = require_role(request, ROLE_ADMIN)
+    profile_id = str(payload.get("profile_id") or f"proxy-{uuid.uuid4().hex[:12]}").strip()
+    password = payload.get("password")
+    enc = None
+    if password is not None and str(password).strip():
+        enc = _SECRETS_MANAGER.encrypt(str(password))
+    row = repo.upsert_proxy_profile(
+        profile_id=profile_id,
+        name=str(payload.get("name") or profile_id),
+        proxy_type=str(payload.get("proxy_type") or payload.get("type") or "http"),
+        host=str(payload.get("host") or ""),
+        port=int(payload.get("port") or 0),
+        username=(str(payload.get("username")) if payload.get("username") is not None else None),
+        password_enc=enc,
+        enabled=bool(payload.get("enabled", True)),
+        note=str(payload.get("note") or ""),
+        updated_by=actor,
+    )
+    _audit_action(actor=actor, role=role, action="proxy_profile.upsert", target=profile_id, new_value=row, metadata={})
+    return {"status": "ok", "profile": row}
+
+
+@router.delete("/ops/proxy_profiles/{profile_id}")
+async def delete_proxy_profile(request: Request, profile_id: str):
+    actor, role = require_role(request, ROLE_ADMIN)
+    ok = repo.delete_proxy_profile(profile_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="proxy_profile_not_found")
+    _audit_action(actor=actor, role=role, action="proxy_profile.delete", target=profile_id, metadata={})
+    return {"status": "ok", "profile_id": profile_id}
+
+
+@router.get("/ops/proxy_bindings")
+async def list_proxy_bindings():
+    rows = repo.list_proxy_bindings()
+    return {"status": "ok", "items": rows, "count": len(rows)}
+
+
+@router.post("/ops/proxy_bindings")
+async def upsert_proxy_binding(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    actor, role = require_role(request, ROLE_ADMIN)
+    target_type = str(payload.get("target_type") or "").strip().lower()
+    target_id = str(payload.get("target_id") or "").strip()
+    profile_id = str(payload.get("profile_id") or "").strip()
+    if target_type not in {"global", "account", "process"}:
+        raise HTTPException(status_code=400, detail="target_type_invalid")
+    if target_type != "global" and not target_id:
+        raise HTTPException(status_code=400, detail="target_id_required")
+    if not profile_id:
+        raise HTTPException(status_code=400, detail="profile_id_required")
+    requires_restart = bool(payload.get("requires_restart", target_type == "process"))
+    row = repo.upsert_proxy_binding(
+        target_type=target_type,
+        target_id=("" if target_type == "global" else target_id),
+        profile_id=profile_id,
+        requires_restart=requires_restart,
+        updated_by=actor,
+    )
+    _audit_action(actor=actor, role=role, action="proxy_binding.upsert", target=f"{target_type}:{target_id}", new_value=row, metadata={})
+    return {"status": "ok", "binding": row}
+
+
+@router.delete("/ops/proxy_bindings")
+async def delete_proxy_binding(
+    request: Request,
+    target_type: str = Query(...),
+    target_id: str = Query(default=""),
+):
+    actor, role = require_role(request, ROLE_ADMIN)
+    tt = str(target_type).strip().lower()
+    tid = "" if tt == "global" else str(target_id).strip()
+    ok = repo.delete_proxy_binding(target_type=tt, target_id=tid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="proxy_binding_not_found")
+    _audit_action(actor=actor, role=role, action="proxy_binding.delete", target=f"{tt}:{tid}", metadata={})
+    return {"status": "ok"}
+
+
+@router.get("/ops/clock_drift")
+async def get_clock_drift():
+    if _CLOCK_DRIFT_SERVICE is None:
+        raise HTTPException(status_code=503, detail="clock_drift_service_unavailable")
+    return _CLOCK_DRIFT_SERVICE.latest()
+
+
+@router.post("/ops/clock_drift/probe")
+async def probe_clock_drift(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _CLOCK_DRIFT_SERVICE is None:
+        raise HTTPException(status_code=503, detail="clock_drift_service_unavailable")
+    actor, role = require_role(request, ROLE_OPERATOR)
+    out = _CLOCK_DRIFT_SERVICE.probe(
+        source_url=str(payload.get("source_url") or "https://api.bitget.com/api/v2/public/time"),
+        timeout_sec=float(payload.get("timeout_sec") or 5.0),
+        persist=True,
+    )
+    _audit_action(actor=actor, role=role, action="clock_drift.probe", target=str(out.get("source") or ""), new_value=out, metadata={})
+    return {"status": "ok", "clock_drift": out}
+
+
+@router.get("/ops/audit_logs")
+async def get_audit_logs(
+    limit: int = Query(default=200, ge=1, le=5000),
+    action: Optional[str] = Query(default=None),
+):
+    rows = repo.list_audit_logs(limit=limit, action=action)
+    return {"status": "ok", "items": rows, "count": len(rows)}
+
+
+@router.get("/ops/mail_delivery_logs")
+async def get_mail_delivery_logs(limit: int = Query(default=200, ge=1, le=5000)):
+    rows = repo.list_mail_delivery_logs(limit=limit)
+    return {"status": "ok", "items": rows, "count": len(rows)}
+
+
+@router.get("/ops/secrets")
+async def list_secrets_meta(request: Request):
+    require_role(request, ROLE_ADMIN)
+    rows = repo.list_secrets_meta()
+    return {"status": "ok", "items": rows, "count": len(rows)}
+
+
+@router.post("/ops/secrets/smtp")
+async def upsert_smtp_secret(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _SECRETS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="secrets_manager_unavailable")
+    actor, role = require_role(request, ROLE_ADMIN)
+    smtp_pass = str(payload.get("smtp_pass") or "").strip()
+    if not smtp_pass:
+        raise HTTPException(status_code=400, detail="smtp_pass_required")
+    enc = _SECRETS_MANAGER.encrypt(smtp_pass)
+    row = repo.upsert_secret(secret_key="smtp.password", secret_value_enc=enc, updated_by=actor)
+    _audit_action(actor=actor, role=role, action="secret.smtp.upsert", target="smtp.password", metadata={})
+    return {"status": "ok", "secret": row}
+
+
+@router.post("/risk/commands/execute")
+async def execute_risk_command(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _RISK_COMMAND_EXECUTOR is None:
+        raise HTTPException(status_code=503, detail="risk_command_executor_unavailable")
+    actor, role = require_role(request, ROLE_OPERATOR)
+    command_text = str(payload.get("command") or payload.get("command_text") or "").strip()
+    if not command_text:
+        raise HTTPException(status_code=400, detail="command_required")
+    parsed = parse_risk_command(command_text)
+    if parsed.ok and parsed.action == "kill_switch" and role != ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="rbac_forbidden:admin_required_for_kill_switch")
+    source = str(payload.get("source") or "frontend").strip().lower() or "frontend"
+    actor = str(payload.get("actor") or payload.get("updated_by") or actor)
+    result = _RISK_COMMAND_EXECUTOR.execute(source=source, command_text=command_text, actor=actor)
+    status_txt = "success" if bool(result.get("execute_ok")) else "failed"
+    mail = _notify_risk_mail(
+        event_type="risk_command",
+        subject=f"[risk-command] {status_txt}: {command_text[:120]}",
+        body=json.dumps({"source": source, "actor": actor, "command": command_text, "result": result}, ensure_ascii=False, default=str, indent=2),
+    )
+    _audit_action(actor=actor, role=role, action="risk.command.execute", target=source, new_value={"command": command_text, "result": result}, metadata={})
+    return {**result, "mail": mail, "supported_commands": list(SUPPORTED_COMMANDS)}
+
+
+@router.get("/risk/commands/logs")
+async def risk_command_logs(limit: int = Query(default=200, ge=1, le=2000)):
+    rows = repo.list_risk_command_logs(limit=limit)
+    return {"status": "ok", "items": rows, "count": len(rows)}
+
+
+@router.get("/risk/events/recent")
+async def recent_risk_events(limit: int = Query(default=200, ge=1, le=2000)):
+    events = repo.list_recent_risk_events(limit=limit)
+    recon = repo.list_recent_reconciliation_logs(limit=min(limit, 200))
+    return {"status": "ok", "risk_events": events, "reconciliation_logs": recon}
+
+
+@router.get("/live/accounts")
+async def list_live_accounts():
+    rows_raw = repo.list_bitget_accounts()
+    rows = [
+        {
+            k: v
+            for k, v in dict(r).items()
+            if str(k).lower() not in {"api_key_enc", "api_secret_enc", "passphrase_enc", "secret", "password", "password_enc"}
+        }
+        for r in rows_raw
+    ]
+    env_configured = bool(str(os.getenv("BITGET_API_KEY", "")).strip() and str(os.getenv("BITGET_API_SECRET", "")).strip() and str(os.getenv("BITGET_API_PASSPHRASE", "")).strip())
+    return {
+        "status": "ok",
+        "items": rows,
+        "count": len(rows),
+        "default_env_account": {"account_id": "default", "configured": env_configured},
+        "notice": "No withdraw/transfer capability is implemented in this system.",
+    }
+
+
+@router.post("/live/accounts")
+async def upsert_live_account(request: Request, payload: Dict[str, Any] = Body(default_factory=dict)):
+    if _SECRETS_MANAGER is None:
+        raise HTTPException(status_code=503, detail="secrets_manager_unavailable")
+    actor, role = require_role(request, ROLE_ADMIN)
+    account_id = str(payload.get("account_id") or "").strip()
+    account_name = str(payload.get("account_name") or account_id).strip()
+    api_key = str(payload.get("api_key") or "").strip()
+    api_secret = str(payload.get("api_secret") or "").strip()
+    passphrase = str(payload.get("passphrase") or "").strip()
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id_required")
+    if not api_key or not api_secret or not passphrase:
+        raise HTTPException(status_code=400, detail="api_key/api_secret/passphrase_required")
+    enc = _SECRETS_MANAGER.encrypt_bitget(api_key=api_key, api_secret=api_secret, passphrase=passphrase)
+    row = repo.upsert_bitget_account(
+        account_id=account_id,
+        account_name=account_name,
+        api_key_enc=enc["api_key_enc"],
+        api_secret_enc=enc["api_secret_enc"],
+        passphrase_enc=enc["passphrase_enc"],
+        is_default=bool(payload.get("is_default") or False),
+        enabled=bool(payload.get("enabled", True)),
+        updated_by=str(payload.get("updated_by") or actor),
+    )
+    _audit_action(
+        actor=actor,
+        role=role,
+        action="live.account.upsert",
+        target=account_id,
+        new_value=row,
+        metadata={"notice": "secret_fields_not_returned"},
+    )
+    return {"status": "ok", "account": row}
+
+
+@router.delete("/live/accounts/{account_id}")
+async def delete_live_account(request: Request, account_id: str):
+    actor, role = require_role(request, ROLE_ADMIN)
+    ok = repo.delete_bitget_account(account_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="account_not_found")
+    _audit_action(actor=actor, role=role, action="live.account.delete", target=account_id, metadata={})
+    return {"status": "ok", "account_id": account_id}
+
+
+@router.get("/live/accounts/{account_id}/connectivity")
+async def live_account_connectivity(account_id: str):
+    if _CONNECTIVITY_SERVICE is None:
+        raise HTTPException(status_code=503, detail="connectivity_service_unavailable")
+    row = repo.get_bitget_account_secret_row(account_id) if account_id != "default" else None
+    if account_id != "default" and not row:
+        raise HTTPException(status_code=404, detail="account_not_found")
+    has_env = bool(str(os.getenv("BITGET_API_KEY", "")).strip() and str(os.getenv("BITGET_API_SECRET", "")).strip() and str(os.getenv("BITGET_API_PASSPHRASE", "")).strip())
+    configured = True if account_id != "default" else has_env
+    probe = _CONNECTIVITY_SERVICE.probe(venue="bitget", account_id=(None if account_id == "default" else account_id), persist=True)
+    return {
+        "status": "ok",
+        "account_id": account_id,
+        "configured": configured,
+        "rest_ok": bool(probe.get("rest_ok")),
+        "ws_ok": bool(probe.get("ws_ok")),
+        "reachable": bool(probe.get("rest_ok")) and bool(probe.get("ws_ok")),
+        "using_proxy_profile": probe.get("using_proxy_profile"),
+        "detail": probe.get("error"),
+    }

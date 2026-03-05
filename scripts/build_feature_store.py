@@ -65,6 +65,14 @@ def _table_exists(cur, table_name: str) -> bool:
     return bool(row.get("reg"))
 
 
+def _ensure_feature_snapshots_main_schema(cur) -> None:
+    # Keep strict pipeline columns present even when table was created by older migrations.
+    cur.execute("ALTER TABLE feature_snapshots_main ADD COLUMN IF NOT EXISTS feature_values JSONB")
+    cur.execute("ALTER TABLE feature_snapshots_main ADD COLUMN IF NOT EXISTS feature_mask JSONB")
+    cur.execute("ALTER TABLE feature_snapshots_main ADD COLUMN IF NOT EXISTS schema_hash TEXT")
+    cur.execute("ALTER TABLE feature_snapshots_main ADD COLUMN IF NOT EXISTS synthetic_ratio DOUBLE PRECISION NOT NULL DEFAULT 0.0")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build strict feature snapshots with values+mask+schema_hash")
     ap.add_argument("--database-url", default=os.getenv("DATABASE_URL", "postgresql://monitor@localhost:5432/monitor"))
@@ -103,6 +111,7 @@ def main() -> int:
                 )
                 """
             )
+            _ensure_feature_snapshots_main_schema(cur)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_feature_snapshots_main_symbol_ts ON feature_snapshots_main(symbol, as_of_ts DESC)")
             if bool(args.truncate):
                 cur.execute("TRUNCATE TABLE feature_snapshots_main")
@@ -217,11 +226,47 @@ def main() -> int:
                     )
                     event_rows = [dict(r) for r in cur.fetchall()]
 
+                # Pre-index onchain metrics by name for O(logN) latest lookup.
+                oc_metric_ts: Dict[str, List[datetime]] = {}
+                oc_metric_rows: Dict[str, List[Dict[str, Any]]] = {}
+                for row in oc_rows:
+                    name = str(row.get("metric_name") or "")
+                    ts_row = row.get("ts")
+                    val = _safe_float(row.get("metric_value"))
+                    if (not name) or (not isinstance(ts_row, datetime)) or val is None:
+                        continue
+                    oc_metric_ts.setdefault(name, []).append(ts_row)
+                    oc_metric_rows.setdefault(name, []).append(
+                        {
+                            "ts": ts_row,
+                            "value": float(val),
+                            "is_synthetic": bool(row.get("is_synthetic")),
+                        }
+                    )
+
+                # Pre-index events for rolling 1h/6h windows (O(N) overall).
+                event_ts: List[datetime] = []
+                event_conf: List[float] = []
+                event_sent: List[float] = []
+                for e in event_rows:
+                    ets = e.get("ts")
+                    if not isinstance(ets, datetime):
+                        continue
+                    event_ts.append(ets)
+                    event_conf.append(float(e.get("confidence_score") or 0.0))
+                    payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+                    event_sent.append(float(payload.get("post_sentiment") or 0.0))
+
                 prices = [float(r.get("close") or 0.0) for r in bars]
                 volumes = [float(r.get("volume") or 0.0) for r in bars]
                 timestamps = [r.get("ts") for r in bars]
 
                 inserts: List[tuple] = []
+                ev_r = 0
+                ev_l1 = 0
+                ev_l6 = 0
+                ev_sum_conf_6h = 0.0
+                ev_sum_sent_6h = 0.0
                 for i in range(12, len(bars)):
                     ts = timestamps[i]
                     if not isinstance(ts, datetime):
@@ -267,33 +312,23 @@ def main() -> int:
                         source_syn += int(bool(oc_latest.get("is_synthetic")))
                         raw["freshness_onchain_sec"] = float(max(0.0, (ts - oc_latest["ts"]).total_seconds()))
 
-                    net_inflow = None
-                    active_addr = None
-                    basis_rate = None
-                    taker_ratio = None
-                    open_interest = None
-                    for row in reversed(oc_rows):
-                        rts = row.get("ts")
-                        if (not isinstance(rts, datetime)) or rts > ts:
-                            continue
-                        if row.get("is_synthetic") and (not bool(args.allow_synthetic)):
-                            continue
-                        name = str(row.get("metric_name") or "")
-                        val = _safe_float(row.get("metric_value"))
-                        if val is None:
-                            continue
-                        if name == "net_inflow" and net_inflow is None:
-                            net_inflow = val
-                        elif name == "active_addresses" and active_addr is None:
-                            active_addr = val
-                        elif name == "basis_rate" and basis_rate is None:
-                            basis_rate = val
-                        elif name == "taker_buy_sell_ratio" and taker_ratio is None:
-                            taker_ratio = val
-                        elif name == "open_interest" and open_interest is None:
-                            open_interest = val
-                        if all(x is not None for x in (net_inflow, active_addr, basis_rate, taker_ratio, open_interest)):
-                            break
+                    def _latest_metric(metric_name: str) -> Optional[float]:
+                        mts = oc_metric_ts.get(metric_name) or []
+                        mrows = oc_metric_rows.get(metric_name) or []
+                        item = _latest_before(mts, mrows, ts)
+                        if not item:
+                            return None
+                        if bool(item.get("is_synthetic")) and (not bool(args.allow_synthetic)):
+                            return None
+                        return _safe_float(item.get("value"))
+
+                    net_inflow = _latest_metric("net_inflow")
+                    active_addr = _latest_metric("active_addresses")
+                    basis_rate = _latest_metric("basis_rate")
+                    taker_ratio = _latest_metric("taker_buy_sell_ratio")
+                    open_interest = _latest_metric("open_interest")
+                    if open_interest is None:
+                        open_interest = _latest_metric("open_interest_value")
 
                     raw.update(compute_onchain(net_inflow=net_inflow, active_addresses=active_addr))
                     raw.update(compute_derivatives(
@@ -303,14 +338,25 @@ def main() -> int:
                         open_interest=open_interest,
                     ))
 
-                    ev1 = [e for e in event_rows if isinstance(e.get("ts"), datetime) and (ts - timedelta(hours=1) <= e["ts"] <= ts)]
-                    ev6 = [e for e in event_rows if isinstance(e.get("ts"), datetime) and (ts - timedelta(hours=6) <= e["ts"] <= ts)]
-                    conf_values = [float(e.get("confidence_score") or 0.0) for e in ev6]
-                    sent_values = [float((e.get("payload") or {}).get("post_sentiment") or 0.0) for e in ev6]
-                    raw["event_count_1h"] = float(len(ev1))
-                    raw["event_count_6h"] = float(len(ev6))
-                    raw["event_confidence_mean"] = float(sum(conf_values) / max(1, len(conf_values)))
-                    raw["event_sentiment_mean"] = float(sum(sent_values) / max(1, len(sent_values)))
+                    while ev_r < len(event_ts) and event_ts[ev_r] <= ts:
+                        ev_sum_conf_6h += event_conf[ev_r]
+                        ev_sum_sent_6h += event_sent[ev_r]
+                        ev_r += 1
+                    ev_cut_6h = ts - timedelta(hours=6)
+                    while ev_l6 < ev_r and event_ts[ev_l6] < ev_cut_6h:
+                        ev_sum_conf_6h -= event_conf[ev_l6]
+                        ev_sum_sent_6h -= event_sent[ev_l6]
+                        ev_l6 += 1
+                    ev_cut_1h = ts - timedelta(hours=1)
+                    while ev_l1 < ev_r and event_ts[ev_l1] < ev_cut_1h:
+                        ev_l1 += 1
+
+                    ev_cnt_1h = int(max(0, ev_r - ev_l1))
+                    ev_cnt_6h = int(max(0, ev_r - ev_l6))
+                    raw["event_count_1h"] = float(ev_cnt_1h)
+                    raw["event_count_6h"] = float(ev_cnt_6h)
+                    raw["event_confidence_mean"] = float(ev_sum_conf_6h / max(1, ev_cnt_6h))
+                    raw["event_sentiment_mean"] = float(ev_sum_sent_6h / max(1, ev_cnt_6h))
 
                     raw["freshness_market_sec"] = 0.0
                     raw["synthetic_ratio"] = float(source_syn / max(1, source_total)) if source_total > 0 else 0.0
@@ -349,8 +395,20 @@ def main() -> int:
                         template="(%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s)",
                     )
                     rows_created += len(inserts)
-
-        conn.commit()
+                conn.commit()
+                print(
+                    json.dumps(
+                        {
+                            "status": "progress",
+                            "table": "feature_snapshots_main",
+                            "symbol": sym,
+                            "rows_written_symbol": int(len(inserts)),
+                            "rows_created_total": int(rows_created),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
 
     print(
         json.dumps(

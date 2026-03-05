@@ -47,6 +47,16 @@ CREATE INDEX IF NOT EXISTS idx_training_samples_symbol ON training_samples(symbo
 CREATE INDEX IF NOT EXISTS idx_training_samples_created ON training_samples(created_at DESC);
 
 -- 更新 predictions 表，添加实际准确率追踪
+CREATE TABLE IF NOT EXISTS predictions (
+    id BIGSERIAL PRIMARY KEY,
+    symbol VARCHAR(20) NOT NULL,
+    predicted_price DECIMAL(20, 8),
+    predicted_change_pct DECIMAL(10, 4),
+    confidence DECIMAL(8, 4),
+    horizon_hours INT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_predictions_symbol_created ON predictions(symbol, created_at DESC);
 ALTER TABLE predictions ADD COLUMN IF NOT EXISTS actual_price DECIMAL(20, 8);
 ALTER TABLE predictions ADD COLUMN IF NOT EXISTS actual_change_pct DECIMAL(10, 4);
 ALTER TABLE predictions ADD COLUMN IF NOT EXISTS was_correct BOOLEAN;
@@ -384,6 +394,19 @@ CREATE TABLE IF NOT EXISTS market_bars (
 );
 CREATE INDEX IF NOT EXISTS idx_market_bars_symbol_tf_ts ON market_bars(symbol, timeframe, ts DESC);
 
+CREATE TABLE IF NOT EXISTS market_context_multi_tf (
+    symbol VARCHAR(32) NOT NULL,
+    as_of_ts TIMESTAMPTZ NOT NULL,
+    primary_timeframe VARCHAR(8) NOT NULL,
+    context_json JSONB NOT NULL,
+    coverage_json JSONB NOT NULL,
+    source_hash VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(symbol, primary_timeframe, as_of_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_market_context_multi_tf_symbol_ts ON market_context_multi_tf(symbol, as_of_ts DESC);
+
 CREATE TABLE IF NOT EXISTS orderbook_l2 (
     id BIGSERIAL PRIMARY KEY,
     symbol VARCHAR(32) NOT NULL,
@@ -592,3 +615,209 @@ CREATE TABLE IF NOT EXISTS ops_control_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_ops_control_state_updated_at ON ops_control_state(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS offline_data_audits (
+    id BIGSERIAL PRIMARY KEY,
+    task_id VARCHAR(64) NOT NULL UNIQUE,
+    status VARCHAR(16) NOT NULL DEFAULT 'completed',
+    track VARCHAR(32) NOT NULL DEFAULT 'liquid',
+    symbols_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    window_start TIMESTAMPTZ,
+    window_end TIMESTAMPTZ,
+    lookback INTEGER NOT NULL DEFAULT 96,
+    bucket VARCHAR(8) NOT NULL DEFAULT '5m',
+    ready BOOLEAN NOT NULL DEFAULT FALSE,
+    reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_offline_data_audits_track_time ON offline_data_audits(track, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS runtime_config (
+    id BIGSERIAL PRIMARY KEY,
+    config_key VARCHAR(128) NOT NULL,
+    scope VARCHAR(32) NOT NULL DEFAULT 'global',
+    scope_id VARCHAR(128) NOT NULL DEFAULT '',
+    value_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    version INTEGER NOT NULL DEFAULT 1,
+    requires_restart BOOLEAN NOT NULL DEFAULT FALSE,
+    description TEXT NOT NULL DEFAULT '',
+    updated_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (config_key, scope, scope_id)
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_config_scope_key ON runtime_config(scope, scope_id, config_key);
+CREATE INDEX IF NOT EXISTS idx_runtime_config_updated_at ON runtime_config(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS runtime_config_audit_logs (
+    id BIGSERIAL PRIMARY KEY,
+    config_key VARCHAR(128) NOT NULL,
+    scope VARCHAR(32) NOT NULL,
+    scope_id VARCHAR(128) NOT NULL DEFAULT '',
+    old_value_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    new_value_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    old_version INTEGER,
+    new_version INTEGER,
+    requires_restart BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_config_audit_logs_time ON runtime_config_audit_logs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ops_processes (
+    process_id VARCHAR(64) PRIMARY KEY,
+    task_type VARCHAR(64) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    pid INTEGER,
+    start_time TIMESTAMPTZ,
+    end_time TIMESTAMPTZ,
+    command JSONB NOT NULL DEFAULT '[]'::jsonb,
+    env_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
+    config_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    log_path TEXT NOT NULL,
+    metrics_path TEXT,
+    account_id VARCHAR(64),
+    track VARCHAR(32) NOT NULL DEFAULT 'liquid',
+    symbols_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    restart_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    auto_restart BOOLEAN NOT NULL DEFAULT FALSE,
+    max_restarts INTEGER NOT NULL DEFAULT 0,
+    exit_code INTEGER,
+    error TEXT,
+    created_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ops_processes_status_time ON ops_processes(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ops_processes_task_type_time ON ops_processes(task_type, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ops_process_events (
+    id BIGSERIAL PRIMARY KEY,
+    process_id VARCHAR(64) NOT NULL REFERENCES ops_processes(process_id) ON DELETE CASCADE,
+    event_type VARCHAR(64) NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ops_process_events_pid_time ON ops_process_events(process_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS bitget_accounts (
+    account_id VARCHAR(64) PRIMARY KEY,
+    account_name VARCHAR(128) NOT NULL,
+    api_key_enc TEXT NOT NULL,
+    api_secret_enc TEXT NOT NULL,
+    passphrase_enc TEXT NOT NULL,
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    updated_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bitget_accounts_enabled ON bitget_accounts(enabled, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS risk_command_logs (
+    id BIGSERIAL PRIMARY KEY,
+    source VARCHAR(32) NOT NULL,
+    command_text TEXT NOT NULL,
+    parse_ok BOOLEAN NOT NULL DEFAULT FALSE,
+    execute_ok BOOLEAN NOT NULL DEFAULT FALSE,
+    result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error TEXT,
+    created_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_risk_command_logs_time ON risk_command_logs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS mail_delivery_logs (
+    id BIGSERIAL PRIMARY KEY,
+    event_type VARCHAR(64) NOT NULL,
+    recipients JSONB NOT NULL DEFAULT '[]'::jsonb,
+    subject TEXT NOT NULL,
+    body_preview TEXT NOT NULL DEFAULT '',
+    send_ok BOOLEAN NOT NULL DEFAULT FALSE,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_mail_delivery_logs_time ON mail_delivery_logs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS venue_connectivity_status (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    venue VARCHAR(64) NOT NULL,
+    rest_ok BOOLEAN NOT NULL DEFAULT FALSE,
+    ws_ok BOOLEAN NOT NULL DEFAULT FALSE,
+    latency_ms DOUBLE PRECISION,
+    error TEXT,
+    using_proxy_profile VARCHAR(64),
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_venue_connectivity_status_venue_ts ON venue_connectivity_status(venue, ts DESC);
+
+CREATE TABLE IF NOT EXISTS proxy_profiles (
+    id BIGSERIAL PRIMARY KEY,
+    profile_id VARCHAR(64) NOT NULL UNIQUE,
+    name VARCHAR(128) NOT NULL,
+    proxy_type VARCHAR(16) NOT NULL,
+    host VARCHAR(255) NOT NULL,
+    port INTEGER NOT NULL,
+    username TEXT,
+    password_enc TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    note TEXT NOT NULL DEFAULT '',
+    updated_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_profiles_enabled ON proxy_profiles(enabled, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS proxy_profile_bindings (
+    id BIGSERIAL PRIMARY KEY,
+    target_type VARCHAR(16) NOT NULL, -- global/account/process
+    target_id VARCHAR(128) NOT NULL DEFAULT '',
+    profile_id VARCHAR(64) NOT NULL REFERENCES proxy_profiles(profile_id) ON DELETE CASCADE,
+    requires_restart BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (target_type, target_id)
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_profile_bindings_target ON proxy_profile_bindings(target_type, target_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor VARCHAR(128) NOT NULL DEFAULT 'system',
+    role VARCHAR(32) NOT NULL DEFAULT 'viewer',
+    action VARCHAR(128) NOT NULL,
+    target VARCHAR(256) NOT NULL DEFAULT '',
+    old_value JSONB NOT NULL DEFAULT '{}'::jsonb,
+    new_value JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs(ts DESC);
+
+CREATE TABLE IF NOT EXISTS ops_secrets (
+    id BIGSERIAL PRIMARY KEY,
+    secret_key VARCHAR(128) NOT NULL UNIQUE,
+    secret_value_enc TEXT NOT NULL,
+    updated_by VARCHAR(128) NOT NULL DEFAULT 'system',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ops_secrets_updated_at ON ops_secrets(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS clock_drift_status (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source VARCHAR(128) NOT NULL,
+    local_utc TIMESTAMPTZ NOT NULL,
+    remote_utc TIMESTAMPTZ,
+    drift_ms DOUBLE PRECISION,
+    level VARCHAR(16) NOT NULL DEFAULT 'green',
+    error TEXT,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_clock_drift_status_ts ON clock_drift_status(ts DESC);
